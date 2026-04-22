@@ -150,6 +150,35 @@ def reverse_part(part: stream.Part, report: ProcessingReport | None = None) -> s
     part_name = part.partName or part.id or "Unknown"
     error_handling = report.error_handling if report else ErrorHandling.SKIP_PART
 
+    # Spannerの情報を保存（小節内容を変更する前に）
+    # 各Spannerについて、どの音符をつなぐかの位置情報を記録
+    spanner_info = []
+    for sp in part.spannerBundle:
+        spanned_elements_original = list(sp.getSpannedElements())
+        if len(spanned_elements_original) < 2:
+            continue
+
+        # 各音符の位置情報を記録（小節番号、オフセット、ピッチ）
+        note_positions = []
+        for elem in spanned_elements_original:
+            for measure in measures:
+                if elem in measure.notesAndRests:
+                    pitch_name = str(elem.pitch) if hasattr(elem, 'pitch') else None
+                    note_positions.append({
+                        'measure_num': measure.number,
+                        'offset': elem.offset,
+                        'duration': elem.duration.quarterLength,
+                        'pitch': pitch_name,
+                        'is_rest': elem.isRest
+                    })
+                    break
+
+        if len(note_positions) == len(spanned_elements_original):
+            spanner_info.append({
+                'type': sp.__class__,
+                'positions': note_positions
+            })
+
     # SKIP_MEASURE_CONTENT モードでは元の小節を保持
     if error_handling == ErrorHandling.SKIP_MEASURE_CONTENT:
         original_measures = [copy.deepcopy(m) for m in measures]
@@ -260,9 +289,56 @@ def reverse_part(part: stream.Part, report: ProcessingReport | None = None) -> s
                 for note in element.notes:
                     reverse_ties(note)
 
-        # 小節番号を再割り当て
+            # 小節番号を再割り当て
         processed_measure.number = i + 1
         new_part.append(processed_measure)
+
+    # 保存したSpanner情報を使って、新しいパートでSpannerを再構築
+    for sp_info in spanner_info:
+        new_spanned_elements = []
+
+        for pos in sp_info['positions']:
+            # 反転後の小節番号を計算
+            reversed_measure_num = len(measures) - pos['measure_num'] + 1
+
+            # 新しいパートから対応する小節を取得
+            for new_measure in new_part.getElementsByClass(stream.Measure):
+                if new_measure.number == reversed_measure_num:
+                    # 小節内で反転後のオフセットを計算
+                    measure_duration = new_measure.duration.quarterLength
+                    reversed_offset = measure_duration - pos['offset'] - pos['duration']
+                    reversed_offset = max(0, reversed_offset)
+
+                    # 反転後のオフセットとピッチが一致する音符を探す
+                    for new_elem in new_measure.notesAndRests:
+                        offset_match = abs(new_elem.offset - reversed_offset) < 0.01
+                        if offset_match:
+                            # ピッチまたは休符かをチェック
+                            if pos['is_rest'] and new_elem.isRest:
+                                new_spanned_elements.append(new_elem)
+                                break
+                            elif pos['pitch'] and hasattr(new_elem, 'pitch'):
+                                if str(new_elem.pitch) == pos['pitch']:
+                                    new_spanned_elements.append(new_elem)
+                                    break
+                    break
+
+        # すべての音符が見つかった場合のみSpannerを作成
+        if len(new_spanned_elements) == len(sp_info['positions']) and len(new_spanned_elements) >= 2:
+            # IMPORTANT: Spannerは時系列順(小節番号→オフセット順)に要素を持つ必要がある
+            # 反転後、要素が逆順になっている可能性があるため、ソートする
+            new_spanned_elements_sorted = sorted(
+                new_spanned_elements,
+                key=lambda elem: (
+                    # 要素が属する小節番号を取得
+                    next((m.number for m in new_part.getElementsByClass(stream.Measure)
+                          if elem in m.notesAndRests), 0),
+                    # 小節内のオフセット
+                    elem.offset
+                )
+            )
+            new_spanner = sp_info['type'](new_spanned_elements_sorted)
+            new_part.insert(0, new_spanner)
 
     # ダイナミクスのウェッジを反転
     reverse_dynamics_wedges(new_part)
