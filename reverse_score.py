@@ -333,7 +333,9 @@ def process_file(input_path: Path, output_path: Path,
 
         # 出力ファイルを書き出し（エラー時はスキップして続行）
         try:
-            reversed_score.write('mxl', fp=str(output_path))
+            # 入力ファイルの形式に応じて出力形式を決定
+            output_format = 'mxl' if input_path.suffix == '.mxl' else 'xml'
+            reversed_score.write(output_format, fp=str(output_path))
             print(f"  出力: {output_path.name}")
         except Exception as write_error:
             # 書き出しエラーの詳細を解析してレポートに追加
@@ -410,7 +412,9 @@ def write_with_fallback(score: stream.Score, output_path: Path, report: Processi
 
     # 修正後に書き出しを試行
     try:
-        score.write('mxl', fp=str(output_path))
+        # output_path から形式を判定
+        output_format = 'mxl' if output_path.suffix == '.mxl' else 'xml'
+        score.write(output_format, fp=str(output_path))
         return True
     except Exception:
         # それでもダメな場合はパート単位でスキップ
@@ -472,7 +476,9 @@ def write_with_part_fallback(score: stream.Score, output_path: Path, report: Pro
         new_score.append(part)
 
     try:
-        new_score.write('mxl', fp=str(output_path))
+        # output_path から形式を判定
+        output_format = 'mxl' if output_path.suffix == '.mxl' else 'xml'
+        new_score.write(output_format, fp=str(output_path))
         return True
     except Exception:
         return False
@@ -500,21 +506,23 @@ def main():
 
     outbox.mkdir(parents=True, exist_ok=True)
 
-    # MXL ファイルを検索
-    mxl_files = list(inbox.glob("*.mxl"))
+    # MusicXML ファイルを検索 (.mxl, .xml, .musicxml)
+    input_files = []
+    for pattern in ["*.mxl", "*.xml", "*.musicxml"]:
+        input_files.extend(inbox.glob(pattern))
 
-    if not mxl_files:
-        print(f"MXL ファイルが見つかりません: {inbox}")
+    if not input_files:
+        print(f"MusicXML ファイルが見つかりません: {inbox}")
         sys.exit(0)
 
-    print(f"処理対象: {len(mxl_files)} ファイル\n")
+    print(f"処理対象: {len(input_files)} ファイル\n")
 
     success_count = 0
     all_reports: list[ProcessingReport] = []
 
-    for input_path in mxl_files:
-        # 出力ファイル名を生成
-        output_name = input_path.stem + "_rev.mxl"
+    for input_path in input_files:
+        # 出力ファイル名を生成（入力形式を保持）
+        output_name = input_path.stem + "_rev" + input_path.suffix
         output_path = outbox / output_name
 
         report = process_file(input_path, output_path, error_handling)
@@ -524,7 +532,7 @@ def main():
             success_count += 1
         print()
 
-    print(f"完了: {success_count}/{len(mxl_files)} ファイル処理成功")
+    print(f"完了: {success_count}/{len(input_files)} ファイル処理成功")
 
     # 問題レポートを出力
     reports_with_issues = [r for r in all_reports if r.has_issues()]

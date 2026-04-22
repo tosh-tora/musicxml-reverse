@@ -1,6 +1,6 @@
 # mrev - MusicXML Score Reverser
 
-MusicXML (.mxl) ファイルを「逆から演奏できる」スコアに変換するツール。
+MusicXML (.mxl / .xml / .musicxml) ファイルを「逆から演奏できる」スコアに変換するツール。
 
 ## 機能
 
@@ -17,15 +17,28 @@ pip install -r requirements.txt
 
 ## 使い方
 
+### 対応形式
+
+- `.mxl` (圧縮MusicXML)
+- `.xml` (非圧縮MusicXML)
+- `.musicxml` (非圧縮MusicXML)
+
+入力ファイルの形式はそのまま出力にも保持されます（.mxl → .mxl、.xml → .xml）。
+
 ### 基本的な使い方
 
-1. `work/inbox/` に MXL ファイルを配置
+1. `work/inbox/` に MusicXML ファイル (.mxl / .xml / .musicxml) を配置
 2. スクリプトを実行
 3. `work/outbox/` に反転されたファイルが出力される
 
 ```bash
 python reverse_score.py
 ```
+
+例:
+- `work/inbox/score.mxl` → `work/outbox/score_rev.mxl`
+- `work/inbox/score.xml` → `work/outbox/score_rev.xml`
+- `work/inbox/score.musicxml` → `work/outbox/score_rev.musicxml`
 
 ### オプション
 
