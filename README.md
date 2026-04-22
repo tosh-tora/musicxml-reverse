@@ -9,6 +9,8 @@ MusicXML (.mxl / .xml / .musicxml) ファイルを「逆から演奏できる」
 - 強弱記号（f, p等）、テキスト表現、テンポ指示、リハーサルマークのオフセットを反転
 - Crescendo ↔ Diminuendo を変換
 - タイの start/stop を反転
+- スラー、オクターブ記号（8va/8vb）などのSpanner要素を保持
+- 音部記号、調号、拍子記号を反転後も保持
 
 ## インストール
 
