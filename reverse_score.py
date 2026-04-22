@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from music21 import converter, stream, dynamics, tie, spanner
+from music21.spanner import Ottava
 
 
 @dataclass
@@ -174,10 +175,18 @@ def reverse_part(part: stream.Part, report: ProcessingReport | None = None) -> s
                     break
 
         if len(note_positions) == len(spanned_elements_original):
-            spanner_info.append({
+            sp_data = {
                 'type': sp.__class__,
                 'positions': note_positions
-            })
+            }
+
+            # Ottavaの場合、追加のプロパティを保存
+            if isinstance(sp, Ottava):
+                sp_data['ottava_type'] = sp.type
+                sp_data['transposing'] = sp.transposing
+                sp_data['placement'] = sp.placement
+
+            spanner_info.append(sp_data)
 
     # SKIP_MEASURE_CONTENT モードでは元の小節を保持
     if error_handling == ErrorHandling.SKIP_MEASURE_CONTENT:
@@ -338,6 +347,13 @@ def reverse_part(part: stream.Part, report: ProcessingReport | None = None) -> s
                 )
             )
             new_spanner = sp_info['type'](new_spanned_elements_sorted)
+
+            # Ottavaの場合、保存したプロパティを復元
+            if isinstance(new_spanner, Ottava):
+                new_spanner.type = sp_info.get('ottava_type', '8va')
+                new_spanner.transposing = sp_info.get('transposing', False)
+                new_spanner.placement = sp_info.get('placement', 'above')
+
             new_part.insert(0, new_spanner)
 
     # ダイナミクスのウェッジを反転
