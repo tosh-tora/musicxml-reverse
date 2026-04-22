@@ -86,7 +86,7 @@ def reverse_note_offset(element, measure_duration: float) -> None:
 
 
 def reverse_measure_contents(measure: stream.Measure) -> tuple[stream.Measure, str | None]:
-    """小節内の音符・休符のオフセットを反転する
+    """小節内の音符・休符・表現記号のオフセットを反転する
 
     Returns:
         tuple: (処理後の小節, エラーメッセージ or None)
@@ -98,6 +98,11 @@ def reverse_measure_contents(measure: stream.Measure) -> tuple[stream.Measure, s
     try:
         # 音符、休符、和音を取得して反転
         for element in measure.notesAndRests:
+            reverse_note_offset(element, measure_duration)
+
+        # 表現記号（Dynamics, TextExpression等）を反転
+        for element in measure.getElementsByClass(['Dynamic', 'TextExpression',
+                                                    'TempoText', 'RehearsalMark']):
             reverse_note_offset(element, measure_duration)
 
         # 要素をオフセット順にソート
