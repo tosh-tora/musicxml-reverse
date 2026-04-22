@@ -171,6 +171,27 @@ def reverse_part(part: stream.Part, report: ProcessingReport | None = None) -> s
     for inst in part.getElementsByClass('Instrument'):
         new_part.insert(0, inst)
 
+    # 音部記号をコピー (Clef)
+    clefs = first_original_measure.getElementsByClass('Clef')
+    if clefs:
+        first_clef = clefs.first()
+        if first_clef:
+            new_part.insert(0, first_clef)
+
+    # 調号をコピー (KeySignature)
+    key_sigs = first_original_measure.getElementsByClass('KeySignature')
+    if key_sigs:
+        first_key = key_sigs.first()
+        if first_key:
+            new_part.insert(0, first_key)
+
+    # 拍子記号をコピー (TimeSignature)
+    time_sigs = first_original_measure.getElementsByClass('TimeSignature')
+    if time_sigs:
+        first_time = time_sigs.first()
+        if first_time:
+            new_part.insert(0, first_time)
+
     # 各小節を処理して追加
     for i, measure in enumerate(reversed_measures):
         original_measure_num = measure.number
