@@ -123,6 +123,18 @@ def reverse_ties(element) -> None:
         # 'continue' はそのまま維持
 
 
+def reverse_beams(element) -> None:
+    """連桁の start/stop を反転する"""
+    if hasattr(element, 'beams') and element.beams is not None:
+        if len(element.beams.beamsList) > 0:
+            for beam_obj in element.beams.beamsList:
+                if beam_obj.type == 'start':
+                    beam_obj.type = 'stop'
+                elif beam_obj.type == 'stop':
+                    beam_obj.type = 'start'
+                # 'continue' と 'partial' はそのまま維持
+
+
 def reverse_dynamics_wedges(part: stream.Part) -> None:
     """Crescendo ↔ Diminuendo を変換する"""
     spanners_to_process = list(part.spannerBundle)
@@ -306,22 +318,26 @@ def reverse_part(part: stream.Part, report: ProcessingReport | None = None) -> s
                     except Exception:
                         pass  # 修正失敗しても続行
 
-                # タイは反転する（小節順序が変わるため）
+                # タイと連桁は反転する（小節順序が変わるため）
                 for element in fallback.notesAndRests:
                     reverse_ties(element)
+                    reverse_beams(element)
                     if hasattr(element, 'notes'):
                         for note in element.notes:
                             reverse_ties(note)
+                            reverse_beams(note)
                 new_part.append(fallback)
                 continue
 
-        # タイを反転
+        # タイと連桁を反転
         for element in processed_measure.notesAndRests:
             reverse_ties(element)
-            # 和音内の音符のタイも処理
+            reverse_beams(element)
+            # 和音内の音符のタイと連桁も処理
             if hasattr(element, 'notes'):
                 for note in element.notes:
                     reverse_ties(note)
+                    reverse_beams(note)
 
             # 小節番号を再割り当て
         processed_measure.number = i + 1
