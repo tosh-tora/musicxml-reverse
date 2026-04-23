@@ -159,19 +159,39 @@ def reverse_part(part: stream.Part, report: ProcessingReport | None = None) -> s
         if len(spanned_elements_original) < 2:
             continue
 
-        # 各音符の位置情報を記録（小節番号、オフセット、ピッチ）
+        # 各音符の位置情報を記録（小節番号、オフセット、ピッチ、小節内インデックス）
         note_positions = []
         for elem in spanned_elements_original:
+            found = False
             for measure in measures:
-                if elem in measure.notesAndRests:
-                    pitch_name = str(elem.pitch) if hasattr(elem, 'pitch') else None
-                    note_positions.append({
-                        'measure_num': measure.number,
-                        'offset': elem.offset,
-                        'duration': elem.duration.quarterLength,
-                        'pitch': pitch_name,
-                        'is_rest': elem.isRest
-                    })
+                # IMPORTANT: elem in measure.notesAndRestsは、music21の等価性チェックを使うため、
+                # 異なるオブジェクトでもプロパティが一致すれば Trueを返す。
+                # 代わりに、pitch + offset + durationで一致する音符を探す
+                measure_notes = list(measure.notesAndRests)
+                for note_idx, note in enumerate(measure_notes):
+                    # プロパティで一致を判定
+                    offset_match = abs(elem.offset - note.offset) < 0.0001
+                    duration_match = abs(elem.duration.quarterLength - note.duration.quarterLength) < 0.0001
+
+                    pitch_match = False
+                    if elem.isRest and note.isRest:
+                        pitch_match = True
+                    elif hasattr(elem, 'pitch') and hasattr(note, 'pitch'):
+                        pitch_match = (str(elem.pitch) == str(note.pitch))
+
+                    if offset_match and duration_match and pitch_match:
+                        pitch_name = str(note.pitch) if hasattr(note, 'pitch') else None
+                        note_positions.append({
+                            'measure_num': measure.number,
+                            'offset': note.offset,
+                            'duration': note.duration.quarterLength,
+                            'pitch': pitch_name,
+                            'is_rest': note.isRest,
+                            'note_index': note_idx
+                        })
+                        found = True
+                        break
+                if found:
                     break
 
         if len(note_positions) == len(spanned_elements_original):
@@ -240,11 +260,11 @@ def reverse_part(part: stream.Part, report: ProcessingReport | None = None) -> s
         original_measure_num = measure.number
         original_index = len(measures) - 1 - i  # 元の配列でのインデックス
 
-        # SKIP_MEASURE_CONTENT モードでは反転前にコピーを作成
-        if error_handling == ErrorHandling.SKIP_MEASURE_CONTENT:
-            measure_to_process = copy.deepcopy(measure)
-        else:
-            measure_to_process = measure
+        # 小節のディープコピーを作成
+        # IMPORTANT: reverse_measure_contents() は要素のオフセットをin-placeで変更するため、
+        # 元の小節を変更しないよう、常にコピーを使用する必要がある
+        # (Spanner情報の収集時に記録した位置情報が狂うのを防ぐため)
+        measure_to_process = copy.deepcopy(measure)
 
         # 小節内の音符を反転
         processed_measure, error = reverse_measure_contents(measure_to_process)
@@ -318,8 +338,27 @@ def reverse_part(part: stream.Part, report: ProcessingReport | None = None) -> s
                     reversed_offset = measure_duration - pos['offset'] - pos['duration']
                     reversed_offset = max(0, reversed_offset)
 
-                    # 反転後のオフセットとピッチが一致する音符を探す
-                    for new_elem in new_measure.notesAndRests:
+                    # 元の小節内のインデックスから、反転後のインデックスを計算
+                    # 反転により、notesAndRestsリストも逆順になるため
+                    original_note_index = pos.get('note_index')
+                    notes_list = list(new_measure.notesAndRests)
+
+                    # note_indexが記録されている場合は、それを使って一意に識別
+                    if original_note_index is not None:
+                        # 反転後のインデックスを計算（逆順になるため）
+                        reversed_note_index = len(notes_list) - 1 - original_note_index
+                        if 0 <= reversed_note_index < len(notes_list):
+                            new_elem = notes_list[reversed_note_index]
+                            # オフセットとピッチの最終確認（sanity check）
+                            offset_match = abs(new_elem.offset - reversed_offset) < 0.01
+                            pitch_match = (pos['is_rest'] and new_elem.isRest) or \
+                                         (pos['pitch'] and hasattr(new_elem, 'pitch') and str(new_elem.pitch) == pos['pitch'])
+                            if offset_match and pitch_match:
+                                new_spanned_elements.append(new_elem)
+                                break
+
+                    # フォールバック: note_indexが使えない場合、オフセット+ピッチで検索（従来の方法）
+                    for new_elem in notes_list:
                         offset_match = abs(new_elem.offset - reversed_offset) < 0.01
                         if offset_match:
                             # ピッチまたは休符かをチェック
