@@ -4,11 +4,23 @@ MusicXML (.mxl / .xml / .musicxml) ファイルを「逆から演奏できる」
 
 ## 機能
 
+### 音楽的反転
 - 小節順序を反転
 - 各小節内の音符オフセットを反転
 - 強弱記号（f, p等）、テキスト表現、テンポ指示、リハーサルマークのオフセットを反転
 - Crescendo ↔ Diminuendo を変換
 - タイの start/stop を反転
+
+### レイアウト保存
+- **視覚的配置の保存**: 反転後もスコアの視覚的品質を維持
+  - ダイナミクス（f, p等）の座標変換（X座標を小節内で鏡像反転）
+  - Y座標、配置属性（above/below）の保持
+  - 元の小節幅に基づく正確な座標変換
+- **3段階処理**:
+  1. 元のXMLからレイアウト情報を抽出（music21処理前）
+  2. 音楽的反転処理（既存ロジック）
+  3. 変換されたレイアウトを出力XMLに適用（music21処理後）
+- **graceful degradation**: レイアウト処理が失敗しても反転は完了
 
 ## インストール
 
@@ -85,12 +97,14 @@ python reverse_score.py -s
 
 ```
 mrev/
-├── reverse_score.py    # メインスクリプト
-├── requirements.txt    # 依存パッケージ
+├── reverse_score.py          # メインスクリプト
+├── layout_preservation.py    # レイアウト保存モジュール
+├── test_layout_preservation.py  # ユニットテスト
+├── requirements.txt          # 依存パッケージ
 ├── README.md
 └── work/
-    ├── inbox/          # 入力ファイル置き場
-    └── outbox/         # 出力ファイル置き場
+    ├── inbox/                # 入力ファイル置き場
+    └── outbox/               # 出力ファイル置き場
 ```
 
 ## 依存関係

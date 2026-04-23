@@ -477,6 +477,18 @@ def process_file(input_path: Path, output_path: Path,
         print(f"  モード: 問題小節の音符反転をスキップ")
 
     try:
+        # ========== Phase 1: レイアウト抽出 ==========
+        print(f"  [Phase 1] レイアウト情報を抽出中...")
+        from layout_preservation import extract_layout_from_xml
+        try:
+            original_layout = extract_layout_from_xml(input_path)
+            layout_extraction_success = True
+        except Exception as layout_error:
+            print(f"  警告: レイアウト抽出に失敗しました: {layout_error}")
+            original_layout = None
+            layout_extraction_success = False
+
+        # ========== Phase 2: 音楽反転処理 ==========
         # MXL ファイルを読み込み
         score = converter.parse(str(input_path))
 
@@ -510,6 +522,19 @@ def process_file(input_path: Path, output_path: Path,
             output_format = 'mxl' if input_path.suffix == '.mxl' else 'xml'
             reversed_score.write(output_format, fp=str(output_path))
             print(f"  出力: {output_path.name}")
+
+            # ========== Phase 3: レイアウト復元 ==========
+            if layout_extraction_success and original_layout is not None:
+                print(f"  [Phase 3] レイアウト情報を復元中...")
+                from layout_preservation import apply_layout_to_xml
+                try:
+                    total_measures = len(list(reversed_score.parts[0].getElementsByClass('Measure')))
+                    apply_layout_to_xml(output_path, original_layout, total_measures)
+                    print(f"  [Phase 3] レイアウト復元完了")
+                except Exception as layout_apply_error:
+                    print(f"  警告: レイアウト復元に失敗しました: {layout_apply_error}")
+                    # レイアウト適用失敗は警告のみ（反転処理自体は成功）
+
         except Exception as write_error:
             # 書き出しエラーの詳細を解析してレポートに追加
             error_msg = str(write_error)
