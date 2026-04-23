@@ -156,8 +156,13 @@ def reverse_part(part: stream.Part, report: ProcessingReport | None = None) -> s
     spanner_info = []
     for sp in part.spannerBundle:
         spanned_elements_original = list(sp.getSpannedElements())
+        # Allow single-element spanners for dynamics wedges
         if len(spanned_elements_original) < 2:
-            continue
+            if not isinstance(sp, (dynamics.Crescendo, dynamics.Diminuendo)):
+                continue
+            # For dynamics with < 2 elements, skip if no elements at all
+            if len(spanned_elements_original) == 0:
+                continue
 
         # 各音符の位置情報を記録（小節番号、オフセット、ピッチ、小節内インデックス）
         note_positions = []
@@ -372,7 +377,9 @@ def reverse_part(part: stream.Part, report: ProcessingReport | None = None) -> s
                     break
 
         # すべての音符が見つかった場合のみSpannerを作成
-        if len(new_spanned_elements) == len(sp_info['positions']) and len(new_spanned_elements) >= 2:
+        # ダイナミクスは1要素でもOK、それ以外は2要素以上必要
+        min_elements = 1 if issubclass(sp_info['type'], (dynamics.Crescendo, dynamics.Diminuendo)) else 2
+        if len(new_spanned_elements) == len(sp_info['positions']) and len(new_spanned_elements) >= min_elements:
             # IMPORTANT: Spannerは時系列順(小節番号→オフセット順)に要素を持つ必要がある
             # 反転後、要素が逆順になっている可能性があるため、ソートする
             new_spanned_elements_sorted = sorted(
@@ -385,7 +392,15 @@ def reverse_part(part: stream.Part, report: ProcessingReport | None = None) -> s
                     elem.offset
                 )
             )
-            new_spanner = sp_info['type'](new_spanned_elements_sorted)
+
+            # Create spanner with type conversion for dynamics
+            spanner_class = sp_info['type']
+            if issubclass(spanner_class, dynamics.Crescendo):
+                new_spanner = dynamics.Diminuendo(new_spanned_elements_sorted)
+            elif issubclass(spanner_class, dynamics.Diminuendo):
+                new_spanner = dynamics.Crescendo(new_spanned_elements_sorted)
+            else:
+                new_spanner = spanner_class(new_spanned_elements_sorted)
 
             # Ottavaの場合、保存したプロパティを復元
             if isinstance(new_spanner, Ottava):
@@ -396,7 +411,8 @@ def reverse_part(part: stream.Part, report: ProcessingReport | None = None) -> s
             new_part.insert(0, new_spanner)
 
     # ダイナミクスのウェッジを反転
-    reverse_dynamics_wedges(new_part)
+    # DEPRECATED: now handled in spanner restoration above with type conversion
+    # reverse_dynamics_wedges(new_part)
 
     return new_part
 
