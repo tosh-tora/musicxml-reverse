@@ -177,6 +177,8 @@ def reverse_part(part: stream.Part, report: ProcessingReport | None = None) -> s
     # Spannerの情報を保存（小節内容を変更する前に）
     # 各Spannerについて、どの音符をつなぐかの位置情報を記録
     spanner_info = []
+    measure_based_spanners = []  # RepeatBracket等の小節ベースSpanner
+
     for sp in part.spannerBundle:
         spanned_elements_original = list(sp.getSpannedElements())
         # Allow single-element spanners for dynamics wedges
@@ -186,6 +188,16 @@ def reverse_part(part: stream.Part, report: ProcessingReport | None = None) -> s
             # For dynamics with < 2 elements, skip if no elements at all
             if len(spanned_elements_original) == 0:
                 continue
+
+        # 小節ベースのSpanner（RepeatBracket等）を特別扱い
+        if spanned_elements_original and isinstance(spanned_elements_original[0], stream.Measure):
+            measure_numbers = [m.number for m in spanned_elements_original]
+            measure_based_spanners.append({
+                'type': sp.__class__,
+                'measure_numbers': measure_numbers,
+                'number': getattr(sp, 'number', None),  # RepeatBracketのnumber属性
+            })
+            continue
 
         # 各音符の位置情報を記録（小節番号、オフセット、ピッチ、小節内インデックス）
         note_positions = []
@@ -439,6 +451,30 @@ def reverse_part(part: stream.Part, report: ProcessingReport | None = None) -> s
                 new_spanner.transposing = sp_info.get('transposing', False)
                 new_spanner.placement = sp_info.get('placement', 'above')
 
+            new_part.insert(0, new_spanner)
+
+    # 小節ベースSpanner（RepeatBracket等）を再構築
+    for mb_sp in measure_based_spanners:
+        # 元の小節番号を反転後の小節番号にマッピング
+        total_measures = len(measures)
+        reversed_measure_numbers = [total_measures - m_num + 1 for m_num in mb_sp['measure_numbers']]
+        reversed_measure_numbers.sort()  # 昇順にソート
+
+        # 反転後の小節を取得
+        reversed_measures_for_spanner = []
+        for m_num in reversed_measure_numbers:
+            for measure in new_part.getElementsByClass(stream.Measure):
+                if measure.number == m_num:
+                    reversed_measures_for_spanner.append(measure)
+                    break
+
+        if len(reversed_measures_for_spanner) == len(mb_sp['measure_numbers']):
+            spanner_class = mb_sp['type']
+            if mb_sp['number'] is not None:
+                # RepeatBracketの場合、number引数が必要
+                new_spanner = spanner_class(reversed_measures_for_spanner, number=mb_sp['number'])
+            else:
+                new_spanner = spanner_class(reversed_measures_for_spanner)
             new_part.insert(0, new_spanner)
 
     # ダイナミクスのウェッジを反転
