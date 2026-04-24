@@ -103,7 +103,8 @@ def reverse_measure_contents(measure: stream.Measure) -> tuple[stream.Measure, s
 
         # 表現記号（Dynamics, TextExpression等）を反転
         for element in measure.getElementsByClass(['Dynamic', 'TextExpression',
-                                                    'TempoText', 'RehearsalMark']):
+                                                    'TempoText', 'RehearsalMark',
+                                                    'MetronomeMark']):
             reverse_note_offset(element, measure_duration)
 
         # 要素をオフセット順にソート
