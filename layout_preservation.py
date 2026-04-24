@@ -45,10 +45,23 @@ class MeasureLayout:
 
 
 @dataclass
+class TechnicalElement:
+    """Technical要素の保存用（music21が読み込まないもの）"""
+    measure_num: int
+    note_index: int  # 小節内の音符インデックス
+    pitch: Optional[str] = None  # 音符のピッチ（マッチング用）
+    pitches: Optional[list[str]] = None  # 和音の場合
+    offset: float = 0.0
+    technical_xml: str = ""  # technical要素のXML文字列
+
+
+@dataclass
 class LayoutMap:
     """スコア全体のレイアウト情報"""
     measures: dict[tuple[str, int], MeasureLayout] = field(default_factory=dict)
     # Key: (part_id, measure_number)
+    technical_elements: dict[str, list[TechnicalElement]] = field(default_factory=dict)
+    # Key: part_id
 
 
 def _extract_mxl_content(mxl_path: Path) -> tuple[ET.Element, str]:
@@ -103,9 +116,13 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
     # 名前空間を考慮した検索（MusicXMLは名前空間を使う場合がある）
     ns = {'': root.tag.split('}')[0].strip('{') if '}' in root.tag else ''}
 
+    # music21が読み込まないtechnical要素のリスト
+    unsupported_technicals = {'open', 'stopped', 'snap-pizzicato', 'thumb-position'}
+
     # 各パートを走査
     for part_idx, part in enumerate(root.findall('.//{*}part')):
         part_id = part.get('id', f'P{part_idx + 1}')
+        layout_map.technical_elements[part_id] = []
 
         # 各小節を走査
         for measure in part.findall('.//{*}measure'):
@@ -132,6 +149,7 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
             # 現在のオフセット（divisions単位）を追跡
             current_offset = 0.0
             divisions = 1.0  # デフォルト
+            note_index = 0  # 小節内の音符インデックス
 
             # attributes要素からdivisionsを取得
             for attributes in measure.findall('.//{*}attributes'):
@@ -186,15 +204,59 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
                             )
                             measure_layout.elements.append(elem_layout)
 
-                # note要素の後にオフセットを更新
+                # note要素の処理
                 elif elem.tag.endswith('note'):
+                    # technical要素を探す
+                    notations = elem.find('.//{*}notations')
+                    if notations is not None:
+                        technical = notations.find('.//{*}technical')
+                        if technical is not None:
+                            # music21がサポートしていないtechnical子要素を探す
+                            has_unsupported = False
+                            for tech_child in technical:
+                                tech_name = tech_child.tag.split('}')[-1]
+                                if tech_name in unsupported_technicals:
+                                    has_unsupported = True
+                                    break
+
+                            if has_unsupported:
+                                # 音符のピッチ情報を取得
+                                pitch_elem = elem.find('.//{*}pitch')
+                                pitch_str = None
+                                if pitch_elem is not None:
+                                    step = pitch_elem.find('.//{*}step')
+                                    octave = pitch_elem.find('.//{*}octave')
+                                    alter = pitch_elem.find('.//{*}alter')
+                                    if step is not None and octave is not None:
+                                        pitch_str = step.text + octave.text
+                                        if alter is not None:
+                                            alter_val = int(float(alter.text))
+                                            if alter_val == 1:
+                                                pitch_str = step.text + '#' + octave.text
+                                            elif alter_val == -1:
+                                                pitch_str = step.text + '-' + octave.text
+
+                                # technical要素をXML文字列として保存
+                                tech_xml = ET.tostring(technical, encoding='unicode')
+
+                                tech_elem = TechnicalElement(
+                                    measure_num=measure_num,
+                                    note_index=note_index,
+                                    pitch=pitch_str,
+                                    offset=current_offset,
+                                    technical_xml=tech_xml
+                                )
+                                layout_map.technical_elements[part_id].append(tech_elem)
+
+                    # オフセット更新
                     duration_elem = elem.find('.//{*}duration')
                     if duration_elem is not None and duration_elem.text:
                         try:
                             duration = float(duration_elem.text)
-                            # chord要素がない場合のみオフセットを進める
+                            # chord要素がない場合のみオフセットを進める＆インデックスを増やす
                             if elem.find('.//{*}chord') is None:
                                 current_offset += duration / divisions
+                                note_index += 1
                         except ValueError:
                             pass
 
@@ -424,6 +486,113 @@ def merge_split_directions(output_xml_path: Path, verbose: bool = False) -> None
         tree.write(output_xml_path, encoding='utf-8', xml_declaration=True)
 
 
+def _restore_technical_elements(
+    root: ET.Element,
+    original_layout_map: LayoutMap,
+    total_measures: int
+) -> None:
+    """
+    music21が読み込まなかったtechnical要素を復元
+
+    Args:
+        root: XMLルート要素
+        original_layout_map: 元のレイアウト情報（technical_elementsを含む）
+        total_measures: 総小節数（反転計算用）
+    """
+    # 各パートを走査
+    for part_idx, part in enumerate(root.findall('.//{*}part')):
+        part_id = part.get('id', f'P{part_idx + 1}')
+
+        if part_id not in original_layout_map.technical_elements:
+            continue
+
+        tech_elements = original_layout_map.technical_elements[part_id]
+        if not tech_elements:
+            continue
+
+        # 各小節を走査
+        for measure in part.findall('.//{*}measure'):
+            measure_num_str = measure.get('number')
+            if measure_num_str is None:
+                continue
+
+            try:
+                reversed_measure_num = int(measure_num_str)
+            except ValueError:
+                continue
+
+            # 元の小節番号を計算
+            original_measure_num = total_measures - reversed_measure_num + 1
+
+            # 元の小節に該当するtechnical要素を探す
+            matching_techs = [t for t in tech_elements if t.measure_num == original_measure_num]
+            if not matching_techs:
+                continue
+
+            # 小節内の音符を収集
+            note_index = 0
+            divisions = 1.0
+
+            # divisionsを取得
+            for attributes in measure.findall('.//{*}attributes'):
+                div_elem = attributes.find('.//{*}divisions')
+                if div_elem is not None and div_elem.text:
+                    try:
+                        divisions = float(div_elem.text)
+                    except ValueError:
+                        pass
+
+            # 小節内の音符数をカウント
+            notes = [elem for elem in measure if elem.tag.endswith('note') and
+                     elem.find('.//{*}chord') is None]
+            total_notes = len(notes)
+
+            # 各音符を走査
+            for elem in measure:
+                if not elem.tag.endswith('note'):
+                    continue
+
+                # chordは音符インデックスをインクリメントしない
+                is_chord = elem.find('.//{*}chord') is not None
+                if is_chord:
+                    continue
+
+                # 反転後のインデックスから元のインデックスを計算
+                original_note_index = total_notes - 1 - note_index
+
+                # マッチするtechnical要素を探す
+                for tech in matching_techs:
+                    if tech.note_index == original_note_index:
+                        # notations要素を取得または作成
+                        notations = elem.find('.//{*}notations')
+                        if notations is None:
+                            notations = ET.SubElement(elem, 'notations')
+
+                        # 既存のtechnical要素を取得または新規作成
+                        technical = notations.find('.//{*}technical')
+                        if technical is None:
+                            technical = ET.SubElement(notations, 'technical')
+
+                        # 保存されたtechnical要素をパースして子要素を追加
+                        try:
+                            saved_tech = ET.fromstring(tech.technical_xml)
+                            for child in saved_tech:
+                                # 名前空間を削除
+                                child_tag = child.tag.split('}')[-1]
+                                # 既存の子要素を確認
+                                existing = technical.find(f'.//{child_tag}')
+                                if existing is None:
+                                    new_elem = ET.SubElement(technical, child_tag)
+                                    new_elem.attrib = child.attrib
+                                    new_elem.text = child.text
+                        except ET.ParseError:
+                            pass
+
+                        break
+
+                note_index += 1
+
+
 def apply_layout_to_xml(
     output_xml_path: Path,
     original_layout_map: LayoutMap,
@@ -591,6 +760,9 @@ def apply_layout_to_xml(
                             current_offset += duration / divisions
                         except ValueError:
                             pass
+
+    # technical要素の復元（music21が読み込まなかった要素）
+    _restore_technical_elements(root, original_layout_map, total_measures)
 
     # 変更後のXMLを書き出し
     if is_mxl:

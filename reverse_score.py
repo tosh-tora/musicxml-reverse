@@ -418,16 +418,31 @@ def reverse_part(part: stream.Part, report: ProcessingReport | None = None) -> s
                     pitch_match = False
                     if elem.isRest and note.isRest:
                         pitch_match = True
+                    elif hasattr(elem, 'pitches') and hasattr(note, 'pitches'):
+                        # Chord: compare all pitches
+                        elem_pitches = sorted(p.nameWithOctave for p in elem.pitches)
+                        note_pitches = sorted(p.nameWithOctave for p in note.pitches)
+                        pitch_match = (elem_pitches == note_pitches)
                     elif hasattr(elem, 'pitch') and hasattr(note, 'pitch'):
                         pitch_match = (str(elem.pitch) == str(note.pitch))
 
                     if offset_match and duration_match and pitch_match:
-                        pitch_name = str(note.pitch) if hasattr(note, 'pitch') else None
+                        # 単音符と和音の両方に対応
+                        if hasattr(note, 'pitches'):
+                            pitch_name = None  # Chordの場合はpitchはNone
+                            pitches_list = sorted(p.nameWithOctave for p in note.pitches)
+                        elif hasattr(note, 'pitch'):
+                            pitch_name = str(note.pitch)
+                            pitches_list = None
+                        else:
+                            pitch_name = None
+                            pitches_list = None
                         note_positions.append({
                             'measure_num': measure.number,
                             'offset': note.offset,
                             'duration': note.duration.quarterLength,
                             'pitch': pitch_name,
+                            'pitches': pitches_list,  # 和音用
                             'is_rest': note.isRest,
                             'note_index': note_idx
                         })
@@ -619,8 +634,15 @@ def reverse_part(part: stream.Part, report: ProcessingReport | None = None) -> s
                             new_elem = notes_list[reversed_note_index]
                             # オフセットとピッチの最終確認（sanity check）
                             offset_match = abs(new_elem.offset - reversed_offset) < 0.01
-                            pitch_match = (pos['is_rest'] and new_elem.isRest) or \
-                                         (pos['pitch'] and hasattr(new_elem, 'pitch') and str(new_elem.pitch) == pos['pitch'])
+                            # 和音と単音符の両方に対応
+                            pitch_match = False
+                            if pos['is_rest'] and new_elem.isRest:
+                                pitch_match = True
+                            elif pos.get('pitches') and hasattr(new_elem, 'pitches'):
+                                new_pitches = sorted(p.nameWithOctave for p in new_elem.pitches)
+                                pitch_match = (pos['pitches'] == new_pitches)
+                            elif pos['pitch'] and hasattr(new_elem, 'pitch'):
+                                pitch_match = (str(new_elem.pitch) == pos['pitch'])
                             if offset_match and pitch_match:
                                 new_spanned_elements.append(new_elem)
                                 break
@@ -629,10 +651,15 @@ def reverse_part(part: stream.Part, report: ProcessingReport | None = None) -> s
                     for new_elem in notes_list:
                         offset_match = abs(new_elem.offset - reversed_offset) < 0.01
                         if offset_match:
-                            # ピッチまたは休符かをチェック
+                            # ピッチまたは休符かをチェック（和音対応）
                             if pos['is_rest'] and new_elem.isRest:
                                 new_spanned_elements.append(new_elem)
                                 break
+                            elif pos.get('pitches') and hasattr(new_elem, 'pitches'):
+                                new_pitches = sorted(p.nameWithOctave for p in new_elem.pitches)
+                                if pos['pitches'] == new_pitches:
+                                    new_spanned_elements.append(new_elem)
+                                    break
                             elif pos['pitch'] and hasattr(new_elem, 'pitch'):
                                 if str(new_elem.pitch) == pos['pitch']:
                                     new_spanned_elements.append(new_elem)
