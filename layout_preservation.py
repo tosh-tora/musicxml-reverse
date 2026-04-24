@@ -290,6 +290,142 @@ def transform_layout_for_reversal(
     return transformed
 
 
+def merge_split_directions(output_xml_path: Path, verbose: bool = False) -> None:
+    """
+    music21が誤って分割したdirection要素をマージする
+
+    music21のバグ: <words>と<sound>を含むdirection要素を、
+    - <words />と<sound>の組
+    - <words>テキストのみ
+    の2つに分割してしまう。これらを元の1つに統合する。
+
+    重要: 分割された direction は小節内の異なる位置に配置されることがあるため、
+    placement 属性とsound/words パターンでマッチングする。
+
+    Args:
+        output_xml_path: 出力MusicXMLファイル(.xml または .mxl)
+        verbose: デバッグログを出力する
+    """
+    # ファイルを読み込み
+    is_mxl = output_xml_path.suffix == '.mxl'
+
+    if is_mxl:
+        root, xml_filename = _extract_mxl_content(output_xml_path)
+    else:
+        tree = ET.parse(output_xml_path)
+        root = tree.getroot()
+
+    merge_count = 0
+
+    # 各パートを走査
+    for part in root.findall('.//{*}part'):
+        # 各小節を走査
+        for measure in part.findall('.//{*}measure'):
+            measure_num = measure.get('number', '?')
+
+            # 小節内のdirection要素をすべて収集
+            directions = list(measure.findall('{*}direction'))  # 直接の子要素のみ
+
+            if len(directions) < 2:
+                continue
+
+            if verbose and len(directions) > 1:
+                print(f"  measure {measure_num}: {len(directions)} directions before merge")
+
+            # 空words+soundのdirection（マージ元）を収集
+            empty_word_dirs = []
+            for i, d in enumerate(directions):
+                words = d.find('.//{*}direction-type/{*}words')
+                sound = d.find('.//{*}sound')
+                if (words is not None and
+                    sound is not None and
+                    (words.text is None or words.text.strip() == '')):
+                    empty_word_dirs.append(i)
+
+            # wordsのみのdirection（マージ先）を収集
+            text_only_dirs = []
+            for i, d in enumerate(directions):
+                words = d.find('.//{*}direction-type/{*}words')
+                sound = d.find('.//{*}sound')
+                if (words is not None and
+                    words.text is not None and
+                    words.text.strip() != '' and
+                    sound is None):
+                    text_only_dirs.append(i)
+
+            if verbose and (empty_word_dirs or text_only_dirs):
+                print(f"    empty_word_dirs: {empty_word_dirs}, text_only_dirs: {text_only_dirs}")
+
+            # マッチングしてマージ
+            merged_indices = set()
+            for empty_idx in empty_word_dirs:
+                if empty_idx in merged_indices:
+                    continue
+
+                dir_empty = directions[empty_idx]
+                placement_empty = dir_empty.get('placement')
+
+                # 同じplacement属性を持つtext_only directionを探す
+                for text_idx in text_only_dirs:
+                    if text_idx in merged_indices:
+                        continue
+
+                    dir_text = directions[text_idx]
+                    placement_text = dir_text.get('placement')
+
+                    if placement_empty == placement_text:
+                        # マッチ！マージを実行
+                        if verbose:
+                            print(f"    merging: empty_idx={empty_idx} + text_idx={text_idx}")
+
+                        # dir_textのwordsテキストをdir_emptyのwordsにコピー
+                        words_empty = dir_empty.find('.//{*}direction-type/{*}words')
+                        words_text = dir_text.find('.//{*}direction-type/{*}words')
+                        if words_empty is not None and words_text is not None:
+                            words_empty.text = words_text.text
+
+                        # dir_textの他の属性もdir_emptyに復元
+                        for attr_name, attr_value in dir_text.attrib.items():
+                            if attr_name not in dir_empty.attrib or attr_name == 'system':
+                                dir_empty.set(attr_name, attr_value)
+
+                        # dir_textを削除
+                        measure.remove(dir_text)
+                        merged_indices.add(empty_idx)
+                        merged_indices.add(text_idx)
+                        merge_count += 1
+                        break  # 1対1マッチング
+
+            if verbose and merge_count > 0:
+                remaining = len(list(measure.findall('{*}direction')))
+                print(f"  measure {measure_num}: {remaining} directions after merge")
+
+    if verbose:
+        print(f"  Total merged: {merge_count} direction pairs")
+
+    # 変更後のXMLを書き出し
+    if is_mxl:
+        import tempfile
+        import shutil
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_mxl = Path(tmpdir) / 'output.mxl'
+            shutil.copy2(output_xml_path, tmp_mxl)
+
+            xml_content = ET.tostring(root, encoding='utf-8', xml_declaration=True)
+
+            with zipfile.ZipFile(output_xml_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf_out:
+                with zipfile.ZipFile(tmp_mxl, 'r') as zf_in:
+                    for item in zf_in.namelist():
+                        if item == xml_filename:
+                            zf_out.writestr(item, xml_content)
+                        else:
+                            zf_out.writestr(item, zf_in.read(item))
+    else:
+        tree = ET.ElementTree(root)
+        tree.write(output_xml_path, encoding='utf-8', xml_declaration=True)
+
+
 def apply_layout_to_xml(
     output_xml_path: Path,
     original_layout_map: LayoutMap,
