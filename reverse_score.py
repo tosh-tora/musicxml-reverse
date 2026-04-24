@@ -14,7 +14,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from music21 import converter, stream, dynamics, tie, spanner
+from music21 import converter, stream, dynamics, tie, spanner, clef
 from music21.spanner import Ottava
 
 
@@ -166,6 +166,207 @@ def reverse_dynamics_wedges(part: stream.Part) -> None:
             part.insert(0, new_wedge)
 
 
+def collect_clef_positions(measures: list[stream.Measure]) -> list[dict]:
+    """パート内の全音部記号と小節番号を収集する
+
+    Args:
+        measures: 小節のリスト（元の順序）
+
+    Returns:
+        音部記号の情報リスト [{measure_num, offset, clef}]
+    """
+    clef_positions = []
+
+    for measure in measures:
+        measure_clefs = measure.getElementsByClass('Clef')
+        for clef_obj in measure_clefs:
+            clef_positions.append({
+                'measure_num': measure.number,
+                'offset': clef_obj.offset,
+                'clef': clef_obj,
+            })
+
+    # 小節番号→オフセット順でソート
+    clef_positions.sort(key=lambda x: (x['measure_num'], x['offset']))
+    return clef_positions
+
+
+def calculate_reversed_clef_positions(
+    clef_positions: list[dict],
+    total_measures: int
+) -> list[dict]:
+    """音部記号の反転後位置を計算する
+
+    「始点のみ要素」は「次の同種要素が出現するまで有効」という性質を持つ。
+    1. 各要素の適用終了位置を計算:
+       effective_end[i] = element[i+1].measure_num - 1
+       effective_end[last] = total_measures
+    2. 反転後の開始位置を計算:
+       reversed_start = total_measures - effective_end + 1
+
+    Args:
+        clef_positions: collect_clef_positions() の結果
+        total_measures: 総小節数
+
+    Returns:
+        反転後の位置情報 [{reversed_measure_num, clef}]
+    """
+    if not clef_positions:
+        return []
+
+    reversed_positions = []
+
+    for i, pos in enumerate(clef_positions):
+        # 適用終了位置を計算
+        if i + 1 < len(clef_positions):
+            # 次の音部記号の直前まで有効
+            effective_end = clef_positions[i + 1]['measure_num'] - 1
+        else:
+            # 最後の音部記号は曲の最後まで有効
+            effective_end = total_measures
+
+        # 反転後の開始位置を計算
+        reversed_start = total_measures - effective_end + 1
+
+        reversed_positions.append({
+            'reversed_measure_num': reversed_start,
+            'clef': copy.deepcopy(pos['clef']),
+        })
+
+    # 反転後の小節番号順でソート
+    reversed_positions.sort(key=lambda x: x['reversed_measure_num'])
+    return reversed_positions
+
+
+def apply_reversed_clefs(
+    new_part: stream.Part,
+    reversed_clef_positions: list[dict]
+) -> None:
+    """反転後のパートに音部記号を挿入する
+
+    Args:
+        new_part: 反転後のパート（小節が追加済み）
+        reversed_clef_positions: calculate_reversed_clef_positions() の結果
+    """
+    if not reversed_clef_positions:
+        return
+
+    # m1に最初の音部記号を挿入（パートレベル）
+    first_clef = reversed_clef_positions[0]
+    new_part.insert(0, first_clef['clef'])
+
+    # m2以降に音部記号の変更を挿入
+    for pos in reversed_clef_positions[1:]:
+        target_measure_num = pos['reversed_measure_num']
+
+        # 対象の小節を検索
+        for measure in new_part.getElementsByClass(stream.Measure):
+            if measure.number == target_measure_num:
+                # 小節の先頭に音部記号を挿入
+                measure.insert(0, pos['clef'])
+                break
+
+
+def collect_tempo_positions(measures: list[stream.Measure]) -> list[dict]:
+    """パート内の全テンポ関連要素と小節番号を収集する
+
+    Args:
+        measures: 小節のリスト（元の順序）
+
+    Returns:
+        テンポ要素の情報リスト [{measure_num, offset, element, element_type}]
+    """
+    tempo_positions = []
+    tempo_classes = ['TempoText', 'TextExpression', 'MetronomeMark']
+
+    for measure in measures:
+        for tempo_class in tempo_classes:
+            tempo_elements = measure.getElementsByClass(tempo_class)
+            for elem in tempo_elements:
+                tempo_positions.append({
+                    'measure_num': measure.number,
+                    'offset': elem.offset,
+                    'element': elem,
+                    'element_type': tempo_class,
+                })
+
+    # 小節番号→オフセット順でソート
+    tempo_positions.sort(key=lambda x: (x['measure_num'], x['offset']))
+    return tempo_positions
+
+
+def calculate_reversed_tempo_positions(
+    tempo_positions: list[dict],
+    total_measures: int
+) -> list[dict]:
+    """テンポ要素の反転後位置を計算する
+
+    音部記号と同様のアルゴリズムを使用:
+    1. 各要素の適用終了位置を計算
+    2. 反転後の開始位置を算出
+
+    Args:
+        tempo_positions: collect_tempo_positions() の結果
+        total_measures: 総小節数
+
+    Returns:
+        反転後の位置情報 [{reversed_measure_num, element}]
+    """
+    if not tempo_positions:
+        return []
+
+    reversed_positions = []
+
+    for i, pos in enumerate(tempo_positions):
+        # 適用終了位置を計算
+        if i + 1 < len(tempo_positions):
+            # 次のテンポ要素の直前まで有効
+            effective_end = tempo_positions[i + 1]['measure_num'] - 1
+        else:
+            # 最後のテンポ要素は曲の最後まで有効
+            effective_end = total_measures
+
+        # 反転後の開始位置を計算
+        reversed_start = total_measures - effective_end + 1
+
+        reversed_positions.append({
+            'reversed_measure_num': reversed_start,
+            'element': copy.deepcopy(pos['element']),
+            'element_type': pos['element_type'],
+        })
+
+    # 反転後の小節番号順でソート
+    reversed_positions.sort(key=lambda x: x['reversed_measure_num'])
+    return reversed_positions
+
+
+def apply_reversed_tempo_elements(
+    new_part: stream.Part,
+    reversed_tempo_positions: list[dict]
+) -> None:
+    """反転後のパートにテンポ要素を挿入する
+
+    Args:
+        new_part: 反転後のパート（小節が追加済み）
+        reversed_tempo_positions: calculate_reversed_tempo_positions() の結果
+    """
+    if not reversed_tempo_positions:
+        return
+
+    for pos in reversed_tempo_positions:
+        target_measure_num = pos['reversed_measure_num']
+        element = pos['element']
+        # オフセットをリセット（小節先頭に配置）
+        element.offset = 0
+
+        # 対象の小節を検索
+        for measure in new_part.getElementsByClass(stream.Measure):
+            if measure.number == target_measure_num:
+                # 小節の先頭にテンポ要素を挿入
+                measure.insert(0, element)
+                break
+
+
 def reverse_part(part: stream.Part, report: ProcessingReport | None = None) -> stream.Part:
     """パート全体を反転する"""
     measures = list(part.getElementsByClass(stream.Measure))
@@ -268,19 +469,20 @@ def reverse_part(part: stream.Part, report: ProcessingReport | None = None) -> s
     if part.partAbbreviation:
         new_part.partAbbreviation = part.partAbbreviation
 
-    # 最初の小節から楽器、音部記号、調号、拍子記号を取得してコピー
+    # 最初の小節から楽器、調号、拍子記号を取得してコピー
     first_original_measure = measures[0]
+    total_measures = len(measures)
 
     # 楽器をコピー
     for inst in part.getElementsByClass('Instrument'):
         new_part.insert(0, inst)
 
-    # 音部記号をコピー (Clef)
-    clefs = first_original_measure.getElementsByClass('Clef')
-    if clefs:
-        first_clef = clefs.first()
-        if first_clef:
-            new_part.insert(0, first_clef)
+    # 音部記号は反転ロジックで処理するため、ここではスキップ
+    # （全小節処理後に apply_reversed_clefs() で挿入）
+    clef_positions = collect_clef_positions(measures)
+
+    # テンポ要素も同様に反転ロジックで処理
+    tempo_positions = collect_tempo_positions(measures)
 
     # 調号をコピー (KeySignature)
     key_sigs = first_original_measure.getElementsByClass('KeySignature')
@@ -306,6 +508,15 @@ def reverse_part(part: stream.Part, report: ProcessingReport | None = None) -> s
         # 元の小節を変更しないよう、常にコピーを使用する必要がある
         # (Spanner情報の収集時に記録した位置情報が狂うのを防ぐため)
         measure_to_process = copy.deepcopy(measure)
+
+        # テンポ要素を小節から削除（反転ロジックで再配置するため）
+        for tempo_class in ['TempoText', 'TextExpression', 'MetronomeMark']:
+            for elem in list(measure_to_process.getElementsByClass(tempo_class)):
+                measure_to_process.remove(elem)
+
+        # 音部記号を小節から削除（反転ロジックで再配置するため）
+        for elem in list(measure_to_process.getElementsByClass('Clef')):
+            measure_to_process.remove(elem)
 
         # 小節内の音符を反転
         processed_measure, error = reverse_measure_contents(measure_to_process)
@@ -370,6 +581,14 @@ def reverse_part(part: stream.Part, report: ProcessingReport | None = None) -> s
             # 小節番号を再割り当て
         processed_measure.number = i + 1
         new_part.append(processed_measure)
+
+    # 音部記号を反転して適用
+    reversed_clef_positions = calculate_reversed_clef_positions(clef_positions, total_measures)
+    apply_reversed_clefs(new_part, reversed_clef_positions)
+
+    # テンポ要素を反転して適用
+    reversed_tempo_positions = calculate_reversed_tempo_positions(tempo_positions, total_measures)
+    apply_reversed_tempo_elements(new_part, reversed_tempo_positions)
 
     # 保存したSpanner情報を使って、新しいパートでSpannerを再構築
     for sp_info in spanner_info:
