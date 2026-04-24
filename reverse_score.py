@@ -590,14 +590,26 @@ def process_file(input_path: Path, output_path: Path,
             reversed_score.write(output_format, fp=str(output_path))
             print(f"  出力: {output_path.name}")
 
-            # ========== Phase 3: レイアウト復元 ==========
+            # ========== Phase 3: XML後処理 ==========
+            try:
+                # music21のバグで分割されたdirection要素をマージ
+                print(f"  [Phase 3] 分割されたdirection要素をマージ中...")
+                from layout_preservation import merge_split_directions
+                merge_split_directions(output_path, verbose=True)
+                print(f"  [Phase 3] direction要素のマージ完了")
+            except Exception as merge_error:
+                print(f"  警告: direction要素のマージに失敗しました: {merge_error}")
+                import traceback
+                traceback.print_exc()
+
+            # ========== Phase 4: レイアウト復元 ==========
             if layout_extraction_success and original_layout is not None:
-                print(f"  [Phase 3] レイアウト情報を復元中...")
+                print(f"  [Phase 4] レイアウト情報を復元中...")
                 from layout_preservation import apply_layout_to_xml
                 try:
                     total_measures = len(list(reversed_score.parts[0].getElementsByClass('Measure')))
                     apply_layout_to_xml(output_path, original_layout, total_measures)
-                    print(f"  [Phase 3] レイアウト復元完了")
+                    print(f"  [Phase 4] レイアウト復元完了")
                 except Exception as layout_apply_error:
                     print(f"  警告: レイアウト復元に失敗しました: {layout_apply_error}")
                     # レイアウト適用失敗は警告のみ（反転処理自体は成功）
