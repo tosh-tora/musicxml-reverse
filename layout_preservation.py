@@ -261,31 +261,29 @@ def transform_layout_for_reversal(
     """
     レイアウト座標を反転用に変換
 
+    重要: default-x は変換しない（music21が適切な位置を生成するため）
+    Y座標と placement 属性のみを復元する
+
     Args:
         original_layout: 元のレイアウト情報
-        measure_width: 小節幅（tenths単位）
+        measure_width: 小節幅（tenths単位）- 未使用だが互換性のため保持
 
     Returns:
         ElementLayout: 変換後のレイアウト情報
     """
-    # レイアウトをコピー
     transformed = ElementLayout(
         element_type=original_layout.element_type,
         offset=original_layout.offset,
         pitch=original_layout.pitch,
         text=original_layout.text,
         duration=original_layout.duration,
+        # X座標は変換しない（music21に任せる）
+        default_x=None,
         default_y=original_layout.default_y,      # Y座標はそのまま
-        relative_x=original_layout.relative_x,    # relative座標はそのまま
-        relative_y=original_layout.relative_y,
+        relative_x=None,  # 音符との相対位置も music21 に任せる
+        relative_y=original_layout.relative_y,    # Y方向の相対位置は保持
         placement=original_layout.placement       # placementはそのまま
     )
-
-    # X座標のみ鏡像反転
-    if original_layout.default_x is not None and measure_width is not None:
-        transformed.default_x = measure_width - original_layout.default_x
-    else:
-        transformed.default_x = original_layout.default_x  # 変換不可の場合はそのまま
 
     return transformed
 
