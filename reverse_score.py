@@ -605,11 +605,16 @@ def process_file(input_path: Path, output_path: Path,
             # ========== Phase 4: レイアウト復元 ==========
             if layout_extraction_success and original_layout is not None:
                 print(f"  [Phase 4] レイアウト情報を復元中...")
-                from layout_preservation import apply_layout_to_xml
+                from layout_preservation import apply_layout_to_xml, merge_split_directions
                 try:
                     total_measures = len(list(reversed_score.parts[0].getElementsByClass('Measure')))
                     apply_layout_to_xml(output_path, original_layout, total_measures)
                     print(f"  [Phase 4] レイアウト復元完了")
+
+                    # レイアウト復元後に再度マージ（XMLシリアライズで再分割される可能性があるため）
+                    print(f"  [Phase 4] direction要素を再マージ中...")
+                    merge_split_directions(output_path, verbose=False)
+                    print(f"  [Phase 4] direction要素の再マージ完了")
                 except Exception as layout_apply_error:
                     print(f"  警告: レイアウト復元に失敗しました: {layout_apply_error}")
                     # レイアウト適用失敗は警告のみ（反転処理自体は成功）
