@@ -6,7 +6,7 @@ Issue #29: 音部記号、テンポ指示など「始点のみ指定される要
 """
 
 import pytest
-from music21 import stream, clef, tempo, note
+from music21 import stream, clef, tempo, note, expressions
 
 import sys
 from pathlib import Path
@@ -20,6 +20,7 @@ from reverse_score import (
     calculate_reversed_tempo_positions,
     apply_reversed_tempo_elements,
     reverse_part,
+    is_transitional_tempo,
 )
 
 
@@ -347,3 +348,229 @@ class TestRealDataIntegration:
 
         # 音部記号の種類が保持されていることを確認
         assert original_clef_set == final_clef_set, "音部記号の種類が一致しない"
+
+
+class TestTransitionalTempoDetection:
+    """経過的テンポ表記の検出テスト"""
+
+    def test_transitional_tempo_patterns(self):
+        """経過的テンポ表記が正しく検出される"""
+        transitional_texts = [
+            'rit.',
+            'ritardando',
+            'rall.',
+            'rallentando',
+            'accel.',
+            'accelerando',
+            'stringendo',
+            'morendo',
+            'calando',
+            'allargando',
+            'a tempo',
+            'Rit.',  # 大文字でも検出
+            'ALLARGANDO',
+        ]
+        for text in transitional_texts:
+            assert is_transitional_tempo(text), f"'{text}' should be detected as transitional"
+
+    def test_main_tempo_not_detected(self):
+        """主要テンポ指示は経過的として検出されない"""
+        main_texts = [
+            'Allegro',
+            'Andante',
+            'Molto Maestoso.',
+            'Tempo primo.',
+            'Più mosso.',
+            'Presto',
+            'Adagio',
+            'Moderato',
+        ]
+        for text in main_texts:
+            assert not is_transitional_tempo(text), f"'{text}' should NOT be detected as transitional"
+
+
+class TestTransitionalTempoCalculation:
+    """経過的テンポの反転位置計算テスト"""
+
+    def test_ifudodo_viola_tempo_pattern(self):
+        """威風堂々-Violaパターンのテンポ反転
+
+        元のテンポ指示（全53小節）:
+        - m1: Molto Maestoso. (主要)
+        - m29: allargando (経過的)
+        - m34: rit. (経過的)
+        - m41: Tempo primo. (主要)
+        - m45: Più mosso. (主要)
+
+        主要テンポの有効範囲計算（経過的を除外）:
+        - Molto Maestoso: m1-40 → 反転後 m14 (53-40+1)
+        - Tempo primo: m41-44 → 反転後 m10 (53-44+1)
+        - Più mosso: m45-53 → 反転後 m1 (53-53+1)
+
+        経過的テンポの単純反転:
+        - allargando: m29 → m25 (53-29+1)
+        - rit.: m34 → m20 (53-34+1)
+
+        期待される反転結果（ソート後）:
+        - m1: Più mosso
+        - m10: Tempo primo
+        - m14: Molto Maestoso
+        - m20: rit.
+        - m25: allargando
+        """
+        # TextExpressionを使ってテンポ指示を作成
+        positions = [
+            {
+                'measure_num': 1,
+                'offset': 0,
+                'element': expressions.TextExpression('Molto Maestoso.'),
+                'element_type': 'TextExpression',
+                'is_transitional': False,
+            },
+            {
+                'measure_num': 29,
+                'offset': 0,
+                'element': expressions.TextExpression('allargando'),
+                'element_type': 'TextExpression',
+                'is_transitional': True,
+            },
+            {
+                'measure_num': 34,
+                'offset': 0,
+                'element': expressions.TextExpression('rit.'),
+                'element_type': 'TextExpression',
+                'is_transitional': True,
+            },
+            {
+                'measure_num': 41,
+                'offset': 0,
+                'element': expressions.TextExpression('Tempo primo.'),
+                'element_type': 'TextExpression',
+                'is_transitional': False,
+            },
+            {
+                'measure_num': 45,
+                'offset': 0,
+                'element': expressions.TextExpression('Più mosso.'),
+                'element_type': 'TextExpression',
+                'is_transitional': False,
+            },
+        ]
+        total_measures = 53
+
+        reversed_positions = calculate_reversed_tempo_positions(positions, total_measures)
+
+        assert len(reversed_positions) == 5
+
+        # 反転後の位置を確認（ソート済み）
+        # m1: Più mosso
+        assert reversed_positions[0]['reversed_measure_num'] == 1
+        assert reversed_positions[0]['element'].content == 'Più mosso.'
+
+        # m10: Tempo primo
+        assert reversed_positions[1]['reversed_measure_num'] == 10
+        assert reversed_positions[1]['element'].content == 'Tempo primo.'
+
+        # m14: Molto Maestoso
+        assert reversed_positions[2]['reversed_measure_num'] == 14
+        assert reversed_positions[2]['element'].content == 'Molto Maestoso.'
+
+        # m20: rit. (経過的、単純反転: 53-34+1=20)
+        assert reversed_positions[3]['reversed_measure_num'] == 20
+        assert reversed_positions[3]['element'].content == 'rit.'
+
+        # m25: allargando (経過的、単純反転: 53-29+1=25)
+        assert reversed_positions[4]['reversed_measure_num'] == 25
+        assert reversed_positions[4]['element'].content == 'allargando'
+
+    def test_main_tempo_only(self):
+        """主要テンポのみの場合（従来動作と同じ）"""
+        positions = [
+            {
+                'measure_num': 1,
+                'offset': 0,
+                'element': tempo.MetronomeMark(number=120),
+                'element_type': 'MetronomeMark',
+                'is_transitional': False,
+            },
+            {
+                'measure_num': 5,
+                'offset': 0,
+                'element': tempo.MetronomeMark(number=80),
+                'element_type': 'MetronomeMark',
+                'is_transitional': False,
+            },
+        ]
+        total_measures = 10
+
+        reversed_positions = calculate_reversed_tempo_positions(positions, total_measures)
+
+        assert len(reversed_positions) == 2
+        # m5の80はm10まで有効 → 反転後m1
+        assert reversed_positions[0]['reversed_measure_num'] == 1
+        # m1の120はm4まで有効 → 反転後m7
+        assert reversed_positions[1]['reversed_measure_num'] == 7
+
+    def test_transitional_only(self):
+        """経過的テンポのみの場合"""
+        positions = [
+            {
+                'measure_num': 3,
+                'offset': 0,
+                'element': expressions.TextExpression('rit.'),
+                'element_type': 'TextExpression',
+                'is_transitional': True,
+            },
+            {
+                'measure_num': 7,
+                'offset': 0,
+                'element': expressions.TextExpression('accel.'),
+                'element_type': 'TextExpression',
+                'is_transitional': True,
+            },
+        ]
+        total_measures = 10
+
+        reversed_positions = calculate_reversed_tempo_positions(positions, total_measures)
+
+        assert len(reversed_positions) == 2
+        # 単純反転: m7 → 10-7+1=4, m3 → 10-3+1=8
+        assert reversed_positions[0]['reversed_measure_num'] == 4
+        assert reversed_positions[0]['element'].content == 'accel.'
+        assert reversed_positions[1]['reversed_measure_num'] == 8
+        assert reversed_positions[1]['element'].content == 'rit.'
+
+
+class TestTransitionalTempoCollection:
+    """経過的テンポの収集テスト（is_transitionalフラグ）"""
+
+    def test_collect_with_transitional_flag(self):
+        """収集時にis_transitionalフラグが設定される"""
+        measures = []
+        for i in range(1, 11):
+            m = stream.Measure(number=i)
+            if i == 1:
+                m.insert(0, expressions.TextExpression('Allegro'))
+            elif i == 5:
+                m.insert(0, expressions.TextExpression('rit.'))
+            elif i == 8:
+                m.insert(0, expressions.TextExpression('a tempo'))
+            m.append(note.Rest(quarterLength=4))
+            measures.append(m)
+
+        positions = collect_tempo_positions(measures)
+
+        # Allegroは主要テンポ
+        allegro_pos = [p for p in positions if 'Allegro' in getattr(p['element'], 'content', '')]
+        assert len(allegro_pos) == 1
+        assert allegro_pos[0]['is_transitional'] is False
+
+        # rit.は経過的
+        rit_pos = [p for p in positions if 'rit' in getattr(p['element'], 'content', '').lower()]
+        assert len(rit_pos) == 1
+        assert rit_pos[0]['is_transitional'] is True
+
+        # a tempoは経過的
+        atempo_pos = [p for p in positions if 'a tempo' in getattr(p['element'], 'content', '').lower()]
+        assert len(atempo_pos) == 1
+        assert atempo_pos[0]['is_transitional'] is True
