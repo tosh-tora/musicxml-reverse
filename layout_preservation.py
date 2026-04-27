@@ -793,6 +793,21 @@ def _separate_wedge_pairs(
     return pairs, others
 
 
+def _strip_dynamics_x_attributes(direction_root: ET.Element) -> None:
+    """direction 内の <dynamics> から default-x/relative-x を除去する。
+
+    時間反転に伴い音符の水平位置が変化するため、保存時の元 default-x を
+    そのまま復元すると音符との位置がずれる（Issue #30 と同様の問題）。
+    X 座標は楽譜ソフト/music21 の自動配置に任せ、ここでは Y 座標と
+    placement のみが復元 XML に残るようにする。
+    """
+    for dyn in direction_root.iter():
+        if dyn.tag.endswith('dynamics'):
+            for attr in ('default-x', 'relative-x'):
+                if attr in dyn.attrib:
+                    del dyn.attrib[attr]
+
+
 def _is_tempo_direction(dir_elem: DirectionElement) -> bool:
     """direction要素がテンポ関連かどうかを判定する
 
@@ -941,6 +956,7 @@ def restore_direction_elements(
 
             try:
                 restored_direction = ET.fromstring(dir_elem.direction_xml)
+                _strip_dynamics_x_attributes(restored_direction)
 
                 # 経過的テンポのwordsテキストに←記号を付与
                 if dir_elem.words_text and _is_transitional_tempo_text(dir_elem.words_text):
@@ -968,6 +984,7 @@ def restore_direction_elements(
                 if new_start_measure in measure_map:
                     target = measure_map[new_start_measure]
                     new_start_xml = ET.fromstring(start_dir.direction_xml)
+                    _strip_dynamics_x_attributes(new_start_xml)
                     wedge_elem = new_start_xml.find('.//{*}direction-type/{*}wedge')
                     if wedge_elem is not None:
                         cur_type = wedge_elem.get('type')
@@ -982,6 +999,7 @@ def restore_direction_elements(
                 if new_stop_measure in measure_map:
                     target = measure_map[new_stop_measure]
                     new_stop_xml = ET.fromstring(stop_dir.direction_xml)
+                    _strip_dynamics_x_attributes(new_stop_xml)
                     target_dur = start_dir.measure_duration_quarters
                     target_offset = max(0.0, target_dur - start_dir.offset_quarters)
                     _insert_direction_at_offset(
@@ -1001,6 +1019,7 @@ def restore_direction_elements(
 
             try:
                 restored_direction = ET.fromstring(dir_elem.direction_xml)
+                _strip_dynamics_x_attributes(restored_direction)
                 _insert_into_measure(target_measure, restored_direction)
             except ET.ParseError:
                 pass
