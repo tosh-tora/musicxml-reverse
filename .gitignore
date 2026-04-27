@@ -1,6 +1,11 @@
-# 入出力ファイル
-work/inbox/*.mxl
-work/outbox/
+# Claude Code設定
+.claude/
+
+# 作業用ディレクトリ
+work/
+
+# 個人的なメモ
+prompt.txt
 
 # Python
 __pycache__/
@@ -8,30 +13,13 @@ __pycache__/
 *$py.class
 *.so
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
-
-# 仮想環境
-.venv/
-venv/
-ENV/
+dist/
+build/
 
 # IDE
-.idea/
 .vscode/
+.idea/
 *.swp
 *.swo
 
