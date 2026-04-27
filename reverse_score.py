@@ -1101,34 +1101,29 @@ def process_file(input_path: Path, output_path: Path,
 
             # ========== Phase 3: XML後処理 ==========
             try:
-                # music21のバグで分割されたdirection要素をマージ
-                print(f"  [Phase 3] 分割されたdirection要素をマージ中...")
-                from layout_preservation import merge_split_directions, normalize_slur_numbers
-                merge_split_directions(output_path, verbose=True)
-                print(f"  [Phase 3] direction要素のマージ完了")
+                # direction要素を元のXMLから復元（music21分割バグ対策）
+                print(f"  [Phase 3] direction要素を復元中...")
+                from layout_preservation import restore_direction_elements, normalize_slur_numbers
+                total_measures = len(list(reversed_score.parts[0].getElementsByClass('Measure')))
+                restore_direction_elements(output_path, original_layout, total_measures)
+                print(f"  [Phase 3] direction要素の復元完了")
 
                 # スラーのnumber属性を正規化
                 print(f"  [Phase 3] スラー番号を正規化中...")
                 normalize_slur_numbers(output_path, verbose=False)
                 print(f"  [Phase 3] スラー番号の正規化完了")
-            except Exception as merge_error:
-                print(f"  警告: direction要素のマージに失敗しました: {merge_error}")
+            except Exception as restore_error:
+                print(f"  警告: direction要素の復元に失敗しました: {restore_error}")
                 import traceback
                 traceback.print_exc()
 
             # ========== Phase 4: レイアウト復元 ==========
             if layout_extraction_success and original_layout is not None:
                 print(f"  [Phase 4] レイアウト情報を復元中...")
-                from layout_preservation import apply_layout_to_xml, merge_split_directions
+                from layout_preservation import apply_layout_to_xml
                 try:
-                    total_measures = len(list(reversed_score.parts[0].getElementsByClass('Measure')))
                     apply_layout_to_xml(output_path, original_layout, total_measures)
                     print(f"  [Phase 4] レイアウト復元完了")
-
-                    # レイアウト復元後に再度マージ（XMLシリアライズで再分割される可能性があるため）
-                    print(f"  [Phase 4] direction要素を再マージ中...")
-                    merge_split_directions(output_path, verbose=False)
-                    print(f"  [Phase 4] direction要素の再マージ完了")
                 except Exception as layout_apply_error:
                     print(f"  警告: レイアウト復元に失敗しました: {layout_apply_error}")
                     # レイアウト適用失敗は警告のみ（反転処理自体は成功）
