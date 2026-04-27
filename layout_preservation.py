@@ -563,6 +563,69 @@ def _is_transitional_tempo_text(text: str) -> bool:
     return any(pattern in text_lower for pattern in TRANSITIONAL_TEMPO_PATTERNS)
 
 
+def _is_tempo_direction(dir_elem: DirectionElement) -> bool:
+    """direction要素がテンポ関連かどうかを判定する
+
+    sound子要素を持つwordsはテンポ指示と判断する。
+    """
+    return dir_elem.has_sound and dir_elem.has_words
+
+
+def _calculate_reversed_tempo_directions(
+    directions: list[DirectionElement],
+    total_measures: int
+) -> list[tuple[DirectionElement, int]]:
+    """テンポ関連direction要素の反転後位置を計算する
+
+    主要テンポ指示と経過的テンポ指示を分けて処理:
+    - 主要テンポ: 有効範囲ベースで反転（次の主要テンポまでの範囲を考慮）
+    - 経過的テンポ（rit., accel.等）: 単純な位置反転（相対位置を維持）
+
+    Args:
+        directions: テンポ関連のDirectionElementリスト
+        total_measures: 総小節数
+
+    Returns:
+        (DirectionElement, reversed_measure_num)のタプルリスト
+    """
+    if not directions:
+        return []
+
+    # 主要テンポ指示と経過的テンポ指示を分離
+    main_tempos = []
+    transitional_tempos = []
+
+    for d in directions:
+        if d.words_text and _is_transitional_tempo_text(d.words_text):
+            transitional_tempos.append(d)
+        else:
+            main_tempos.append(d)
+
+    result = []
+
+    # 主要テンポの有効範囲ベース反転
+    for i, dir_elem in enumerate(main_tempos):
+        # 適用終了位置を計算（次の「異なる小節」の主要テンポの直前まで）
+        effective_end = total_measures  # デフォルトは曲の最後
+        for j in range(i + 1, len(main_tempos)):
+            next_measure = main_tempos[j].measure_num
+            if next_measure > dir_elem.measure_num:
+                # 次の異なる小節のテンポを見つけた
+                effective_end = next_measure - 1
+                break
+
+        # 反転後の開始位置を計算
+        reversed_start = total_measures - effective_end + 1
+        result.append((dir_elem, reversed_start))
+
+    # 経過的テンポは単純な位置反転（小節番号のみ反転）
+    for dir_elem in transitional_tempos:
+        reversed_start = total_measures - dir_elem.measure_num + 1
+        result.append((dir_elem, reversed_start))
+
+    return result
+
+
 def restore_direction_elements(
     output_xml_path: Path,
     original_layout_map: LayoutMap,
@@ -574,6 +637,7 @@ def restore_direction_elements(
     music21が出力したdirection要素を削除し、元のXMLから保存した
     direction要素を反転後の正しい小節に挿入する。
 
+    テンポ関連direction要素（sound+wordsを持つもの）は有効範囲ベースで反転し、
     経過的テンポ（rit., accel.等）のwordsテキストには←記号を付与する。
 
     Args:
@@ -613,30 +677,34 @@ def restore_direction_elements(
             for d in directions_to_remove:
                 measure.remove(d)
 
-        # 保存したdirection要素を反転後の小節に挿入
-        for dir_elem in original_layout_map.directions[part_id]:
-            # 反転後の小節番号を計算（単純な反転）
-            reversed_measure_num = total_measures - dir_elem.measure_num + 1
+        # direction要素をテンポ関連とその他に分離
+        all_directions = original_layout_map.directions[part_id]
+        tempo_directions = [d for d in all_directions if _is_tempo_direction(d)]
+        other_directions = [d for d in all_directions if not _is_tempo_direction(d)]
 
+        # テンポ関連direction要素の反転位置を計算（有効範囲ベース）
+        reversed_tempo_positions = _calculate_reversed_tempo_directions(
+            tempo_directions, total_measures
+        )
+
+        # テンポ関連direction要素を挿入
+        for dir_elem, reversed_measure_num in reversed_tempo_positions:
             if reversed_measure_num not in measure_map:
                 continue
 
             target_measure = measure_map[reversed_measure_num]
 
-            # direction XMLをパースして要素を復元
             try:
                 restored_direction = ET.fromstring(dir_elem.direction_xml)
 
                 # 経過的テンポのwordsテキストに←記号を付与
-                if dir_elem.has_words and dir_elem.words_text:
-                    if _is_transitional_tempo_text(dir_elem.words_text):
-                        words_elem = restored_direction.find('.//{*}direction-type/{*}words')
-                        if words_elem is not None and words_elem.text:
-                            if not words_elem.text.startswith('←'):
-                                words_elem.text = '←' + words_elem.text
+                if dir_elem.words_text and _is_transitional_tempo_text(dir_elem.words_text):
+                    words_elem = restored_direction.find('.//{*}direction-type/{*}words')
+                    if words_elem is not None and words_elem.text:
+                        if not words_elem.text.startswith('←'):
+                            words_elem.text = '←' + words_elem.text
 
                 # direction要素を小節に挿入
-                # 挿入位置: 小節の先頭（attributesの後）
                 insert_pos = 0
                 for idx, child in enumerate(target_measure):
                     if child.tag.endswith('attributes'):
@@ -646,7 +714,29 @@ def restore_direction_elements(
                 target_measure.insert(insert_pos, restored_direction)
 
             except ET.ParseError:
-                # XMLパースエラーは無視
+                pass
+
+        # その他のdirection要素は単純な位置反転で挿入
+        for dir_elem in other_directions:
+            reversed_measure_num = total_measures - dir_elem.measure_num + 1
+
+            if reversed_measure_num not in measure_map:
+                continue
+
+            target_measure = measure_map[reversed_measure_num]
+
+            try:
+                restored_direction = ET.fromstring(dir_elem.direction_xml)
+
+                insert_pos = 0
+                for idx, child in enumerate(target_measure):
+                    if child.tag.endswith('attributes'):
+                        insert_pos = idx + 1
+                        break
+
+                target_measure.insert(insert_pos, restored_direction)
+
+            except ET.ParseError:
                 pass
 
     # 変更後のXMLを書き出し
