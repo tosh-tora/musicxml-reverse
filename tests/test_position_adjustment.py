@@ -363,10 +363,14 @@ class TestTransitionalTempoDetection:
             'accel.',
             'accelerando',
             'stringendo',
-            'morendo',
             'calando',
             'allargando',
-            'a tempo',
+            'smorzando',
+            'slentando',
+            'affrettando',
+            'incalzando',
+            'animando',
+            'stretto',
             'Rit.',  # 大文字でも検出
             'ALLARGANDO',
         ]
@@ -475,13 +479,13 @@ class TestTransitionalTempoCalculation:
         assert reversed_positions[2]['reversed_measure_num'] == 14
         assert reversed_positions[2]['element'].content == 'Molto Maestoso.'
 
-        # m20: rit. (経過的、単純反転: 53-34+1=20)
+        # m20: rit. (経過的、単純反転: 53-34+1=20) ←が付く
         assert reversed_positions[3]['reversed_measure_num'] == 20
-        assert reversed_positions[3]['element'].content == 'rit.'
+        assert reversed_positions[3]['element'].content == '←rit.'
 
-        # m25: allargando (経過的、単純反転: 53-29+1=25)
+        # m25: allargando (経過的、単純反転: 53-29+1=25) ←が付く
         assert reversed_positions[4]['reversed_measure_num'] == 25
-        assert reversed_positions[4]['element'].content == 'allargando'
+        assert reversed_positions[4]['element'].content == '←allargando'
 
     def test_main_tempo_only(self):
         """主要テンポのみの場合（従来動作と同じ）"""
@@ -534,11 +538,11 @@ class TestTransitionalTempoCalculation:
         reversed_positions = calculate_reversed_tempo_positions(positions, total_measures)
 
         assert len(reversed_positions) == 2
-        # 単純反転: m7 → 10-7+1=4, m3 → 10-3+1=8
+        # 単純反転: m7 → 10-7+1=4, m3 → 10-3+1=8 (←が付く)
         assert reversed_positions[0]['reversed_measure_num'] == 4
-        assert reversed_positions[0]['element'].content == 'accel.'
+        assert reversed_positions[0]['element'].content == '←accel.'
         assert reversed_positions[1]['reversed_measure_num'] == 8
-        assert reversed_positions[1]['element'].content == 'rit.'
+        assert reversed_positions[1]['element'].content == '←rit.'
 
 
 class TestTransitionalTempoCollection:
@@ -554,7 +558,7 @@ class TestTransitionalTempoCollection:
             elif i == 5:
                 m.insert(0, expressions.TextExpression('rit.'))
             elif i == 8:
-                m.insert(0, expressions.TextExpression('a tempo'))
+                m.insert(0, expressions.TextExpression('accel.'))
             m.append(note.Rest(quarterLength=4))
             measures.append(m)
 
@@ -570,7 +574,7 @@ class TestTransitionalTempoCollection:
         assert len(rit_pos) == 1
         assert rit_pos[0]['is_transitional'] is True
 
-        # a tempoは経過的
-        atempo_pos = [p for p in positions if 'a tempo' in getattr(p['element'], 'content', '').lower()]
-        assert len(atempo_pos) == 1
-        assert atempo_pos[0]['is_transitional'] is True
+        # accel.は経過的
+        accel_pos = [p for p in positions if 'accel' in getattr(p['element'], 'content', '').lower()]
+        assert len(accel_pos) == 1
+        assert accel_pos[0]['is_transitional'] is True
