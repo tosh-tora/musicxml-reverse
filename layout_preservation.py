@@ -1289,7 +1289,7 @@ def _restore_credits_with_retrograde(
                 # credit-words のテキストがパート名と一致するか確認
                 for words_elem in new_credit.findall('credit-words'):
                     if words_elem.text and words_elem.text.strip() == pn:
-                        words_elem.text = f"{pn}   {retrograde_label}"
+                        words_elem.text = f"{pn}\n{retrograde_label}"
                         break
 
         parent.insert(insert_idx, new_credit)
