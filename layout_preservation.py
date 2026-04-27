@@ -563,6 +563,77 @@ def _is_transitional_tempo_text(text: str) -> bool:
     return any(pattern in text_lower for pattern in TRANSITIONAL_TEMPO_PATTERNS)
 
 
+def _flip_wedge_type(t: Optional[str]) -> str:
+    if t == 'crescendo':
+        return 'diminuendo'
+    if t in ('diminuendo', 'decrescendo'):
+        return 'crescendo'
+    return t or ''
+
+
+def _wedge_only_direction(dir_elem: 'DirectionElement') -> Optional[ET.Element]:
+    """direction が wedge 単独要素ならその wedge 要素を返す。それ以外は None。"""
+    try:
+        root = ET.fromstring(dir_elem.direction_xml)
+    except ET.ParseError:
+        return None
+    direction_type = root.find('{*}direction-type')
+    if direction_type is None:
+        return None
+    children = list(direction_type)
+    if len(children) != 1:
+        return None
+    child = children[0]
+    if not child.tag.endswith('wedge'):
+        return None
+    return child
+
+
+def _separate_wedge_pairs(
+    dir_elems: list['DirectionElement']
+) -> tuple[list[tuple['DirectionElement', 'DirectionElement']], list['DirectionElement']]:
+    """direction リストから wedge start/stop ペアと、それ以外に分離する。
+
+    ペアリングは出現順に number 属性で対応付ける。ペアにならなかった
+    wedge direction は他の direction として扱う（フォールバック）。
+    """
+    pairs: list[tuple[DirectionElement, DirectionElement]] = []
+    others: list[DirectionElement] = []
+    open_starts: dict[str, DirectionElement] = {}
+    wedge_dirs_by_number: dict[str, list[DirectionElement]] = {}
+
+    classified: list[tuple[DirectionElement, Optional[ET.Element]]] = []
+    for d in dir_elems:
+        wedge = _wedge_only_direction(d)
+        classified.append((d, wedge))
+
+    for d, wedge in classified:
+        if wedge is None:
+            others.append(d)
+            continue
+        number = wedge.get('number') or '1'
+        wtype = wedge.get('type') or ''
+        if wtype in ('crescendo', 'diminuendo', 'decrescendo'):
+            # 既に開いている同 number の start は孤立扱い
+            if number in open_starts:
+                others.append(open_starts.pop(number))
+            open_starts[number] = d
+        elif wtype == 'stop':
+            start = open_starts.pop(number, None)
+            if start is not None:
+                pairs.append((start, d))
+            else:
+                others.append(d)
+        else:
+            others.append(d)
+
+    # 未クローズの start は孤立扱い
+    for d in open_starts.values():
+        others.append(d)
+
+    return pairs, others
+
+
 def restore_direction_elements(
     output_xml_path: Path,
     original_layout_map: LayoutMap,
@@ -613,9 +684,24 @@ def restore_direction_elements(
             for d in directions_to_remove:
                 measure.remove(d)
 
-        # 保存したdirection要素を反転後の小節に挿入
-        for dir_elem in original_layout_map.directions[part_id]:
-            # 反転後の小節番号を計算（単純な反転）
+        # wedge direction（クレッシェンド/デクレッシェンド）は、time方向が
+        # 反転すると start/stop の役割と type が入れ替わるため、ペアを認識して
+        # 再配置する必要がある。それ以外の direction は従来通り総小節数 - N + 1
+        # の位置に復元する。
+        wedge_pairs, other_dirs = _separate_wedge_pairs(
+            original_layout_map.directions[part_id]
+        )
+
+        def _insert_into_measure(target_measure, restored):
+            insert_pos = 0
+            for idx, child in enumerate(target_measure):
+                if child.tag.endswith('attributes'):
+                    insert_pos = idx + 1
+                    break
+            target_measure.insert(insert_pos, restored)
+
+        # 非 wedge direction の復元（従来挙動）
+        for dir_elem in other_dirs:
             reversed_measure_num = total_measures - dir_elem.measure_num + 1
 
             if reversed_measure_num not in measure_map:
@@ -623,11 +709,9 @@ def restore_direction_elements(
 
             target_measure = measure_map[reversed_measure_num]
 
-            # direction XMLをパースして要素を復元
             try:
                 restored_direction = ET.fromstring(dir_elem.direction_xml)
 
-                # 経過的テンポのwordsテキストに←記号を付与
                 if dir_elem.has_words and dir_elem.words_text:
                     if _is_transitional_tempo_text(dir_elem.words_text):
                         words_elem = restored_direction.find('.//{*}direction-type/{*}words')
@@ -635,18 +719,32 @@ def restore_direction_elements(
                             if not words_elem.text.startswith('←'):
                                 words_elem.text = '←' + words_elem.text
 
-                # direction要素を小節に挿入
-                # 挿入位置: 小節の先頭（attributesの後）
-                insert_pos = 0
-                for idx, child in enumerate(target_measure):
-                    if child.tag.endswith('attributes'):
-                        insert_pos = idx + 1
-                        break
-
-                target_measure.insert(insert_pos, restored_direction)
-
+                _insert_into_measure(target_measure, restored_direction)
             except ET.ParseError:
-                # XMLパースエラーは無視
+                pass
+
+        # wedge ペアの復元（時間反転に伴い type を反転、配置を入れ替え）
+        for start_dir, stop_dir in wedge_pairs:
+            # 元: start at A → stop at B (A < B)
+            # 反転後の時間順では reversed_pos(B) < reversed_pos(A)
+            # 新しい開始: reversed_pos(B) に、type を反転した start XML を配置
+            # 新しい終了: reversed_pos(A) に、stop XML を配置
+            new_start_measure = total_measures - stop_dir.measure_num + 1
+            new_stop_measure = total_measures - start_dir.measure_num + 1
+
+            try:
+                if new_start_measure in measure_map:
+                    new_start_xml = ET.fromstring(start_dir.direction_xml)
+                    wedge_elem = new_start_xml.find('.//{*}direction-type/{*}wedge')
+                    if wedge_elem is not None:
+                        cur_type = wedge_elem.get('type')
+                        wedge_elem.set('type', _flip_wedge_type(cur_type))
+                    _insert_into_measure(measure_map[new_start_measure], new_start_xml)
+
+                if new_stop_measure in measure_map:
+                    new_stop_xml = ET.fromstring(stop_dir.direction_xml)
+                    _insert_into_measure(measure_map[new_stop_measure], new_stop_xml)
+            except ET.ParseError:
                 pass
 
     # 変更後のXMLを書き出し
