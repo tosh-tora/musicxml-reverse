@@ -875,21 +875,36 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
 
             new_part.insert(0, new_spanner)
 
-    # TrillExtensionの開始音符からTrill expressionを削除（重複防止）
-    trill_extension_starts = set()
+    # TrillExtension内の重複Trill expressionをクリーンアップ
+    # 開始音符にはTrillを確保、それ以外の音符からは削除
     for sp in new_part.spannerBundle:
         if isinstance(sp, expressions.TrillExtension):
             spanned = list(sp.getSpannedElements())
-            if spanned:
-                trill_extension_starts.add(id(spanned[0]))
+            if not spanned:
+                continue
 
-    for measure in new_part.getElementsByClass(stream.Measure):
-        for element in measure.notesAndRests:
-            if id(element) in trill_extension_starts and hasattr(element, 'expressions'):
-                element.expressions = [
-                    exp for exp in element.expressions
-                    if not isinstance(exp, expressions.Trill)
-                ]
+            for i, elem in enumerate(spanned):
+                if not hasattr(elem, 'expressions'):
+                    continue
+
+                if i == 0:
+                    # 開始音符: Trillが1つだけあることを保証
+                    existing_trills = [e for e in elem.expressions if isinstance(e, expressions.Trill)]
+                    other_expressions = [e for e in elem.expressions if not isinstance(e, expressions.Trill)]
+
+                    if len(existing_trills) == 0:
+                        # Trillがない場合は追加
+                        elem.expressions = other_expressions + [expressions.Trill()]
+                    elif len(existing_trills) > 1:
+                        # 複数ある場合は1つに削減
+                        elem.expressions = other_expressions + [existing_trills[0]]
+                    # すでに1つある場合は何もしない
+                else:
+                    # 開始音符以外: Trillを削除
+                    elem.expressions = [e for e in elem.expressions if not isinstance(e, expressions.Trill)]
+
+
+
 
     # 小節ベースSpanner（RepeatBracket等）を再構築
     for mb_sp in measure_based_spanners:
