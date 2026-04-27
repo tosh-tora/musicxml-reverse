@@ -56,11 +56,30 @@ class TechnicalElement:
 
 
 @dataclass
+class DirectionElement:
+    """Direction要素の保存用（music21が分割するもの）
+
+    music21はMusicXMLのdirection要素を読み込んで書き出す際、
+    words+soundを含む単一のdirection要素を2つに分割してしまう。
+    元のXMLを保存し、反転後に復元することでこの問題を回避する。
+    """
+    measure_num: int
+    element_index: int  # 小節内でのdirection要素の出現順
+    direction_xml: str  # direction要素全体のXML文字列
+    placement: Optional[str] = None  # placement属性
+    has_sound: bool = False  # sound子要素を持つか
+    has_words: bool = False  # words子要素を持つか
+    words_text: Optional[str] = None  # wordsのテキスト内容
+
+
+@dataclass
 class LayoutMap:
     """スコア全体のレイアウト情報"""
     measures: dict[tuple[str, int], MeasureLayout] = field(default_factory=dict)
     # Key: (part_id, measure_number)
     technical_elements: dict[str, list[TechnicalElement]] = field(default_factory=dict)
+    # Key: part_id
+    directions: dict[str, list[DirectionElement]] = field(default_factory=dict)
     # Key: part_id
     defaults_xml: Optional[str] = None  # defaults要素をXML文字列として保存
 
@@ -129,6 +148,7 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
     for part_idx, part in enumerate(root.findall('.//{*}part')):
         part_id = part.get('id', f'P{part_idx + 1}')
         layout_map.technical_elements[part_id] = []
+        layout_map.directions[part_id] = []
 
         # 各小節を走査
         for measure in part.findall('.//{*}measure'):
@@ -156,6 +176,7 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
             current_offset = 0.0
             divisions = 1.0  # デフォルト
             note_index = 0  # 小節内の音符インデックス
+            direction_index = 0  # 小節内のdirection要素のインデックス
 
             # attributes要素からdivisionsを取得
             for attributes in measure.findall('.//{*}attributes'):
@@ -170,6 +191,29 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
             for elem in measure:
                 # direction要素（ダイナミクス、テキストなど）
                 if elem.tag.endswith('direction'):
+                    # direction要素をXMLとして保存（music21分割問題対策）
+                    placement = elem.get('placement')
+                    sound = elem.find('.//{*}sound')
+                    words = elem.find('.//{*}direction-type/{*}words')
+
+                    has_sound = sound is not None
+                    has_words = words is not None
+                    words_text = None
+                    if words is not None and words.text:
+                        words_text = words.text.strip()
+
+                    direction_elem = DirectionElement(
+                        measure_num=measure_num,
+                        element_index=direction_index,
+                        direction_xml=ET.tostring(elem, encoding='unicode'),
+                        placement=placement,
+                        has_sound=has_sound,
+                        has_words=has_words,
+                        words_text=words_text
+                    )
+                    layout_map.directions[part_id].append(direction_elem)
+                    direction_index += 1
+
                     # offset属性（direction要素内のオフセット）
                     offset_elem = elem.find('.//{*}offset')
                     direction_offset = 0.0
@@ -468,6 +512,142 @@ def merge_split_directions(output_xml_path: Path, verbose: bool = False) -> None
 
     if verbose:
         print(f"  Total merged: {merge_count} direction pairs")
+
+    # 変更後のXMLを書き出し
+    if is_mxl:
+        import tempfile
+        import shutil
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_mxl = Path(tmpdir) / 'output.mxl'
+            shutil.copy2(output_xml_path, tmp_mxl)
+
+            xml_content = ET.tostring(root, encoding='utf-8', xml_declaration=True)
+
+            with zipfile.ZipFile(output_xml_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf_out:
+                with zipfile.ZipFile(tmp_mxl, 'r') as zf_in:
+                    for item in zf_in.namelist():
+                        if item == xml_filename:
+                            zf_out.writestr(item, xml_content)
+                        else:
+                            zf_out.writestr(item, zf_in.read(item))
+    else:
+        tree = ET.ElementTree(root)
+        tree.write(output_xml_path, encoding='utf-8', xml_declaration=True)
+
+
+# 経過的テンポパターン（reverse_score.pyからの抜粋）
+# rit., accel.などの一時的な速度変化を示すパターン
+TRANSITIONAL_TEMPO_PATTERNS = [
+    'ritardando', 'rit.', 'rit', 'ritenuto', 'riten.', 'riten',
+    'rallentando', 'rall.', 'rall', 'rallent.',
+    'allargando', 'allarg.', 'allarg',
+    'calando', 'cal.',
+    'smorzando', 'smorz.', 'smorz',
+    'morendo', 'mor.',
+    'perdendosi', 'perd.',
+    'accelerando', 'accel.', 'accel',
+    'stringendo', 'string.', 'string',
+    'affrettando', 'affrett.', 'affrett',
+    'incalzando', 'incalz.', 'incalz',
+    'animando', 'animand.', 'animand',
+    'stretto',
+]
+
+
+def _is_transitional_tempo_text(text: str) -> bool:
+    """テンポ表記が経過的（一時的な変化）かどうかを判定する"""
+    if not text:
+        return False
+    text_lower = text.lower()
+    return any(pattern in text_lower for pattern in TRANSITIONAL_TEMPO_PATTERNS)
+
+
+def restore_direction_elements(
+    output_xml_path: Path,
+    original_layout_map: LayoutMap,
+    total_measures: int
+) -> None:
+    """
+    保存したdirection要素を反転後の小節に復元する
+
+    music21が出力したdirection要素を削除し、元のXMLから保存した
+    direction要素を反転後の正しい小節に挿入する。
+
+    経過的テンポ（rit., accel.等）のwordsテキストには←記号を付与する。
+
+    Args:
+        output_xml_path: 出力MusicXMLファイル(.xml または .mxl)
+        original_layout_map: 元のレイアウト情報（direction要素を含む）
+        total_measures: 総小節数（反転計算用）
+    """
+    # ファイルを読み込み
+    is_mxl = output_xml_path.suffix == '.mxl'
+
+    if is_mxl:
+        root, xml_filename = _extract_mxl_content(output_xml_path)
+    else:
+        tree = ET.parse(output_xml_path)
+        root = tree.getroot()
+
+    # 各パートを処理
+    for part_idx, part in enumerate(root.findall('.//{*}part')):
+        part_id = part.get('id', f'P{part_idx + 1}')
+
+        if part_id not in original_layout_map.directions:
+            continue
+
+        # 小節をインデックスでアクセスできるようにマップを作成
+        measure_map = {}
+        for measure in part.findall('.//{*}measure'):
+            measure_num_str = measure.get('number')
+            if measure_num_str:
+                try:
+                    measure_map[int(measure_num_str)] = measure
+                except ValueError:
+                    pass
+
+        # 各小節からmusic21が生成したdirection要素を削除
+        for measure in part.findall('.//{*}measure'):
+            directions_to_remove = list(measure.findall('{*}direction'))
+            for d in directions_to_remove:
+                measure.remove(d)
+
+        # 保存したdirection要素を反転後の小節に挿入
+        for dir_elem in original_layout_map.directions[part_id]:
+            # 反転後の小節番号を計算（単純な反転）
+            reversed_measure_num = total_measures - dir_elem.measure_num + 1
+
+            if reversed_measure_num not in measure_map:
+                continue
+
+            target_measure = measure_map[reversed_measure_num]
+
+            # direction XMLをパースして要素を復元
+            try:
+                restored_direction = ET.fromstring(dir_elem.direction_xml)
+
+                # 経過的テンポのwordsテキストに←記号を付与
+                if dir_elem.has_words and dir_elem.words_text:
+                    if _is_transitional_tempo_text(dir_elem.words_text):
+                        words_elem = restored_direction.find('.//{*}direction-type/{*}words')
+                        if words_elem is not None and words_elem.text:
+                            if not words_elem.text.startswith('←'):
+                                words_elem.text = '←' + words_elem.text
+
+                # direction要素を小節に挿入
+                # 挿入位置: 小節の先頭（attributesの後）
+                insert_pos = 0
+                for idx, child in enumerate(target_measure):
+                    if child.tag.endswith('attributes'):
+                        insert_pos = idx + 1
+                        break
+
+                target_measure.insert(insert_pos, restored_direction)
+
+            except ET.ParseError:
+                # XMLパースエラーは無視
+                pass
 
     # 変更後のXMLを書き出し
     if is_mxl:
