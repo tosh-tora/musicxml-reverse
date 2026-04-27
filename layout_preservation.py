@@ -84,6 +84,8 @@ class LayoutMap:
     directions: dict[str, list[DirectionElement]] = field(default_factory=dict)
     # Key: part_id
     defaults_xml: Optional[str] = None  # defaults要素をXML文字列として保存
+    credits_xml: list[str] = field(default_factory=list)  # credit要素のXML文字列（順序保持）
+    part_name: Optional[str] = None  # 表示用パート名（part-name credit のマッチング用）
 
 
 def _extract_mxl_content(mxl_path: Path) -> tuple[ET.Element, str]:
@@ -139,6 +141,23 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
     defaults_elem = root.find('.//{*}defaults')
     if defaults_elem is not None:
         layout_map.defaults_xml = ET.tostring(defaults_elem, encoding='unicode')
+
+    # credit要素を抽出して保存（music21が消してしまうため）
+    for credit_elem in root.findall('.//{*}credit'):
+        layout_map.credits_xml.append(ET.tostring(credit_elem, encoding='unicode'))
+
+    # 表示用パート名を抽出（part-name credit のマッチング用）
+    misc_field = root.find('.//{*}miscellaneous/{*}miscellaneous-field[@name="partName"]')
+    if misc_field is not None and misc_field.text:
+        layout_map.part_name = misc_field.text.strip()
+    else:
+        instr_name = root.find('.//{*}score-part/{*}score-instrument/{*}instrument-name')
+        if instr_name is not None and instr_name.text:
+            layout_map.part_name = instr_name.text.strip()
+        else:
+            part_name_elem = root.find('.//{*}score-part/{*}part-name')
+            if part_name_elem is not None and part_name_elem.text:
+                layout_map.part_name = part_name_elem.text.strip()
 
     # 名前空間を考慮した検索（MusicXMLは名前空間を使う場合がある）
     ns = {'': root.tag.split('}')[0].strip('{') if '}' in root.tag else ''}
@@ -1202,6 +1221,81 @@ def normalize_slur_numbers(output_xml_path: Path, verbose: bool = False) -> None
         tree.write(output_xml_path, encoding='utf-8', xml_declaration=True)
 
 
+def _restore_credits_with_retrograde(
+    root: ET.Element,
+    credits_xml: list[str],
+    part_name: Optional[str],
+    retrograde_label: str = "(retrograde)"
+) -> None:
+    """
+    保存されたcredit要素を復元し、part-name credit に retrograde ラベルを付与
+
+    music21はcredit要素を出力XMLから削除してしまうため、
+    元のXMLから抽出したcredit要素を再挿入する。
+    パート名を表示しているcredit-wordsには " (retrograde)" を追記する。
+
+    Args:
+        root: 出力XMLのルート要素
+        credits_xml: 元のcredit要素のXML文字列リスト
+        part_name: パート名（マッチングに使用）
+        retrograde_label: 追記するラベル
+    """
+    if not credits_xml:
+        return
+
+    # 既存のcredit要素を全て削除（重複防止）
+    for parent in list(root.iter()):
+        for child in list(parent):
+            if child.tag.split('}')[-1] == 'credit':
+                parent.remove(child)
+
+    # 挿入位置: part-list の直前
+    part_list = root.find('.//{*}part-list')
+    if part_list is None:
+        return
+
+    parent = None
+    for elem in root.iter():
+        if part_list in list(elem):
+            parent = elem
+            break
+    if parent is None:
+        return
+
+    insert_idx = list(parent).index(part_list)
+
+    pn = part_name.strip() if part_name else None
+
+    for credit_xml in credits_xml:
+        try:
+            credit_elem = ET.fromstring(credit_xml)
+        except ET.ParseError:
+            continue
+
+        # 名前空間を除去した新しい credit 要素を構築
+        new_credit = ET.Element('credit')
+        new_credit.attrib = {k.split('}')[-1]: v for k, v in credit_elem.attrib.items()}
+        _copy_element_children(credit_elem, new_credit)
+
+        # part-name credit を判定し、retrograde ラベルを追記
+        if pn:
+            credit_type_elem = new_credit.find('credit-type')
+            credit_type = (credit_type_elem.text or "").strip().lower() if credit_type_elem is not None and credit_type_elem.text else ""
+
+            # 既知の非パート名タイプはスキップ
+            non_part_types = {'title', 'subtitle', 'composer', 'arranger',
+                              'lyricist', 'rights', 'page number'}
+            if credit_type not in non_part_types:
+                # credit-words のテキストがパート名と一致するか確認
+                for words_elem in new_credit.findall('credit-words'):
+                    if words_elem.text and words_elem.text.strip() == pn:
+                        words_elem.text = f"{pn}\n{retrograde_label}"
+                        break
+
+        parent.insert(insert_idx, new_credit)
+        insert_idx += 1
+
+
 def _restore_defaults_element(root: ET.Element, defaults_xml: str) -> None:
     """
     保存されたdefaults要素を復元
@@ -1568,6 +1662,13 @@ def apply_layout_to_xml(
     # defaults要素の復元（music21が変更してしまうスケーリングやページレイアウト）
     if original_layout_map.defaults_xml is not None:
         _restore_defaults_element(root, original_layout_map.defaults_xml)
+
+    # credit要素の復元（music21が削除してしまう） + part-name に retrograde ラベル付与
+    _restore_credits_with_retrograde(
+        root,
+        original_layout_map.credits_xml,
+        original_layout_map.part_name,
+    )
 
     # technical要素の復元（music21が読み込まなかった要素）
     _restore_technical_elements(root, original_layout_map, total_measures)
