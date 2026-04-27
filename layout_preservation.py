@@ -70,6 +70,8 @@ class DirectionElement:
     has_sound: bool = False  # sound子要素を持つか
     has_words: bool = False  # words子要素を持つか
     words_text: Optional[str] = None  # wordsのテキスト内容
+    offset_quarters: float = 0.0  # 小節内オフセット（四分音符単位）
+    measure_duration_quarters: float = 0.0  # 小節全体の長さ（四分音符単位）
 
 
 @dataclass
@@ -150,6 +152,10 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
         layout_map.technical_elements[part_id] = []
         layout_map.directions[part_id] = []
 
+        # divisions はパート全体で持ち越す（MusicXML は最初の measure で
+        # 1 度だけ宣言されることが多い）
+        divisions = 1.0
+
         # 各小節を走査
         for measure in part.findall('.//{*}measure'):
             measure_num_str = measure.get('number')
@@ -174,7 +180,6 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
 
             # 現在のオフセット（divisions単位）を追跡
             current_offset = 0.0
-            divisions = 1.0  # デフォルト
             note_index = 0  # 小節内の音符インデックス
             direction_index = 0  # 小節内のdirection要素のインデックス
 
@@ -186,6 +191,35 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
                         divisions = float(div_elem.text)
                     except ValueError:
                         pass
+
+            # 小節全体の長さ（四分音符単位）を事前計算
+            _scan_offset = 0.0
+            _scan_max = 0.0
+            for _e in measure:
+                if _e.tag.endswith('note'):
+                    _d = _e.find('.//{*}duration')
+                    if _d is not None and _d.text and _e.find('.//{*}chord') is None:
+                        try:
+                            _scan_offset += float(_d.text) / divisions
+                        except ValueError:
+                            pass
+                elif _e.tag.endswith('backup'):
+                    _d = _e.find('.//{*}duration')
+                    if _d is not None and _d.text:
+                        try:
+                            _scan_offset = max(0.0, _scan_offset - float(_d.text) / divisions)
+                        except ValueError:
+                            pass
+                elif _e.tag.endswith('forward'):
+                    _d = _e.find('.//{*}duration')
+                    if _d is not None and _d.text:
+                        try:
+                            _scan_offset += float(_d.text) / divisions
+                        except ValueError:
+                            pass
+                if _scan_offset > _scan_max:
+                    _scan_max = _scan_offset
+            measure_duration_quarters = _scan_max
 
             # 小節内の要素を走査
             for elem in measure:
@@ -202,6 +236,15 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
                     if words is not None and words.text:
                         words_text = words.text.strip()
 
+                    # direction内のoffset要素も加味して時間位置を計算
+                    _offset_elem = elem.find('.//{*}offset')
+                    _direction_offset_q = 0.0
+                    if _offset_elem is not None and _offset_elem.text:
+                        try:
+                            _direction_offset_q = float(_offset_elem.text) / divisions
+                        except ValueError:
+                            pass
+
                     direction_elem = DirectionElement(
                         measure_num=measure_num,
                         element_index=direction_index,
@@ -209,7 +252,9 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
                         placement=placement,
                         has_sound=has_sound,
                         has_words=has_words,
-                        words_text=words_text
+                        words_text=words_text,
+                        offset_quarters=current_offset + _direction_offset_q,
+                        measure_duration_quarters=measure_duration_quarters,
                     )
                     layout_map.directions[part_id].append(direction_elem)
                     direction_index += 1
@@ -563,6 +608,121 @@ def _is_transitional_tempo_text(text: str) -> bool:
     return any(pattern in text_lower for pattern in TRANSITIONAL_TEMPO_PATTERNS)
 
 
+def _measure_divisions(measure: ET.Element, default: float = 1.0) -> float:
+    """小節（または直前の attributes）から divisions を取得"""
+    div_elem = measure.find('.//{*}attributes/{*}divisions')
+    if div_elem is not None and div_elem.text:
+        try:
+            return float(div_elem.text)
+        except ValueError:
+            pass
+    return default
+
+
+def _find_part_divisions(part: ET.Element, default: float = 1.0) -> float:
+    """パート内のいずれかの measure/attributes から divisions を取得"""
+    div_elem = part.find('.//{*}attributes/{*}divisions')
+    if div_elem is not None and div_elem.text:
+        try:
+            return float(div_elem.text)
+        except ValueError:
+            pass
+    return default
+
+
+def _measure_total_quarters(measure: ET.Element, divisions: float) -> float:
+    """小節内の note/backup/forward から実時間長（四分音符単位）を計算"""
+    offset = 0.0
+    max_offset = 0.0
+    for child in measure:
+        if child.tag.endswith('note'):
+            d = child.find('.//{*}duration')
+            if d is not None and d.text and child.find('.//{*}chord') is None:
+                try:
+                    offset += float(d.text) / divisions
+                except ValueError:
+                    pass
+        elif child.tag.endswith('backup'):
+            d = child.find('.//{*}duration')
+            if d is not None and d.text:
+                try:
+                    offset = max(0.0, offset - float(d.text) / divisions)
+                except ValueError:
+                    pass
+        elif child.tag.endswith('forward'):
+            d = child.find('.//{*}duration')
+            if d is not None and d.text:
+                try:
+                    offset += float(d.text) / divisions
+                except ValueError:
+                    pass
+        if offset > max_offset:
+            max_offset = offset
+    return max_offset
+
+
+def _insert_direction_at_offset(
+    measure: ET.Element,
+    direction: ET.Element,
+    target_offset_quarters: float,
+    divisions: Optional[float] = None,
+) -> None:
+    """target_offset_quarters の時間位置に direction を挿入する。
+
+    note/backup/forward を走査してオフセットが target に達した時点で
+    その子要素の直前に挿入する。target が小節末以降なら barline の直前
+    （barline がなければ末尾）に挿入する。
+    """
+    if divisions is None:
+        divisions = _measure_divisions(measure)
+    offset = 0.0
+    epsilon = 1e-6
+
+    # 既に target_offset_quarters <= 0 なら冒頭（attributes 直後）に挿入
+    if target_offset_quarters <= epsilon:
+        insert_pos = 0
+        for idx, child in enumerate(measure):
+            if child.tag.endswith('attributes'):
+                insert_pos = idx + 1
+        measure.insert(insert_pos, direction)
+        return
+
+    children = list(measure)
+    for idx, child in enumerate(children):
+        if child.tag.endswith('note'):
+            if child.find('.//{*}chord') is None:
+                if offset + epsilon >= target_offset_quarters:
+                    measure.insert(idx, direction)
+                    return
+                d = child.find('.//{*}duration')
+                if d is not None and d.text:
+                    try:
+                        offset += float(d.text) / divisions
+                    except ValueError:
+                        pass
+        elif child.tag.endswith('backup'):
+            d = child.find('.//{*}duration')
+            if d is not None and d.text:
+                try:
+                    offset = max(0.0, offset - float(d.text) / divisions)
+                except ValueError:
+                    pass
+        elif child.tag.endswith('forward'):
+            d = child.find('.//{*}duration')
+            if d is not None and d.text:
+                try:
+                    offset += float(d.text) / divisions
+                except ValueError:
+                    pass
+        elif child.tag.endswith('barline'):
+            # barline 直前に挿入
+            measure.insert(idx, direction)
+            return
+
+    # 走査完了 → 末尾に追加
+    measure.append(direction)
+
+
 def _flip_wedge_type(t: Optional[str]) -> str:
     if t == 'crescendo':
         return 'diminuendo'
@@ -723,27 +883,44 @@ def restore_direction_elements(
             except ET.ParseError:
                 pass
 
+        # 反転後の小節は <attributes>/<divisions> を持たないことが多いので
+        # パートレベルから divisions を取得しておく
+        part_divisions = _find_part_divisions(part)
+
         # wedge ペアの復元（時間反転に伴い type を反転、配置を入れ替え）
         for start_dir, stop_dir in wedge_pairs:
-            # 元: start at A → stop at B (A < B)
-            # 反転後の時間順では reversed_pos(B) < reversed_pos(A)
-            # 新しい開始: reversed_pos(B) に、type を反転した start XML を配置
-            # 新しい終了: reversed_pos(A) に、stop XML を配置
+            # 元: start at measure A, offset SA → stop at measure B, offset SB
+            # 時間反転すると、反転後の各 direction の小節内オフセットは
+            # (反転後の小節長) - (元のオフセット) になる。
+            # さらに start/stop のロールが入れ替わるため:
+            #   新 start (type 反転) = 反転後の B 小節, offset = M(B') - SB
+            #   新 stop                = 反転後の A 小節, offset = M(A') - SA
             new_start_measure = total_measures - stop_dir.measure_num + 1
             new_stop_measure = total_measures - start_dir.measure_num + 1
 
             try:
                 if new_start_measure in measure_map:
+                    target = measure_map[new_start_measure]
                     new_start_xml = ET.fromstring(start_dir.direction_xml)
                     wedge_elem = new_start_xml.find('.//{*}direction-type/{*}wedge')
                     if wedge_elem is not None:
                         cur_type = wedge_elem.get('type')
                         wedge_elem.set('type', _flip_wedge_type(cur_type))
-                    _insert_into_measure(measure_map[new_start_measure], new_start_xml)
+                    # 反転後の小節長は元の対応小節（stop の元小節）と等しい
+                    target_dur = stop_dir.measure_duration_quarters
+                    target_offset = max(0.0, target_dur - stop_dir.offset_quarters)
+                    _insert_direction_at_offset(
+                        target, new_start_xml, target_offset, part_divisions
+                    )
 
                 if new_stop_measure in measure_map:
+                    target = measure_map[new_stop_measure]
                     new_stop_xml = ET.fromstring(stop_dir.direction_xml)
-                    _insert_into_measure(measure_map[new_stop_measure], new_stop_xml)
+                    target_dur = start_dir.measure_duration_quarters
+                    target_offset = max(0.0, target_dur - start_dir.offset_quarters)
+                    _insert_direction_at_offset(
+                        target, new_stop_xml, target_offset, part_divisions
+                    )
             except ET.ParseError:
                 pass
 
