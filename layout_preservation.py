@@ -62,6 +62,7 @@ class LayoutMap:
     # Key: (part_id, measure_number)
     technical_elements: dict[str, list[TechnicalElement]] = field(default_factory=dict)
     # Key: part_id
+    defaults_xml: Optional[str] = None  # defaults要素をXML文字列として保存
 
 
 def _extract_mxl_content(mxl_path: Path) -> tuple[ET.Element, str]:
@@ -112,6 +113,11 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
     else:
         tree = ET.parse(xml_path)
         root = tree.getroot()
+
+    # defaults要素を抽出して保存（music21が変更してしまうため）
+    defaults_elem = root.find('.//{*}defaults')
+    if defaults_elem is not None:
+        layout_map.defaults_xml = ET.tostring(defaults_elem, encoding='unicode')
 
     # 名前空間を考慮した検索（MusicXMLは名前空間を使う場合がある）
     ns = {'': root.tag.split('}')[0].strip('{') if '}' in root.tag else ''}
@@ -486,6 +492,249 @@ def merge_split_directions(output_xml_path: Path, verbose: bool = False) -> None
         tree.write(output_xml_path, encoding='utf-8', xml_declaration=True)
 
 
+def normalize_slur_numbers(output_xml_path: Path, verbose: bool = False) -> None:
+    """
+    スラーのnumber属性を正規化する
+
+    music21は同じnumber属性を複数の独立したスラーに使い回すことがあり、
+    これにより楽譜ソフトが異なるスラーを接続してしまう問題がある。
+
+    また、反転処理によりスラーの方向が逆転した場合、music21は
+    XMLに stop, start の順序で出力することがある。
+
+    この関数は各スラーペア(start-stop)に一意のnumber属性を割り当てる。
+    同じ元number属性を持つstart-stopを正しくペアリングする。
+
+    Args:
+        output_xml_path: 処理対象のMusicXMLファイル(.xml または .mxl)
+        verbose: デバッグ出力を有効にする
+    """
+    is_mxl = output_xml_path.suffix == '.mxl'
+
+    if is_mxl:
+        root, xml_filename = _extract_mxl_content(output_xml_path)
+    else:
+        tree = ET.parse(output_xml_path)
+        root = tree.getroot()
+
+    # 各パートを処理
+    for part in root.findall('.//{*}part'):
+        part_id = part.get('id', 'unknown')
+
+        # スラー情報を収集
+        slur_events = []
+
+        for measure in part.findall('.//{*}measure'):
+            measure_num = measure.get('number')
+            if measure_num is None:
+                continue
+
+            note_index = 0
+            for elem in measure:
+                if elem.tag.endswith('note'):
+                    # 和音の場合はインデックスを進めない
+                    is_chord = elem.find('.//{*}chord') is not None
+                    if not is_chord:
+                        note_index += 1
+
+                    # notations内のslur要素を探す
+                    for notations in elem.findall('.//{*}notations'):
+                        for slur in notations.findall('.//{*}slur'):
+                            slur_type = slur.get('type')
+                            slur_num = slur.get('number', '1')
+                            slur_events.append({
+                                'measure_num': int(measure_num),
+                                'note_index': note_index,
+                                'slur_type': slur_type,
+                                'original_number': slur_num,
+                                'slur_element': slur,
+                                'used': False
+                            })
+
+        if not slur_events:
+            continue
+
+        # イベントを時系列順にソート
+        slur_events.sort(key=lambda x: (x['measure_num'], x['note_index']))
+
+        # 2パスでスラーをペアリング
+        # Pass 1: 同じ元番号でstart→stopの順序のペアを見つける（正常なスラー）
+        # Pass 2: 同じ元番号でstop→startの順序のペアを見つける（反転されたスラー）
+
+        next_new_number = 1
+
+        # Pass 1: start → stop (FIFO順)
+        for i, event in enumerate(slur_events):
+            if event['used'] or event['slur_type'] != 'start':
+                continue
+
+            orig_num = event['original_number']
+            # このstartに対応するstopを探す（時系列的に後にある、同じ元番号）
+            for j in range(i + 1, len(slur_events)):
+                other = slur_events[j]
+                if other['used']:
+                    continue
+                if other['original_number'] == orig_num and other['slur_type'] == 'stop':
+                    # ペア発見
+                    new_number = next_new_number
+                    next_new_number += 1
+                    event['slur_element'].set('number', str(new_number))
+                    other['slur_element'].set('number', str(new_number))
+                    event['used'] = True
+                    other['used'] = True
+                    if verbose:
+                        print(f"  Paired slur {new_number}: m{event['measure_num']} start -> m{other['measure_num']} stop (orig={orig_num})")
+                    break
+
+        # Pass 2: stop → start (反転されたスラー)
+        # この場合、stopを見つけたら、それより後のstartを探す
+        for i, event in enumerate(slur_events):
+            if event['used'] or event['slur_type'] != 'stop':
+                continue
+
+            orig_num = event['original_number']
+            # このstopに対応するstartを探す（時系列的に後にある、同じ元番号）
+            for j in range(i + 1, len(slur_events)):
+                other = slur_events[j]
+                if other['used']:
+                    continue
+                if other['original_number'] == orig_num and other['slur_type'] == 'start':
+                    # 反転されたスラーのペア発見
+                    # XMLではstart/stopの順序を入れ替える必要がある
+                    new_number = next_new_number
+                    next_new_number += 1
+
+                    # stopをstartに、startをstopに変更
+                    event['slur_element'].set('type', 'start')
+                    event['slur_element'].set('number', str(new_number))
+                    other['slur_element'].set('type', 'stop')
+                    other['slur_element'].set('number', str(new_number))
+                    event['used'] = True
+                    other['used'] = True
+                    if verbose:
+                        print(f"  Reversed slur {new_number}: m{event['measure_num']} (was stop->start) -> m{other['measure_num']} (was start->stop) (orig={orig_num})")
+                    break
+
+        # 未使用のスラー（孤立したstart/stop）に新しい番号を割り当て
+        for event in slur_events:
+            if not event['used']:
+                new_number = next_new_number
+                next_new_number += 1
+                event['slur_element'].set('number', str(new_number))
+                if verbose:
+                    print(f"  Warning: Orphan {event['slur_type']} (orig={event['original_number']}) at m{event['measure_num']} -> slur {new_number}")
+
+    # 変更後のXMLを書き出し
+    if is_mxl:
+        import tempfile
+        import shutil
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_mxl = Path(tmpdir) / 'output.mxl'
+            shutil.copy2(output_xml_path, tmp_mxl)
+
+            xml_content = ET.tostring(root, encoding='utf-8', xml_declaration=True)
+
+            with zipfile.ZipFile(output_xml_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf_out:
+                with zipfile.ZipFile(tmp_mxl, 'r') as zf_in:
+                    for item in zf_in.namelist():
+                        if item == xml_filename:
+                            zf_out.writestr(item, xml_content)
+                        else:
+                            zf_out.writestr(item, zf_in.read(item))
+    else:
+        tree = ET.ElementTree(root)
+        tree.write(output_xml_path, encoding='utf-8', xml_declaration=True)
+
+
+def _restore_defaults_element(root: ET.Element, defaults_xml: str) -> None:
+    """
+    保存されたdefaults要素を復元
+
+    music21はdefaults要素を適切に保持しないため、
+    元のファイルから抽出したdefaults要素で置換する。
+
+    Args:
+        root: XMLルート要素
+        defaults_xml: 保存されたdefaults要素のXML文字列
+    """
+    # 保存されたdefaultsをパース
+    try:
+        saved_defaults = ET.fromstring(defaults_xml)
+    except ET.ParseError:
+        return
+
+    # 名前空間を削除（必要に応じて）
+    saved_tag = saved_defaults.tag.split('}')[-1]
+
+    # 既存のdefaults要素を探す
+    existing_defaults = root.find('.//{*}defaults')
+
+    if existing_defaults is not None:
+        # 既存のdefaults要素の親を取得
+        parent = None
+        for elem in root.iter():
+            if existing_defaults in list(elem):
+                parent = elem
+                break
+
+        if parent is not None:
+            # 既存要素のインデックスを取得
+            index = list(parent).index(existing_defaults)
+            # 既存要素を削除
+            parent.remove(existing_defaults)
+            # 新しい要素を同じ位置に挿入
+            new_defaults = ET.Element('defaults')
+            for child in saved_defaults:
+                # 名前空間を削除したタグ名を使用
+                child_tag = child.tag.split('}')[-1]
+                new_child = ET.SubElement(new_defaults, child_tag)
+                new_child.attrib = {k.split('}')[-1]: v for k, v in child.attrib.items()}
+                new_child.text = child.text
+                # 孫要素もコピー
+                _copy_element_children(child, new_child)
+            parent.insert(index, new_defaults)
+    else:
+        # defaults要素がない場合、適切な位置に挿入
+        # MusicXMLの構造: score-partwise > work? > identification? > defaults? > credit* > part-list > part+
+        # defaultsはpart-listの前に来る
+        part_list = root.find('.//{*}part-list')
+        if part_list is not None:
+            parent = None
+            for elem in root.iter():
+                if part_list in list(elem):
+                    parent = elem
+                    break
+
+            if parent is not None:
+                index = list(parent).index(part_list)
+                new_defaults = ET.Element('defaults')
+                for child in saved_defaults:
+                    child_tag = child.tag.split('}')[-1]
+                    new_child = ET.SubElement(new_defaults, child_tag)
+                    new_child.attrib = {k.split('}')[-1]: v for k, v in child.attrib.items()}
+                    new_child.text = child.text
+                    _copy_element_children(child, new_child)
+                parent.insert(index, new_defaults)
+
+
+def _copy_element_children(source: ET.Element, dest: ET.Element) -> None:
+    """
+    ソース要素の子孫を再帰的にコピー
+
+    Args:
+        source: コピー元の要素
+        dest: コピー先の要素
+    """
+    for child in source:
+        child_tag = child.tag.split('}')[-1]
+        new_child = ET.SubElement(dest, child_tag)
+        new_child.attrib = {k.split('}')[-1]: v for k, v in child.attrib.items()}
+        new_child.text = child.text
+        new_child.tail = child.tail
+        _copy_element_children(child, new_child)
+
+
 def _restore_technical_elements(
     root: ET.Element,
     original_layout_map: LayoutMap,
@@ -760,6 +1009,10 @@ def apply_layout_to_xml(
                             current_offset += duration / divisions
                         except ValueError:
                             pass
+
+    # defaults要素の復元（music21が変更してしまうスケーリングやページレイアウト）
+    if original_layout_map.defaults_xml is not None:
+        _restore_defaults_element(root, original_layout_map.defaults_xml)
 
     # technical要素の復元（music21が読み込まなかった要素）
     _restore_technical_elements(root, original_layout_map, total_measures)

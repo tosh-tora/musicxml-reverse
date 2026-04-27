@@ -336,16 +336,23 @@ def apply_reversed_clefs(
 
 # 経過的テンポ表記のパターン
 # これらは「一時的な変化」を示し、次の主要テンポ指示まで有効ではない
+# 反転時は方向が逆になるため、←記号を先頭に付けて表示する
 TRANSITIONAL_TEMPO_PATTERNS = [
-    'rit',      # ritardando, ritenuto
-    'rall',     # rallentando
-    'accel',    # accelerando
-    'string',   # stringendo
-    'morendo',
-    'calando',
-    'slentando',
-    'allarg',   # allargando
-    'a tempo',
+    # 減速系
+    'ritardando', 'ritard.', 'ritard', 'rit.', 'rit',
+    'rallentando', 'rallent.', 'rallent', 'rall.', 'rall',
+    'ritenuto', 'riten.', 'riten',
+    'allargando', 'allarg.', 'allarg',
+    'smorzando', 'smorz.', 'smorz',
+    'calando', 'cal.', 'cal',
+    'slentando', 'slent.', 'slent',
+    # 加速系
+    'accelerando', 'accel.', 'accel',
+    'stringendo', 'string.', 'string',
+    'affrettando', 'affrett.', 'affrett',
+    'incalzando', 'incalz.', 'incalz',
+    'animando', 'animand.', 'animand',
+    'stretto',
 ]
 
 
@@ -363,6 +370,24 @@ def is_transitional_tempo(text: str) -> bool:
     """
     text_lower = text.lower()
     return any(pattern in text_lower for pattern in TRANSITIONAL_TEMPO_PATTERNS)
+
+
+def _prepend_arrow_to_tempo_text(elem) -> None:
+    """経過的テンポ要素のテキストに←記号を先頭に付与する
+
+    反転時に方向が逆になることを示すため、←を付与する。
+    既に←が付いている場合は何もしない。
+
+    Args:
+        elem: テンポ要素（TempoText, TextExpression, MetronomeMark等）
+    """
+    # テキスト属性を特定（要素タイプによって異なる）
+    if hasattr(elem, 'content') and elem.content:
+        if not elem.content.startswith('←'):
+            elem.content = '←' + elem.content
+    elif hasattr(elem, 'text') and elem.text:
+        if not elem.text.startswith('←'):
+            elem.text = '←' + elem.text
 
 
 def collect_tempo_positions(measures: list[stream.Measure]) -> list[dict]:
@@ -443,13 +468,17 @@ def calculate_reversed_tempo_positions(
             'element_type': pos['element_type'],
         })
 
-    # 経過的テンポは単純な位置反転（小節番号のみ反転）
+    # 経過的テンポは単純な位置反転（小節番号のみ反転）+ ←記号を付与
     for pos in transitional_tempos:
         reversed_start = total_measures - pos['measure_num'] + 1
 
+        # 要素をコピーしてテキストに←を付与
+        elem_copy = copy.deepcopy(pos['element'])
+        _prepend_arrow_to_tempo_text(elem_copy)
+
         reversed_positions.append({
             'reversed_measure_num': reversed_start,
-            'element': copy.deepcopy(pos['element']),
+            'element': elem_copy,
             'element_type': pos['element_type'],
         })
 
