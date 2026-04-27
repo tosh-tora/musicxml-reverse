@@ -14,7 +14,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from music21 import converter, stream, dynamics, tie, spanner, clef
+from music21 import converter, stream, dynamics, tie, spanner, clef, expressions
 from music21.spanner import Ottava
 
 
@@ -485,7 +485,7 @@ def apply_reversed_tempo_elements(
                 break
 
 
-def reverse_part(part: stream.Part, report: ProcessingReport | None = None) -> stream.Part:
+def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport | None = None) -> stream.Part | stream.PartStaff:
     """パート全体を反転する"""
     measures = list(part.getElementsByClass(stream.Measure))
     if not measures:
@@ -613,8 +613,11 @@ def reverse_part(part: stream.Part, report: ProcessingReport | None = None) -> s
     # 小節を逆順に処理
     reversed_measures = list(reversed(measures))
 
-    # 新しいパートを作成
-    new_part = stream.Part()
+    # 新しいパートを作成（PartStaffの場合はPartStaffを維持）
+    if stream.PartStaff in part.classSet:
+        new_part = stream.PartStaff()
+    else:
+        new_part = stream.Part()
     new_part.id = part.id
 
     # パート名などのメタデータをコピー
@@ -872,6 +875,22 @@ def reverse_part(part: stream.Part, report: ProcessingReport | None = None) -> s
 
             new_part.insert(0, new_spanner)
 
+    # TrillExtensionの開始音符からTrill expressionを削除（重複防止）
+    trill_extension_starts = set()
+    for sp in new_part.spannerBundle:
+        if isinstance(sp, expressions.TrillExtension):
+            spanned = list(sp.getSpannedElements())
+            if spanned:
+                trill_extension_starts.add(id(spanned[0]))
+
+    for measure in new_part.getElementsByClass(stream.Measure):
+        for element in measure.notesAndRests:
+            if id(element) in trill_extension_starts and hasattr(element, 'expressions'):
+                element.expressions = [
+                    exp for exp in element.expressions
+                    if not isinstance(exp, expressions.Trill)
+                ]
+
     # 小節ベースSpanner（RepeatBracket等）を再構築
     for mb_sp in measure_based_spanners:
         # 元の小節番号を反転後の小節番号にマッピング
@@ -923,16 +942,43 @@ def test_measure_write(measure: stream.Measure) -> str | None:
 
 def reverse_score(score: stream.Score, report: ProcessingReport | None = None) -> stream.Score:
     """スコア全体を反転する"""
+    from music21 import layout
+
     new_score = stream.Score()
 
     # メタデータをコピー
     if score.metadata:
         new_score.metadata = score.metadata
 
+    # パートIDから新しいパートへのマッピングを作成
+    old_to_new_part = {}
+
     # 各パートを反転
     for part in score.parts:
         reversed_part = reverse_part(part, report)
         new_score.append(reversed_part)
+        old_to_new_part[id(part)] = reversed_part
+
+    # StaffGroupをコピー（パート参照を更新）
+    # StaffGroupが存在しないと、PartStaffが個別のパートとして出力されてしまい
+    # スコアの縦サイズが変わってしまう（Issue #33）
+    for staff_group in score.getElementsByClass(layout.StaffGroup):
+        # 新しいStaffGroupを作成
+        new_parts = []
+        for old_part in staff_group:
+            new_part = old_to_new_part.get(id(old_part))
+            if new_part is not None:
+                new_parts.append(new_part)
+
+        if len(new_parts) > 1:
+            new_staff_group = layout.StaffGroup(
+                new_parts,
+                name=staff_group.name,
+                symbol=staff_group.symbol
+            )
+            # hideObjectOnPrint属性をコピー
+            new_staff_group.style.hideObjectOnPrint = staff_group.style.hideObjectOnPrint
+            new_score.insert(0, new_staff_group)
 
     return new_score
 
