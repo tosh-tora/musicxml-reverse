@@ -1,0 +1,229 @@
+C:\Users\I018970\AppData\Roaming\Python\Python314\site-packages\requests\__init__.py:113: RequestsDependencyWarning: urllib3 (2.6.3) or chardet (7.4.1)/charset_normalizer (3.4.4) doesn't match a supported version!
+  warnings.warn(
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+C:\Users\I018970\AppData\Local\Programs\Python\Python314\Lib\site-packages\music21\base.py:592: UserWarning: Setting an ID that could be mistaken for a memory location is discouraged: got 1746853789232
+  warnings.warn(msg)
+C:\Users\I018970\AppData\Local\Programs\Python\Python314\Lib\site-packages\music21\base.py:592: UserWarning: Setting an ID that could be mistaken for a memory location is discouraged: got 1746951190032
+  warnings.warn(msg)
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+musicxml.m21ToXml: WARNING: we are out of midi channels! help!
+処理対象: 6 ファイル
+
+処理中: 威風堂々ラスト_rev.mxl
+  [Phase 1] レイアウト情報を抽出中...
+  入力音符数: 3668
+  パート数: 30
+  出力音符数: 3668
+  出力: 威風堂々ラスト_rev_rev.mxl
+  [Phase 3] 分割されたdirection要素をマージ中...
+  measure 1: 2 directions before merge
+  measure 32: 2 directions before merge
+  measure 35: 2 directions before merge
+  measure 44: 2 directions before merge
+  measure 45: 2 directions before merge
+  measure 1: 2 directions before merge
+  measure 35: 2 directions before merge
+  measure 45: 2 directions before merge
+  measure 35: 2 directions before merge
+  measure 44: 3 directions before merge
+  measure 50: 2 directions before merge
+  measure 35: 2 directions before merge
+  measure 1: 2 directions before merge
+  measure 17: 2 directions before merge
+  measure 52: 2 directions before merge
+  measure 1: 2 directions before merge
+  measure 17: 2 directions before merge
+  measure 38: 2 directions before merge
+  measure 52: 2 directions before merge
+  measure 1: 2 directions before merge
+  measure 17: 2 directions before merge
+  measure 49: 2 directions before merge
+  measure 1: 2 directions before merge
+  measure 17: 2 directions before merge
+  measure 1: 2 directions before merge
+  measure 48: 2 directions before merge
+  measure 25: 2 directions before merge
+  measure 43: 2 directions before merge
+  measure 1: 2 directions before merge
+  measure 17: 2 directions before merge
+  measure 1: 2 directions before merge
+  measure 1: 2 directions before merge
+  measure 17: 2 directions before merge
+  measure 40: 3 directions before merge
+  measure 1: 2 directions before merge
+  measure 10: 2 directions before merge
+  measure 17: 2 directions before merge
+  measure 1: 2 directions before merge
+  measure 17: 2 directions before merge
+  measure 1: 2 directions before merge
+  measure 17: 2 directions before merge
+  measure 48: 2 directions before merge
+  measure 2: 2 directions before merge
+  measure 9: 2 directions before merge
+  measure 37: 4 directions before merge
+  measure 53: 2 directions before merge
+  measure 45: 2 directions before merge
+  measure 29: 2 directions before merge
+  measure 1: 2 directions before merge
+  measure 53: 2 directions before merge
+  measure 1: 2 directions before merge
+  measure 25: 2 directions before merge
+  measure 35: 2 directions before merge
+  measure 44: 2 directions before merge
+  measure 1: 2 directions before merge
+  measure 35: 2 directions before merge
+  measure 44: 2 directions before merge
+  measure 52: 2 directions before merge
+  Total merged: 0 direction pairs
+  [Phase 3] direction要素のマージ完了
+  [Phase 4] レイアウト情報を復元中...
+  [Phase 4] レイアウト復元完了
+
+処理中: test-dynamics.xml
+  [Phase 1] レイアウト情報を抽出中...
+  入力音符数: 8
+  パート数: 1
+  出力音符数: 8
+  出力: test-dynamics_rev.xml
+  [Phase 3] 分割されたdirection要素をマージ中...
+  Total merged: 0 direction pairs
+  [Phase 3] direction要素のマージ完了
+  [Phase 4] レイアウト情報を復元中...
+  [Phase 4] レイアウト復元完了
+
+処理中: test-simple.xml
+  [Phase 1] レイアウト情報を抽出中...
+  入力音符数: 5
+  パート数: 1
+  出力音符数: 5
+  出力: test-simple_rev.xml
+  [Phase 3] 分割されたdirection要素をマージ中...
+  Total merged: 0 direction pairs
+  [Phase 3] direction要素のマージ完了
+  [Phase 4] レイアウト情報を復元中...
+  [Phase 4] レイアウト復元完了
+
+処理中: test-slurs.xml
+  [Phase 1] レイアウト情報を抽出中...
+  入力音符数: 8
+  パート数: 1
+  出力音符数: 8
+  出力: test-slurs_rev.xml
+  [Phase 3] 分割されたdirection要素をマージ中...
+  Total merged: 0 direction pairs
+  [Phase 3] direction要素のマージ完了
+  [Phase 4] レイアウト情報を復元中...
+  [Phase 4] レイアウト復元完了
+
+処理中: test-simple.musicxml
+  [Phase 1] レイアウト情報を抽出中...
+  入力音符数: 3
+  パート数: 1
+  出力音符数: 3
+  出力: test-simple_rev.musicxml
+  [Phase 3] 分割されたdirection要素をマージ中...
+  Total merged: 0 direction pairs
+  [Phase 3] direction要素のマージ完了
+  [Phase 4] レイアウト情報を復元中...
+  [Phase 4] レイアウト復元完了
+
+処理中: 威風堂々ラスト - コピー.musicxml
+  [Phase 1] レイアウト情報を抽出中...
+  入力音符数: 3685
+  パート数: 30
+  出力音符数: 3685
+  出力: 威風堂々ラスト - コピー_rev.musicxml
+  [Phase 3] 分割されたdirection要素をマージ中...
+  measure 9: 8 directions before merge
+  measure 13: 8 directions before merge
+  measure 20: 6 directions before merge
+  measure 25: 4 directions before merge
+  measure 37: 3 directions before merge
+  measure 44: 4 directions before merge
+  measure 49: 2 directions before merge
+  measure 53: 8 directions before merge
+  measure 9: 2 directions before merge
+  measure 44: 4 directions before merge
+  measure 53: 2 directions before merge
+  measure 44: 4 directions before merge
+  measure 44: 4 directions before merge
+  measure 37: 2 directions before merge
+  measure 51: 2 directions before merge
+  measure 53: 2 directions before merge
+  measure 37: 2 directions before merge
+  measure 48: 2 directions before merge
+  measure 51: 2 directions before merge
+  measure 53: 2 directions before merge
+  measure 5: 2 directions before merge
+  measure 37: 2 directions before merge
+  measure 53: 2 directions before merge
+  measure 37: 2 directions before merge
+  measure 53: 2 directions before merge
+  measure 6: 2 directions before merge
+  measure 53: 2 directions before merge
+  measure 11: 2 directions before merge
+  measure 37: 2 directions before merge
+  measure 53: 2 directions before merge
+  measure 53: 2 directions before merge
+  measure 9: 3 directions before merge
+  measure 37: 2 directions before merge
+  measure 39: 2 directions before merge
+  measure 53: 2 directions before merge
+  measure 37: 2 directions before merge
+  measure 44: 2 directions before merge
+  measure 53: 2 directions before merge
+  measure 37: 2 directions before merge
+  measure 53: 2 directions before merge
+  measure 6: 2 directions before merge
+  measure 37: 2 directions before merge
+  measure 53: 2 directions before merge
+  measure 2: 2 directions before merge
+  measure 9: 2 directions before merge
+  measure 37: 4 directions before merge
+  measure 53: 2 directions before merge
+  measure 9: 2 directions before merge
+  measure 9: 3 directions before merge
+  measure 25: 2 directions before merge
+  measure 1: 2 directions before merge
+  measure 53: 2 directions before merge
+  measure 9: 2 directions before merge
+  measure 25: 2 directions before merge
+  measure 44: 4 directions before merge
+  measure 50: 2 directions before merge
+  measure 53: 2 directions before merge
+  measure 44: 4 directions before merge
+  measure 53: 2 directions before merge
+  measure 51: 2 directions before merge
+  Total merged: 0 direction pairs
+  [Phase 3] direction要素のマージ完了
+  [Phase 4] レイアウト情報を復元中...
+  [Phase 4] レイアウト復元完了
+
+完了: 6/6 ファイル処理成功

@@ -1,0 +1,49 @@
+C:\Users\I018970\AppData\Roaming\Python\Python314\site-packages\requests\__init__.py:113: RequestsDependencyWarning: urllib3 (2.6.3) or chardet (7.4.1)/charset_normalizer (3.4.4) doesn't match a supported version!
+  warnings.warn(
+### Step 1: 反転処理
+処理中: 威風堂々ラスト_in-Bassoon.mxl
+  [Phase 1] レイアウト情報を抽出中...
+  入力音符数: 142
+  パート数: 1
+  出力音符数: 142
+  出力: 威風堂々ラスト_in-Bassoon_reversed.mxl
+  [Phase 3] レイアウト情報を復元中...
+  [Phase 3] レイアウト復元完了
+OK: 反転完了: C:\Users\I018970\Projects\research\mrev\work\威風堂々ラスト_in-Bassoon_reversed.mxl
+
+### Step 2: 再反転（元に戻す）
+処理中: 威風堂々ラスト_in-Bassoon_reversed.mxl
+  [Phase 1] レイアウト情報を抽出中...
+  入力音符数: 142
+  パート数: 1
+  出力音符数: 142
+  出力: 威風堂々ラスト_in-Bassoon_roundtrip.mxl
+  [Phase 3] レイアウト情報を復元中...
+  [Phase 3] レイアウト復元完了
+OK: 再反転完了: C:\Users\I018970\Projects\research\mrev\work\威風堂々ラスト_in-Bassoon_roundtrip.mxl
+
+### Step 3: 差異分析
+
+=== 往復変換テスト ===
+元ファイル: C:\Users\I018970\Projects\research\mrev\work\inbox\test\威風堂々ラスト_in-Bassoon.mxl
+最終ファイル: C:\Users\I018970\Projects\research\mrev\work\威風堂々ラスト_in-Bassoon_roundtrip.mxl
+
+## 基本構造
+OK: パート数: 1
+
+## パート 1: Fagotti I II.
+OK: 小節数: 53
+
+## XML レベルの比較
+Traceback (most recent call last):
+  File "C:\Users\I018970\Projects\research\mrev\test_bassoon_roundtrip.py", line 189, in <module>
+    main()
+    ~~~~^^
+  File "C:\Users\I018970\Projects\research\mrev\test_bassoon_roundtrip.py", line 167, in main
+    differences = compare_scores(str(original_file), str(step2_file))
+  File "C:\Users\I018970\Projects\research\mrev\test_bassoon_roundtrip.py", line 124, in compare_scores
+    orig_xml = extract_musicxml_from_mxl(Path(original_path))
+  File "C:\Users\I018970\Projects\research\mrev\test_bassoon_roundtrip.py", line 22, in extract_musicxml_from_mxl
+    rootfile = container_root.find('.//container:rootfile', ns).get('full-path')
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'NoneType' object has no attribute 'get'

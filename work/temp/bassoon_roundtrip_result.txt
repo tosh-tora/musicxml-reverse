@@ -1,0 +1,6 @@
+=== 往復変換テスト結果 ===
+元ファイル: C:\Users\I018970\Projects\research\mrev\work\inbox\test\威風堂々ラスト_in-Bassoon.mxl
+中間ファイル: C:\Users\I018970\Projects\research\mrev\work\威風堂々ラスト_in-Bassoon_reversed.mxl
+最終ファイル: C:\Users\I018970\Projects\research\mrev\work\威風堂々ラスト_in-Bassoon_roundtrip.mxl
+
+OK: 差異なし: 往復変換は完全に成功しました
