@@ -213,3 +213,55 @@ class TestIssue27Regression:
 
         # direction要素数は同じであるべき
         assert output_count == input_count, f"Direction elements multiplied: {input_count} -> {output_count}"
+
+
+def get_rehearsal_marks_from_mxl(mxl_path: Path) -> list[tuple[str, str]]:
+    """MXLファイルから(小節番号, 練習番号テキスト)のリストを取得"""
+    result = []
+    with zipfile.ZipFile(mxl_path, 'r') as z:
+        for name in z.namelist():
+            if (name.endswith('.xml') or name.endswith('.musicxml')) and not name.startswith('META-INF'):
+                content = z.read(name)
+                root = ET.fromstring(content)
+                for part in root.findall('.//{*}part'):
+                    for measure in part.findall('.//{*}measure'):
+                        measure_num = measure.get('number', '?')
+                        for d in measure.findall('{*}direction'):
+                            r = d.find('.//{*}direction-type/{*}rehearsal')
+                            if r is not None and r.text:
+                                result.append((measure_num, r.text.strip()))
+                break
+    return result
+
+
+class TestIssue47RehearsalMarkPosition:
+    """Issue #47: 練習番号の反転位置が小節境界に正しく対応する"""
+
+    def test_rehearsal_marks_shifted_by_one_measure(self, tmp_path):
+        """練習番号は反転後 total - N + 2 に配置される（境界貼付）"""
+        input_file = Path('work/inbox/威風堂々ラスト_in-Viola.mxl')
+        if not input_file.exists():
+            pytest.skip(f"Test file not found: {input_file}")
+
+        output_file = tmp_path / 'test_output.mxl'
+
+        layout_map = extract_layout_from_xml(input_file)
+        score = converter.parse(str(input_file))
+        reversed_score = reverse_score(score, None)
+        reversed_score.write('mxl', fp=str(output_file))
+        total_measures = len(list(reversed_score.parts[0].getElementsByClass('Measure')))
+        restore_direction_elements(output_file, layout_map, total_measures)
+
+        marks = get_rehearsal_marks_from_mxl(output_file)
+        # 元: S at m17, T at m41, total=53 → 反転後: S at m38, T at m14
+        mark_measures = {text: measure for measure, text in marks}
+        assert mark_measures.get('T') == '14', \
+            f"T should be at measure 14 (between m13 and m14), got {mark_measures.get('T')}"
+        assert mark_measures.get('S') == '38', \
+            f"S should be at measure 38, got {mark_measures.get('S')}"
+
+        # 旧バグ位置 (m13, m37) には練習番号が無いこと
+        old_bug_measures = {measure for measure, _ in marks}
+        assert '13' not in old_bug_measures or all(
+            text not in ('S', 'T') for measure, text in marks if measure == '13'
+        ), "Rehearsal mark wrongly at measure 13 (off-by-one regression)"
