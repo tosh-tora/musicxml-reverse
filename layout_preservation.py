@@ -72,6 +72,7 @@ class DirectionElement:
     words_text: Optional[str] = None  # wordsのテキスト内容
     offset_quarters: float = 0.0  # 小節内オフセット（四分音符単位）
     measure_duration_quarters: float = 0.0  # 小節全体の長さ（四分音符単位）
+    has_rehearsal: bool = False  # rehearsal（練習番号）子要素を持つか
 
 
 @dataclass
@@ -248,9 +249,11 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
                     placement = elem.get('placement')
                     sound = elem.find('.//{*}sound')
                     words = elem.find('.//{*}direction-type/{*}words')
+                    rehearsal = elem.find('.//{*}direction-type/{*}rehearsal')
 
                     has_sound = sound is not None
                     has_words = words is not None
+                    has_rehearsal = rehearsal is not None
                     words_text = None
                     if words is not None and words.text:
                         words_text = words.text.strip()
@@ -274,6 +277,7 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
                         words_text=words_text,
                         offset_quarters=current_offset + _direction_offset_q,
                         measure_duration_quarters=measure_duration_quarters,
+                        has_rehearsal=has_rehearsal,
                     )
                     layout_map.directions[part_id].append(direction_elem)
                     direction_index += 1
@@ -948,7 +952,9 @@ def restore_direction_elements(
         all_directions = original_layout_map.directions[part_id]
         wedge_pairs, non_wedge_dirs = _separate_wedge_pairs(all_directions)
         tempo_directions = [d for d in non_wedge_dirs if _is_tempo_direction(d)]
-        other_directions = [d for d in non_wedge_dirs if not _is_tempo_direction(d)]
+        non_tempo_dirs = [d for d in non_wedge_dirs if not _is_tempo_direction(d)]
+        rehearsal_directions = [d for d in non_tempo_dirs if d.has_rehearsal]
+        other_directions = [d for d in non_tempo_dirs if not d.has_rehearsal]
 
         def _insert_into_measure(target_measure, restored):
             insert_pos = 0
@@ -1030,6 +1036,28 @@ def restore_direction_elements(
         # 3. その他のdirection要素は単純な位置反転で挿入
         for dir_elem in other_directions:
             reversed_measure_num = total_measures - dir_elem.measure_num + 1
+
+            if reversed_measure_num not in measure_map:
+                continue
+
+            target_measure = measure_map[reversed_measure_num]
+
+            try:
+                restored_direction = ET.fromstring(dir_elem.direction_xml)
+                _strip_dynamics_x_attributes(restored_direction)
+                _insert_into_measure(target_measure, restored_direction)
+            except ET.ParseError:
+                pass
+
+        # 4. 練習番号（rehearsal）は小節境界に紐付くため +1 シフトした位置に挿入
+        # 元 m_N の頭の練習番号 = m_(N-1) と m_N の境界。時間反転すると
+        # その境界は反転後 m_(total-N+1) と m_(total-N+2) の間になり、
+        # MusicXML上は反転後 m_(total-N+2) の頭に置く。
+        for dir_elem in rehearsal_directions:
+            reversed_measure_num = total_measures - dir_elem.measure_num + 2
+            if reversed_measure_num > total_measures:
+                # 元 m_1 の練習番号は反転後では曲末に対応するため最終小節に置く
+                reversed_measure_num = total_measures
 
             if reversed_measure_num not in measure_map:
                 continue
