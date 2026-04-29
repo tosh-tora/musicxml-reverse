@@ -146,7 +146,9 @@ class TestDirectionRestoration:
         input_count = count_directions_in_mxl(input_file)
         output_count = count_directions_in_mxl(output_file)
 
-        assert output_count == input_count, f"Direction count mismatch: input={input_count}, output={output_count}"
+        # Issue #56: 非臨時ダイナミクスに括弧付きマーカーが追加されるため
+        # 出力のdirection数は入力以上になることがある
+        assert output_count >= input_count, f"Direction count should not decrease: input={input_count}, output={output_count}"
 
     def test_transitional_tempo_gets_arrow(self, tmp_path):
         """経過的テンポには←記号が付与される"""
@@ -211,8 +213,11 @@ class TestIssue27Regression:
         input_count = count_directions_in_mxl(input_file)
         output_count = count_directions_in_mxl(output_file)
 
-        # direction要素数は同じであるべき
-        assert output_count == input_count, f"Direction elements multiplied: {input_count} -> {output_count}"
+        # Issue #56: 括弧付きダイナミクスマーカーによる意図的な増加を許容
+        # 大幅な増殖（2倍以上）は起きていないことを確認
+        assert output_count <= input_count * 2, f"Direction elements multiplied excessively: {input_count} -> {output_count}"
+        # 減少は起きていないこと
+        assert output_count >= input_count, f"Direction elements lost: {input_count} -> {output_count}"
 
 
 def get_rehearsal_marks_from_mxl(mxl_path: Path) -> list[tuple[str, str]]:
@@ -290,7 +295,11 @@ def get_dynamics_positions_from_mxl(mxl_path: Path) -> list[tuple[str, float, st
                                 dyn = elem.find('.//{*}dynamics')
                                 if dyn is not None:
                                     for ch in dyn:
-                                        dyn_type = ch.tag.split('}')[-1]
+                                        dyn_tag = ch.tag.split('}')[-1]
+                                        if dyn_tag == 'other-dynamics' and ch.text:
+                                            dyn_type = ch.text.strip()
+                                        else:
+                                            dyn_type = dyn_tag
                                         result.append((measure_num, current_offset / divs, dyn_type))
                             elif tag == 'note':
                                 chord = elem.find('.//{*}chord')
@@ -301,37 +310,89 @@ def get_dynamics_positions_from_mxl(mxl_path: Path) -> list[tuple[str, float, st
     return result
 
 
-class TestIssue54DynamicsPosition:
-    """Issue #54: ダイナミクス記号の反転後位置が正しい"""
+class TestIssue56DynamicsRangeReversal:
+    """Issue #56: 強弱記号の有効範囲ベース反転"""
 
-    def test_dynamics_on_last_beat_after_reversal(self, tmp_path):
-        """1拍目のffは反転後に最後の拍（2拍目）に配置される"""
-        input_file = Path('work/inbox/威風堂々ラスト_in-Viola.mxl')
-        if not input_file.exists():
-            pytest.skip(f"Test file not found: {input_file}")
-
-        output_file = tmp_path / 'test_output.mxl'
-
+    def _run_reversal(self, input_file, output_file):
+        """反転処理を実行してダイナミクス位置を返すヘルパー"""
         layout_map = extract_layout_from_xml(input_file)
         score = converter.parse(str(input_file))
         reversed_score = reverse_score(score, None)
         reversed_score.write('mxl', fp=str(output_file))
         total_measures = len(list(reversed_score.parts[0].getElementsByClass('Measure')))
         restore_direction_elements(output_file, layout_map, total_measures)
+        return get_dynamics_positions_from_mxl(output_file), total_measures
 
-        positions = get_dynamics_positions_from_mxl(output_file)
+    def test_viola_ff_at_beginning_after_reversal(self, tmp_path):
+        """威風堂々Viola: ffは反転後もm1に来る（有効範囲が全曲のため）"""
+        input_file = Path('work/inbox/威風堂々ラスト_in-Viola.mxl')
+        if not input_file.exists():
+            pytest.skip(f"Test file not found: {input_file}")
 
-        # 元の1小節目の1拍目(offset=0q)にffがある
-        # 反転後、最終小節(m53)の2拍目(offset=1q)にffが来るはず
+        output_file = tmp_path / 'test_output.mxl'
+        positions, total_measures = self._run_reversal(input_file, output_file)
+
+        # ff は m1 に来るべき（有効範囲 m1-m53 → reversed_start = 1）
+        ff_positions = [(m, offset, dyn) for m, offset, dyn in positions if dyn == 'ff']
+        assert any(m == '1' for m, _, _ in ff_positions), \
+            f"ff should appear at measure 1 after reversal, got: {ff_positions}"
+
+    def test_viola_parenthesized_ff_at_last_measure(self, tmp_path):
+        """威風堂々Viola: (ff)が最終小節に残る"""
+        input_file = Path('work/inbox/威風堂々ラスト_in-Viola.mxl')
+        if not input_file.exists():
+            pytest.skip(f"Test file not found: {input_file}")
+
+        output_file = tmp_path / 'test_output.mxl'
+        positions, total_measures = self._run_reversal(input_file, output_file)
+
+        # (ff) が最終小節に残るべき
         last_measure_str = str(total_measures)
-        ff_positions = [
-            (m, offset) for m, offset, dyn in positions
-            if dyn == 'ff' and m == last_measure_str
+        paren_ff_positions = [
+            (m, offset, dyn) for m, offset, dyn in positions
+            if dyn == '(ff)' and m == last_measure_str
         ]
+        assert len(paren_ff_positions) >= 1, \
+            f"(ff) should appear in measure {last_measure_str}, positions: {positions}"
 
-        assert len(ff_positions) >= 1, "ff should appear in the last reversed measure"
-        for measure_num, offset in ff_positions:
-            assert offset > 0.0, (
-                f"ff at measure {measure_num} offset {offset}q: "
-                f"should be on beat 2 (offset > 0), not beat 1"
-            )
+    def test_viola_accidental_dynamics_simple_reversal(self, tmp_path):
+        """威風堂々Viola: 臨時ダイナミクス(rf, sf)は単純反転のまま"""
+        input_file = Path('work/inbox/威風堂々ラスト_in-Viola.mxl')
+        if not input_file.exists():
+            pytest.skip(f"Test file not found: {input_file}")
+
+        output_file = tmp_path / 'test_output.mxl'
+        positions, total_measures = self._run_reversal(input_file, output_file)
+
+        # rf (m17) → 単純反転: 53 - 17 + 1 = 37
+        rf_positions = [(m, offset, dyn) for m, offset, dyn in positions if dyn == 'rf']
+        assert any(m == '37' for m, _, _ in rf_positions), \
+            f"rf should be at measure 37 (simple reversal), got: {rf_positions}"
+
+        # sf (m52) → 単純反転: 53 - 52 + 1 = 2
+        sf_positions = [(m, offset, dyn) for m, offset, dyn in positions if dyn == 'sf']
+        assert any(m == '2' for m, _, _ in sf_positions), \
+            f"sf should be at measure 2 (simple reversal), got: {sf_positions}"
+
+    def test_unmei_dynamics_effective_range(self, tmp_path):
+        """運命Violins_I: 複数ダイナミクスの有効範囲ベース反転"""
+        input_file = Path('work/inbox/運命_冒頭-Violins_I.mxl')
+        if not input_file.exists():
+            pytest.skip(f"Test file not found: {input_file}")
+
+        output_file = tmp_path / 'test_output.mxl'
+        positions, total_measures = self._run_reversal(input_file, output_file)
+
+        # m1:ff → 有効範囲 m1-m7 → reversed m18, (ff) at m24
+        ff_at_18 = any(m == '18' and dyn == 'ff' for m, _, dyn in positions)
+        assert ff_at_18, f"ff should be at measure 18, positions: {positions}"
+
+        paren_ff_at_24 = any(m == '24' and dyn == '(ff)' for m, _, dyn in positions)
+        assert paren_ff_at_24, f"(ff) should be at measure 24, positions: {positions}"
+
+        # m8:p → 有効範囲 m8-m18 → reversed m7, (p) at m17
+        p_at_7 = any(m == '7' and dyn == 'p' for m, _, dyn in positions)
+        assert p_at_7, f"p should be at measure 7, positions: {positions}"
+
+        paren_p_at_17 = any(m == '17' and dyn == '(p)' for m, _, dyn in positions)
+        assert paren_p_at_17, f"(p) should be at measure 17, positions: {positions}"

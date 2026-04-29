@@ -631,6 +631,53 @@ def _is_transitional_tempo_text(text: str) -> bool:
     return any(pattern in text_lower for pattern in TRANSITIONAL_TEMPO_PATTERNS)
 
 
+# 臨時の（アクセント系）強弱記号
+# これらは音符単位で適用されるため、有効範囲ベースの反転対象外
+ACCIDENTAL_DYNAMICS = {
+    'sforzando', 'sforzato', 'sfz', 'sf',
+    'forzando', 'forzato', 'fz',
+    'rinforzando', 'rfz', 'rf',
+    'sfp', 'fp',
+}
+
+
+def _is_dynamics_direction(dir_elem: DirectionElement) -> bool:
+    """direction要素がダイナミクス（強弱記号）を含むかどうかを判定する"""
+    try:
+        root = ET.fromstring(dir_elem.direction_xml)
+        return root.find('.//{*}dynamics') is not None
+    except ET.ParseError:
+        return False
+
+
+def _get_dynamics_type(dir_elem: DirectionElement) -> Optional[str]:
+    """ダイナミクスのタイプ名を取得する（例: 'ff', 'p', 'sf'）
+
+    Returns:
+        ダイナミクスタイプの文字列、見つからない場合はNone
+    """
+    try:
+        root = ET.fromstring(dir_elem.direction_xml)
+        dynamics = root.find('.//{*}dynamics')
+        if dynamics is not None:
+            for child in dynamics:
+                tag = child.tag.split('}')[-1]
+                if tag != 'other-dynamics':
+                    return tag
+            # other-dynamics の場合はテキストを返す
+            other = dynamics.find('.//{*}other-dynamics')
+            if other is not None and other.text:
+                return other.text.strip()
+        return None
+    except ET.ParseError:
+        return None
+
+
+def _is_accidental_dynamics(dyn_type: str) -> bool:
+    """臨時の強弱記号（アクセント系）かどうかを判定する"""
+    return dyn_type in ACCIDENTAL_DYNAMICS
+
+
 def _measure_divisions(measure: ET.Element, default: float = 1.0) -> float:
     """小節（または直前の attributes）から divisions を取得"""
     div_elem = measure.find('.//{*}attributes/{*}divisions')
@@ -943,6 +990,112 @@ def _strip_dynamics_x_attributes(direction_root: ET.Element) -> None:
                     del dyn.attrib[attr]
 
 
+def _calculate_reversed_dynamics_directions(
+    directions: list[DirectionElement],
+    total_measures: int
+) -> list[tuple[DirectionElement, int, Optional[tuple[str, int]]]]:
+    """ダイナミクスdirection要素の反転後位置を計算する
+
+    非臨時ダイナミクス: 有効範囲ベースで反転 + 括弧付きマーカー
+    臨時ダイナミクス: 単純な位置反転（従来通り）
+
+    Args:
+        directions: ダイナミクスのDirectionElementリスト
+        total_measures: 総小節数
+
+    Returns:
+        (DirectionElement, reversed_measure_num, optional (dyn_type, paren_measure_num))
+        のタプルリスト。paren_info は非臨時ダイナミクスの括弧付きマーカー情報。
+    """
+    if not directions:
+        return []
+
+    # 臨時 vs 非臨時ダイナミクスを分離
+    main_dynamics = []
+    accidental_dynamics = []
+
+    for d in directions:
+        dyn_type = _get_dynamics_type(d)
+        if dyn_type and _is_accidental_dynamics(dyn_type):
+            accidental_dynamics.append(d)
+        else:
+            main_dynamics.append(d)
+
+    result = []
+
+    # 非臨時ダイナミクスの有効範囲ベース反転
+    for i, dir_elem in enumerate(main_dynamics):
+        dyn_type = _get_dynamics_type(dir_elem)
+        # 適用終了位置を計算（次の非臨時ダイナミクスの直前まで）
+        effective_end = total_measures  # デフォルトは曲の最後
+        for j in range(i + 1, len(main_dynamics)):
+            next_measure = main_dynamics[j].measure_num
+            if next_measure > dir_elem.measure_num:
+                effective_end = next_measure - 1
+                break
+
+        # 反転後の開始位置を計算（有効範囲の終端を基準に）
+        reversed_start = total_measures - effective_end + 1
+
+        # 括弧付きマーカーの位置（単純反転 = 元の開始位置の反転）
+        simple_reversed = total_measures - dir_elem.measure_num + 1
+
+        # 有効範囲反転位置と単純反転位置が同じ場合はマーカー不要
+        paren_info = None
+        if dyn_type and simple_reversed != reversed_start:
+            paren_info = (dyn_type, simple_reversed)
+
+        result.append((dir_elem, reversed_start, paren_info))
+
+    # 臨時ダイナミクスは単純な位置反転
+    for dir_elem in accidental_dynamics:
+        reversed_start = total_measures - dir_elem.measure_num + 1
+        result.append((dir_elem, reversed_start, None))
+
+    return result
+
+
+def _create_parenthesized_dynamics_direction(
+    dir_elem: DirectionElement, dyn_type: str
+) -> Optional[ET.Element]:
+    """括弧付きダイナミクスのdirection要素を生成する
+
+    元のdirection XMLをベースに、<ff/> → <other-dynamics>(ff)</other-dynamics> に変換する。
+
+    Args:
+        dir_elem: 元のDirectionElement
+        dyn_type: ダイナミクスタイプ（例: 'ff'）
+
+    Returns:
+        変換されたdirection要素、失敗時はNone
+    """
+    try:
+        root = ET.fromstring(dir_elem.direction_xml)
+        dynamics = root.find('.//{*}dynamics')
+        if dynamics is None:
+            return None
+
+        # 既存のダイナミクス子要素を全て削除
+        for child in list(dynamics):
+            dynamics.remove(child)
+
+        # <other-dynamics>(ff)</other-dynamics> を追加
+        # 名前空間を検出
+        ns = ''
+        tag = dynamics.tag
+        if '}' in tag:
+            ns = tag[:tag.index('}') + 1]
+
+        other_dyn = ET.SubElement(dynamics, f'{ns}other-dynamics')
+        other_dyn.text = f'({dyn_type})'
+
+        _strip_dynamics_x_attributes(root)
+
+        return root
+    except ET.ParseError:
+        return None
+
+
 def _is_tempo_direction(dir_elem: DirectionElement) -> bool:
     """direction要素がテンポ関連かどうかを判定する
 
@@ -1020,6 +1173,10 @@ def restore_direction_elements(
     テンポ関連direction要素（sound+wordsを持つもの）は有効範囲ベースで反転し、
     経過的テンポ（rit., accel.等）のwordsテキストには←記号を付与する。
 
+    ダイナミクス（強弱記号）も有効範囲ベースで反転し、元の開始位置には
+    括弧付きの強弱記号（例: (ff)）を配置する。臨時のダイナミクス（sfz等）は
+    単純な位置反転のまま処理する。
+
     Args:
         output_xml_path: 出力MusicXMLファイル(.xml または .mxl)
         original_layout_map: 元のレイアウト情報（direction要素を含む）
@@ -1057,17 +1214,22 @@ def restore_direction_elements(
             for d in directions_to_remove:
                 measure.remove(d)
 
-        # direction要素を3カテゴリに分離:
+        # direction要素をカテゴリに分離:
         # 1. wedge ペア (cresc/dim) → type 反転 + 時間反転オフセットで再配置
         # 2. テンポ関連 (sound + words) → 有効範囲ベースで反転
-        # 3. その他 (ダイナミクス、テキスト等) → 単純な位置反転
+        # 3. ダイナミクス → 有効範囲ベースで反転 + 括弧付きマーカー
+        # 4. その他 (テキスト等) → 単純な位置反転
         all_directions = original_layout_map.directions[part_id]
         wedge_pairs, non_wedge_dirs = _separate_wedge_pairs(all_directions)
         octave_shift_pairs, non_pair_dirs = _separate_octave_shift_pairs(non_wedge_dirs)
         tempo_directions = [d for d in non_pair_dirs if _is_tempo_direction(d)]
         non_tempo_dirs = [d for d in non_pair_dirs if not _is_tempo_direction(d)]
         rehearsal_directions = [d for d in non_tempo_dirs if d.has_rehearsal]
-        other_directions = [d for d in non_tempo_dirs if not d.has_rehearsal]
+        non_rehearsal_dirs = [d for d in non_tempo_dirs if not d.has_rehearsal]
+        dynamics_directions = [d for d in non_rehearsal_dirs
+                               if _is_dynamics_direction(d)]
+        other_directions = [d for d in non_rehearsal_dirs
+                            if not _is_dynamics_direction(d)]
 
         def _insert_into_measure(target_measure, restored):
             insert_pos = 0
@@ -1178,7 +1340,53 @@ def restore_direction_elements(
             except ET.ParseError:
                 pass
 
-        # 3. その他のdirection要素（ダイナミクス等）は小節内オフセットを反転して挿入
+        # 3. ダイナミクスの有効範囲ベース反転
+        reversed_dynamics = _calculate_reversed_dynamics_directions(
+            dynamics_directions, total_measures
+        )
+
+        for dir_elem, reversed_measure_num, paren_info in reversed_dynamics:
+            if reversed_measure_num not in measure_map:
+                continue
+
+            target_measure = measure_map[reversed_measure_num]
+
+            try:
+                restored_direction = ET.fromstring(dir_elem.direction_xml)
+                _strip_dynamics_x_attributes(restored_direction)
+                target_offset = _compute_reversed_insert_offset(
+                    target_measure,
+                    dir_elem.offset_quarters,
+                    dir_elem.measure_duration_quarters,
+                    part_divisions,
+                )
+                _insert_direction_at_offset(
+                    target_measure, restored_direction, target_offset, part_divisions
+                )
+            except ET.ParseError:
+                pass
+
+            # 括弧付きマーカーを単純反転位置に挿入
+            if paren_info is not None:
+                paren_dyn_type, paren_measure_num = paren_info
+                if paren_measure_num in measure_map:
+                    paren_direction = _create_parenthesized_dynamics_direction(
+                        dir_elem, paren_dyn_type
+                    )
+                    if paren_direction is not None:
+                        paren_target = measure_map[paren_measure_num]
+                        paren_offset = _compute_reversed_insert_offset(
+                            paren_target,
+                            dir_elem.offset_quarters,
+                            dir_elem.measure_duration_quarters,
+                            part_divisions,
+                        )
+                        _insert_direction_at_offset(
+                            paren_target, paren_direction,
+                            paren_offset, part_divisions
+                        )
+
+        # 4. その他のdirection要素（テキスト等）は小節内オフセットを反転して挿入
         for dir_elem in other_directions:
             reversed_measure_num = total_measures - dir_elem.measure_num + 1
 
@@ -1202,7 +1410,7 @@ def restore_direction_elements(
             except ET.ParseError:
                 pass
 
-        # 4. 練習番号（rehearsal）は小節境界に紐付くため +1 シフトした位置に挿入
+        # 5. 練習番号（rehearsal）は小節境界に紐付くため +1 シフトした位置に挿入
         # 元 m_N の頭の練習番号 = m_(N-1) と m_N の境界。時間反転すると
         # その境界は反転後 m_(total-N+1) と m_(total-N+2) の間になり、
         # MusicXML上は反転後 m_(total-N+2) の頭に置く。
