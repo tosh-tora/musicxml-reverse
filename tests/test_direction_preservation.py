@@ -390,9 +390,9 @@ class TestIssue56DynamicsRangeReversal:
         paren_ff_at_24 = any(m == '24' and dyn == '(ff)' for m, _, dyn in positions)
         assert paren_ff_at_24, f"(ff) should be at measure 24, positions: {positions}"
 
-        # m8:p → 有効範囲 m8-m18 → reversed m7, (p) at m17
-        p_at_7 = any(m == '7' and dyn == 'p' for m, _, dyn in positions)
-        assert p_at_7, f"p should be at measure 7, positions: {positions}"
+        # m8:p → 有効範囲 m8-m17 (m18にcresc.があるため手前で切る) → reversed m8, (p) at m17
+        p_at_8 = any(m == '8' and dyn == 'p' for m, _, dyn in positions)
+        assert p_at_8, f"p should be at measure 8, positions: {positions}"
 
         paren_p_at_17 = any(m == '17' and dyn == '(p)' for m, _, dyn in positions)
         assert paren_p_at_17, f"(p) should be at measure 17, positions: {positions}"
