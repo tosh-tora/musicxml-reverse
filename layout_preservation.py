@@ -631,6 +631,34 @@ def _is_transitional_tempo_text(text: str) -> bool:
     return any(pattern in text_lower for pattern in TRANSITIONAL_TEMPO_PATTERNS)
 
 
+# テキスト形式の強弱変化指示 (cresc./decresc.) の反転マッピング
+# 時間反転に伴い crescendo ↔ decrescendo をフリップする
+_DYNAMICS_TEXT_FLIP_MAP = {
+    'cresc.': 'decresc.',
+    'cresc': 'decresc.',
+    'crescendo': 'decrescendo',
+    'decresc.': 'cresc.',
+    'decresc': 'cresc.',
+    'decrescendo': 'crescendo',
+    'dim.': 'cresc.',
+    'dim': 'cresc.',
+    'diminuendo': 'crescendo',
+}
+
+
+def _is_dynamics_text_direction(dir_elem: DirectionElement) -> bool:
+    """direction要素がテキスト形式の強弱変化指示（cresc./decresc.等）かどうかを判定する"""
+    if not dir_elem.has_words or not dir_elem.words_text:
+        return False
+    return dir_elem.words_text.strip().lower() in _DYNAMICS_TEXT_FLIP_MAP
+
+
+def _flip_dynamics_text(text: str) -> str:
+    """cresc. ↔ decresc. を反転する"""
+    key = text.strip().lower()
+    return _DYNAMICS_TEXT_FLIP_MAP.get(key, text)
+
+
 # 臨時の（アクセント系）強弱記号
 # これらは音符単位で適用されるため、有効範囲ベースの反転対象外
 ACCIDENTAL_DYNAMICS = {
@@ -1398,6 +1426,12 @@ def restore_direction_elements(
             try:
                 restored_direction = ET.fromstring(dir_elem.direction_xml)
                 _strip_dynamics_x_attributes(restored_direction)
+
+                # テキスト形式の cresc./decresc. を反転
+                if _is_dynamics_text_direction(dir_elem):
+                    words_elem = restored_direction.find('.//{*}direction-type/{*}words')
+                    if words_elem is not None and words_elem.text:
+                        words_elem.text = _flip_dynamics_text(words_elem.text)
                 target_offset = _compute_reversed_insert_offset(
                     target_measure,
                     dir_elem.offset_quarters,
