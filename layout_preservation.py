@@ -1397,15 +1397,21 @@ def restore_direction_elements(
             try:
                 restored_direction = ET.fromstring(dir_elem.direction_xml)
                 _strip_dynamics_x_attributes(restored_direction)
-                target_offset = _compute_reversed_insert_offset(
-                    target_measure,
-                    dir_elem.offset_quarters,
-                    dir_elem.measure_duration_quarters,
-                    part_divisions,
-                )
-                _insert_direction_at_offset(
-                    target_measure, restored_direction, target_offset, part_divisions
-                )
+
+                if paren_info is not None:
+                    # 有効範囲ベースで別の小節に移動 → 小節先頭に配置
+                    _insert_into_measure(target_measure, restored_direction)
+                else:
+                    # 臨時ダイナミクス or 有効範囲=1小節 → オフセット反転で配置
+                    target_offset = _compute_reversed_insert_offset(
+                        target_measure,
+                        dir_elem.offset_quarters,
+                        dir_elem.measure_duration_quarters,
+                        part_divisions,
+                    )
+                    _insert_direction_at_offset(
+                        target_measure, restored_direction, target_offset, part_divisions
+                    )
             except ET.ParseError:
                 pass
 
