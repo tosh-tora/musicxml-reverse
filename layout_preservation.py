@@ -1020,16 +1020,21 @@ def _strip_dynamics_x_attributes(direction_root: ET.Element) -> None:
 
 def _calculate_reversed_dynamics_directions(
     directions: list[DirectionElement],
-    total_measures: int
+    total_measures: int,
+    text_dynamics_measures: Optional[list[int]] = None,
 ) -> list[tuple[DirectionElement, int, Optional[tuple[str, int]]]]:
     """ダイナミクスdirection要素の反転後位置を計算する
 
     非臨時ダイナミクス: 有効範囲ベースで反転 + 括弧付きマーカー
     臨時ダイナミクス: 単純な位置反転（従来通り）
 
+    テキスト形式の強弱変化指示（cresc./decresc.）の小節番号も境界として
+    考慮し、ダイナミクスの有効範囲をその手前で切る。
+
     Args:
         directions: ダイナミクスのDirectionElementリスト
         total_measures: 総小節数
+        text_dynamics_measures: テキスト形式の強弱変化指示がある小節番号のリスト
 
     Returns:
         (DirectionElement, reversed_measure_num, optional (dyn_type, paren_measure_num))
@@ -1049,17 +1054,22 @@ def _calculate_reversed_dynamics_directions(
         else:
             main_dynamics.append(d)
 
+    # 有効範囲の境界マーカー: 非臨時ダイナミクスの小節 + テキスト強弱変化の小節
+    boundary_measures = sorted(set(
+        [d.measure_num for d in main_dynamics]
+        + (text_dynamics_measures or [])
+    ))
+
     result = []
 
     # 非臨時ダイナミクスの有効範囲ベース反転
     for i, dir_elem in enumerate(main_dynamics):
         dyn_type = _get_dynamics_type(dir_elem)
-        # 適用終了位置を計算（次の非臨時ダイナミクスの直前まで）
+        # 適用終了位置を計算（次の境界マーカーの直前まで）
         effective_end = total_measures  # デフォルトは曲の最後
-        for j in range(i + 1, len(main_dynamics)):
-            next_measure = main_dynamics[j].measure_num
-            if next_measure > dir_elem.measure_num:
-                effective_end = next_measure - 1
+        for bm in boundary_measures:
+            if bm > dir_elem.measure_num:
+                effective_end = bm - 1
                 break
 
         # 反転後の開始位置を計算（有効範囲の終端を基準に）
@@ -1369,8 +1379,13 @@ def restore_direction_elements(
                 pass
 
         # 3. ダイナミクスの有効範囲ベース反転
+        # テキスト形式の強弱変化指示（cresc./decresc.）の小節番号を境界として渡す
+        text_dyn_measures = [
+            d.measure_num for d in other_directions
+            if _is_dynamics_text_direction(d)
+        ]
         reversed_dynamics = _calculate_reversed_dynamics_directions(
-            dynamics_directions, total_measures
+            dynamics_directions, total_measures, text_dyn_measures
         )
 
         for dir_elem, reversed_measure_num, paren_info in reversed_dynamics:
@@ -1427,20 +1442,22 @@ def restore_direction_elements(
                 restored_direction = ET.fromstring(dir_elem.direction_xml)
                 _strip_dynamics_x_attributes(restored_direction)
 
-                # テキスト形式の cresc./decresc. を反転
+                # テキスト形式の cresc./decresc. を反転し、小節先頭に配置
                 if _is_dynamics_text_direction(dir_elem):
                     words_elem = restored_direction.find('.//{*}direction-type/{*}words')
                     if words_elem is not None and words_elem.text:
                         words_elem.text = _flip_dynamics_text(words_elem.text)
-                target_offset = _compute_reversed_insert_offset(
-                    target_measure,
-                    dir_elem.offset_quarters,
-                    dir_elem.measure_duration_quarters,
-                    part_divisions,
-                )
-                _insert_direction_at_offset(
-                    target_measure, restored_direction, target_offset, part_divisions
-                )
+                    _insert_into_measure(target_measure, restored_direction)
+                else:
+                    target_offset = _compute_reversed_insert_offset(
+                        target_measure,
+                        dir_elem.offset_quarters,
+                        dir_elem.measure_duration_quarters,
+                        part_divisions,
+                    )
+                    _insert_direction_at_offset(
+                        target_measure, restored_direction, target_offset, part_divisions
+                    )
             except ET.ParseError:
                 pass
 
