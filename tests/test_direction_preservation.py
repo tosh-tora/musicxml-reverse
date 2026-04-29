@@ -265,3 +265,73 @@ class TestIssue47RehearsalMarkPosition:
         assert '13' not in old_bug_measures or all(
             text not in ('S', 'T') for measure, text in marks if measure == '13'
         ), "Rehearsal mark wrongly at measure 13 (off-by-one regression)"
+
+
+def get_dynamics_positions_from_mxl(mxl_path: Path) -> list[tuple[str, float, str]]:
+    """MXLファイルから(小節番号, 小節内オフセット_quarters, ダイナミクス種別)を取得"""
+    result = []
+    with zipfile.ZipFile(mxl_path, 'r') as z:
+        for name in z.namelist():
+            if (name.endswith('.xml') or name.endswith('.musicxml')) and not name.startswith('META-INF'):
+                content = z.read(name)
+                root = ET.fromstring(content)
+                for part in root.findall('.//{*}part'):
+                    divs = 1.0
+                    for measure in part.findall('.//{*}measure'):
+                        measure_num = measure.get('number', '?')
+                        current_offset = 0.0
+                        for elem in measure:
+                            tag = elem.tag.split('}')[-1]
+                            if tag == 'attributes':
+                                d = elem.find('.//{*}divisions')
+                                if d is not None and d.text:
+                                    divs = float(d.text)
+                            elif tag == 'direction':
+                                dyn = elem.find('.//{*}dynamics')
+                                if dyn is not None:
+                                    for ch in dyn:
+                                        dyn_type = ch.tag.split('}')[-1]
+                                        result.append((measure_num, current_offset / divs, dyn_type))
+                            elif tag == 'note':
+                                chord = elem.find('.//{*}chord')
+                                dur_e = elem.find('.//{*}duration')
+                                if chord is None and dur_e is not None and dur_e.text:
+                                    current_offset += float(dur_e.text)
+                break
+    return result
+
+
+class TestIssue54DynamicsPosition:
+    """Issue #54: ダイナミクス記号の反転後位置が正しい"""
+
+    def test_dynamics_on_last_beat_after_reversal(self, tmp_path):
+        """1拍目のffは反転後に最後の拍（2拍目）に配置される"""
+        input_file = Path('work/inbox/威風堂々ラスト_in-Viola.mxl')
+        if not input_file.exists():
+            pytest.skip(f"Test file not found: {input_file}")
+
+        output_file = tmp_path / 'test_output.mxl'
+
+        layout_map = extract_layout_from_xml(input_file)
+        score = converter.parse(str(input_file))
+        reversed_score = reverse_score(score, None)
+        reversed_score.write('mxl', fp=str(output_file))
+        total_measures = len(list(reversed_score.parts[0].getElementsByClass('Measure')))
+        restore_direction_elements(output_file, layout_map, total_measures)
+
+        positions = get_dynamics_positions_from_mxl(output_file)
+
+        # 元の1小節目の1拍目(offset=0q)にffがある
+        # 反転後、最終小節(m53)の2拍目(offset=1q)にffが来るはず
+        last_measure_str = str(total_measures)
+        ff_positions = [
+            (m, offset) for m, offset, dyn in positions
+            if dyn == 'ff' and m == last_measure_str
+        ]
+
+        assert len(ff_positions) >= 1, "ff should appear in the last reversed measure"
+        for measure_num, offset in ff_positions:
+            assert offset > 0.0, (
+                f"ff at measure {measure_num} offset {offset}q: "
+                f"should be on beat 2 (offset > 0), not beat 1"
+            )
