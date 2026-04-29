@@ -869,6 +869,65 @@ def _separate_wedge_pairs(
     return pairs, others
 
 
+def _octave_shift_only_direction(dir_elem: 'DirectionElement') -> Optional[ET.Element]:
+    """direction が octave-shift 単独要素ならその octave-shift 要素を返す。それ以外は None。"""
+    try:
+        root = ET.fromstring(dir_elem.direction_xml)
+    except ET.ParseError:
+        return None
+    direction_type = root.find('{*}direction-type')
+    if direction_type is None:
+        return None
+    children = list(direction_type)
+    if len(children) != 1:
+        return None
+    child = children[0]
+    if not child.tag.endswith('octave-shift'):
+        return None
+    return child
+
+
+def _separate_octave_shift_pairs(
+    dir_elems: list['DirectionElement']
+) -> tuple[list[tuple['DirectionElement', 'DirectionElement']], list['DirectionElement']]:
+    """direction リストから octave-shift start/stop ペアと、それ以外に分離する。
+
+    ペアリングは出現順に number 属性で対応付ける。ペアにならなかった
+    octave-shift direction は他の direction として扱う（フォールバック）。
+    """
+    pairs: list[tuple[DirectionElement, DirectionElement]] = []
+    others: list[DirectionElement] = []
+    open_starts: dict[str, DirectionElement] = {}
+
+    for d in dir_elems:
+        os_elem = _octave_shift_only_direction(d)
+        if os_elem is None:
+            others.append(d)
+            continue
+        number = os_elem.get('number') or '1'
+        otype = os_elem.get('type') or ''
+        if otype in ('up', 'down'):
+            # 既に開いている同 number の start は孤立扱い
+            if number in open_starts:
+                others.append(open_starts.pop(number))
+            open_starts[number] = d
+        elif otype == 'stop':
+            start = open_starts.pop(number, None)
+            if start is not None:
+                pairs.append((start, d))
+            else:
+                others.append(d)
+        else:
+            # 'continue' などはフォールバック
+            others.append(d)
+
+    # 未クローズの start は孤立扱い
+    for d in open_starts.values():
+        others.append(d)
+
+    return pairs, others
+
+
 def _strip_dynamics_x_attributes(direction_root: ET.Element) -> None:
     """direction 内の <dynamics> から default-x/relative-x を除去する。
 
@@ -1004,8 +1063,9 @@ def restore_direction_elements(
         # 3. その他 (ダイナミクス、テキスト等) → 単純な位置反転
         all_directions = original_layout_map.directions[part_id]
         wedge_pairs, non_wedge_dirs = _separate_wedge_pairs(all_directions)
-        tempo_directions = [d for d in non_wedge_dirs if _is_tempo_direction(d)]
-        non_tempo_dirs = [d for d in non_wedge_dirs if not _is_tempo_direction(d)]
+        octave_shift_pairs, non_pair_dirs = _separate_octave_shift_pairs(non_wedge_dirs)
+        tempo_directions = [d for d in non_pair_dirs if _is_tempo_direction(d)]
+        non_tempo_dirs = [d for d in non_pair_dirs if not _is_tempo_direction(d)]
         rehearsal_directions = [d for d in non_tempo_dirs if d.has_rehearsal]
         other_directions = [d for d in non_tempo_dirs if not d.has_rehearsal]
 
@@ -1068,6 +1128,38 @@ def restore_direction_elements(
                         cur_type = wedge_elem.get('type')
                         wedge_elem.set('type', _flip_wedge_type(cur_type))
                     # 反転後の小節長は元の対応小節（stop の元小節）と等しい
+                    target_dur = stop_dir.measure_duration_quarters
+                    target_offset = max(0.0, target_dur - stop_dir.offset_quarters)
+                    _insert_direction_at_offset(
+                        target, new_start_xml, target_offset, part_divisions
+                    )
+
+                if new_stop_measure in measure_map:
+                    target = measure_map[new_stop_measure]
+                    new_stop_xml = ET.fromstring(stop_dir.direction_xml)
+                    _strip_dynamics_x_attributes(new_stop_xml)
+                    target_dur = start_dir.measure_duration_quarters
+                    target_offset = max(0.0, target_dur - start_dir.offset_quarters)
+                    _insert_direction_at_offset(
+                        target, new_stop_xml, target_offset, part_divisions
+                    )
+            except ET.ParseError:
+                pass
+
+        # 2b. octave-shift ペアの復元（時間反転に伴い start/stop の位置を入れ替える）
+        # wedge と異なり type は反転せず、start (down/up) と stop の役割だけが入れ替わる:
+        #   元: start (down/up) at measure A offset SA → stop at measure B offset SB
+        #   新 start (down/up と同じ) = 反転後の B 小節, offset = M(B') - SB
+        #   新 stop                     = 反転後の A 小節, offset = M(A') - SA
+        for start_dir, stop_dir in octave_shift_pairs:
+            new_start_measure = total_measures - stop_dir.measure_num + 1
+            new_stop_measure = total_measures - start_dir.measure_num + 1
+
+            try:
+                if new_start_measure in measure_map:
+                    target = measure_map[new_start_measure]
+                    new_start_xml = ET.fromstring(start_dir.direction_xml)
+                    _strip_dynamics_x_attributes(new_start_xml)
                     target_dur = stop_dir.measure_duration_quarters
                     target_offset = max(0.0, target_dur - stop_dir.offset_quarters)
                     _insert_direction_at_offset(
