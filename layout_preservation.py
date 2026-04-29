@@ -684,6 +684,59 @@ def _measure_total_quarters(measure: ET.Element, divisions: float) -> float:
     return max_offset
 
 
+def _compute_reversed_insert_offset(
+    reversed_measure: ET.Element,
+    original_offset_q: float,
+    measure_duration_q: float,
+    divisions: float,
+) -> float:
+    """元の measure の original_offset_q に紐付く direction を
+    反転後の measure に挿入する際の目標オフセットを計算する。
+
+    反転後の measure を走査し、終端時刻が
+    (measure_duration_q - original_offset_q) を超える
+    最初の非コード音符の開始位置を返す。これにより、direction が
+    元の音符と同じ音符の直前に挿入される。
+    """
+    epsilon = 1e-6
+    target_end = measure_duration_q - original_offset_q
+
+    if target_end <= epsilon:
+        return 0.0  # 小節冒頭に挿入
+
+    cumulative = 0.0
+    for child in reversed_measure:
+        tag = child.tag
+        if tag.endswith('note'):
+            if child.find('.//{*}chord') is None:
+                d = child.find('.//{*}duration')
+                dur = 0.0
+                if d is not None and d.text:
+                    try:
+                        dur = float(d.text) / divisions
+                    except ValueError:
+                        pass
+                if cumulative + dur > target_end - epsilon:
+                    return cumulative
+                cumulative += dur
+        elif tag.endswith('backup'):
+            d = child.find('.//{*}duration')
+            if d is not None and d.text:
+                try:
+                    cumulative = max(0.0, cumulative - float(d.text) / divisions)
+                except ValueError:
+                    pass
+        elif tag.endswith('forward'):
+            d = child.find('.//{*}duration')
+            if d is not None and d.text:
+                try:
+                    cumulative += float(d.text) / divisions
+                except ValueError:
+                    pass
+
+    return measure_duration_q  # フォールバック: 末尾に追加
+
+
 def _insert_direction_at_offset(
     measure: ET.Element,
     direction: ET.Element,
@@ -1033,7 +1086,7 @@ def restore_direction_elements(
             except ET.ParseError:
                 pass
 
-        # 3. その他のdirection要素は単純な位置反転で挿入
+        # 3. その他のdirection要素（ダイナミクス等）は小節内オフセットを反転して挿入
         for dir_elem in other_directions:
             reversed_measure_num = total_measures - dir_elem.measure_num + 1
 
@@ -1045,7 +1098,15 @@ def restore_direction_elements(
             try:
                 restored_direction = ET.fromstring(dir_elem.direction_xml)
                 _strip_dynamics_x_attributes(restored_direction)
-                _insert_into_measure(target_measure, restored_direction)
+                target_offset = _compute_reversed_insert_offset(
+                    target_measure,
+                    dir_elem.offset_quarters,
+                    dir_elem.measure_duration_quarters,
+                    part_divisions,
+                )
+                _insert_direction_at_offset(
+                    target_measure, restored_direction, target_offset, part_divisions
+                )
             except ET.ParseError:
                 pass
 
