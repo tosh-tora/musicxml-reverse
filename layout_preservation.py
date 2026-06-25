@@ -1667,6 +1667,131 @@ def normalize_slur_numbers(output_xml_path: Path, verbose: bool = False) -> None
         tree.write(output_xml_path, encoding='utf-8', xml_declaration=True)
 
 
+def convert_filler_rests_to_forward(output_xml_path: Path, verbose: bool = False) -> None:
+    """
+    Voice先頭の不要な隠し休符を forward に変換する
+
+    Divisi等で複数Voiceがある小節で、あるVoiceの音符が小節全体を
+    満たさない場合、music21はその不足分を非表示（print-object="no"）の
+    休符で自動的に埋める。元のファイルでは forward 要素（カーソルを
+    無音で進めるだけで、何の要素も生成しない）で表現されていた末尾の
+    余白が、反転処理でVoiceの先頭に移動すると、music21の書き出し時に
+    この隠し休符として復元されてしまう（MuseScore等では編集時に
+    灰色の休符として表示される）。
+
+    この関数はVoiceの先頭にある「隠し休符の直後に本物の音符が続く」
+    パターンを検出し、forward 要素に置き換えて元の表現に近づける。
+    Voice全体が休符のみの場合（本物の音符が続かない場合）は変更しない。
+
+    Args:
+        output_xml_path: 処理対象のMusicXMLファイル(.xml または .mxl)
+        verbose: デバッグ出力を有効にする
+    """
+    is_mxl = output_xml_path.suffix == '.mxl'
+
+    if is_mxl:
+        root, xml_filename = _extract_mxl_content(output_xml_path)
+    else:
+        tree = ET.parse(output_xml_path)
+        root = tree.getroot()
+
+    converted_count = 0
+
+    for part in root.findall('.//{*}part'):
+        part_id = part.get('id', 'unknown')
+
+        for measure in part.findall('.//{*}measure'):
+            measure_num = measure.get('number')
+            children = list(measure)
+
+            at_voice_start = True
+            for idx, child in enumerate(children):
+                tag = child.tag.rsplit('}', 1)[-1]
+
+                if tag == 'backup':
+                    at_voice_start = True
+                    continue
+
+                if tag != 'note':
+                    continue
+
+                is_hidden_rest = (
+                    child.find('{*}rest') is not None
+                    and child.get('print-object') == 'no'
+                )
+
+                if not (at_voice_start and is_hidden_rest):
+                    at_voice_start = False
+                    continue
+
+                # 隠し休符の直後（次のbackupより前）に本物の音符が
+                # 続くかを確認する
+                has_real_note_after = False
+                for later in children[idx + 1:]:
+                    later_tag = later.tag.rsplit('}', 1)[-1]
+                    if later_tag == 'backup':
+                        break
+                    if later_tag == 'note' and not (
+                        later.find('{*}rest') is not None
+                        and later.get('print-object') == 'no'
+                    ):
+                        has_real_note_after = True
+                        break
+
+                if not has_real_note_after:
+                    # Voice全体が休符のみ: 変更しない
+                    at_voice_start = False
+                    continue
+
+                duration_elem = child.find('{*}duration')
+                duration_text = duration_elem.text if duration_elem is not None else None
+                if not duration_text:
+                    at_voice_start = False
+                    continue
+
+                forward_elem = ET.Element('forward')
+                new_duration = ET.SubElement(forward_elem, 'duration')
+                new_duration.text = duration_text
+
+                measure[idx] = forward_elem
+                converted_count += 1
+
+                if verbose:
+                    print(f"  Converted filler rest -> forward: part={part_id} measure={measure_num} duration={duration_text}")
+
+                # forward自体はVoiceの開始位置をまだ占めているため、
+                # 続く要素の at_voice_start 判定は変えない（次の要素も
+                # 連続した隠し休符であれば同様に変換対象とする）
+
+    if verbose:
+        print(f"  Total filler rests converted: {converted_count}")
+
+    if converted_count == 0:
+        return
+
+    # 変更後のXMLを書き出し
+    if is_mxl:
+        import tempfile
+        import shutil
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_mxl = Path(tmpdir) / 'output.mxl'
+            shutil.copy2(output_xml_path, tmp_mxl)
+
+            xml_content = ET.tostring(root, encoding='utf-8', xml_declaration=True)
+
+            with zipfile.ZipFile(output_xml_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf_out:
+                with zipfile.ZipFile(tmp_mxl, 'r') as zf_in:
+                    for item in zf_in.namelist():
+                        if item == xml_filename:
+                            zf_out.writestr(item, xml_content)
+                        else:
+                            zf_out.writestr(item, zf_in.read(item))
+    else:
+        tree = ET.ElementTree(root)
+        tree.write(output_xml_path, encoding='utf-8', xml_declaration=True)
+
+
 def _restore_credits_with_retrograde(
     root: ET.Element,
     credits_xml: list[str],
