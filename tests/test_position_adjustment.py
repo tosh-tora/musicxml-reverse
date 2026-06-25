@@ -6,7 +6,7 @@ Issue #29: 音部記号、テンポ指示など「始点のみ指定される要
 """
 
 import pytest
-from music21 import stream, clef, tempo, note, expressions
+from music21 import stream, clef, tempo, note, expressions, layout
 
 import sys
 from pathlib import Path
@@ -19,6 +19,9 @@ from reverse_score import (
     collect_tempo_positions,
     calculate_reversed_tempo_positions,
     apply_reversed_tempo_elements,
+    collect_layout_positions,
+    calculate_reversed_layout_positions,
+    apply_reversed_layout_elements,
     reverse_part,
     is_transitional_tempo,
 )
@@ -127,6 +130,104 @@ class TestClefPositionCalculation:
         # m1のC → 反転後m9
         assert reversed_positions[2]['reversed_measure_num'] == 9
         assert isinstance(reversed_positions[2]['clef'], clef.AltoClef)
+
+
+class TestLayoutPositionCollection:
+    """レイアウト要素（SystemLayout/StaffLayout）の位置収集テスト
+
+    Issue #61: <print> から生成される SystemLayout/StaffLayout は
+    音部記号と同じ「始点のみ指定される要素」だが、反転時に再配置されず
+    元の小節と一緒に移動してしまい、スコアの大部分が元のスペーシングを
+    失って行間が広がる原因になっていた。
+    """
+
+    def test_single_system_layout(self):
+        """単一SystemLayoutの収集（威風堂々-Violinパターン）"""
+        measures = []
+        for i in range(1, 6):
+            m = stream.Measure(number=i)
+            if i == 1:
+                sl = layout.SystemLayout()
+                sl.topDistance = 305.89
+                m.insert(0, sl)
+            m.append(note.Rest(quarterLength=4))
+            measures.append(m)
+
+        positions = collect_layout_positions(measures, 'SystemLayout')
+        assert len(positions) == 1
+        assert positions[0]['measure_num'] == 1
+        assert isinstance(positions[0]['layout_obj'], layout.SystemLayout)
+
+    def test_multiple_staff_layouts(self):
+        """複数StaffLayoutの収集"""
+        measures = []
+        for i in range(1, 11):
+            m = stream.Measure(number=i)
+            if i == 1:
+                m.insert(0, layout.StaffLayout(distance=78.44))
+            elif i == 6:
+                m.insert(0, layout.StaffLayout(distance=100.0))
+            m.append(note.Rest(quarterLength=4))
+            measures.append(m)
+
+        positions = collect_layout_positions(measures, 'StaffLayout')
+        assert len(positions) == 2
+        assert positions[0]['measure_num'] == 1
+        assert positions[1]['measure_num'] == 6
+
+    def test_system_and_staff_layout_independent(self):
+        """SystemLayoutとStaffLayoutは別系列として扱われる"""
+        measures = []
+        for i in range(1, 6):
+            m = stream.Measure(number=i)
+            if i == 1:
+                m.insert(0, layout.SystemLayout())
+                m.insert(0, layout.StaffLayout(distance=78.44))
+            m.append(note.Rest(quarterLength=4))
+            measures.append(m)
+
+        system_positions = collect_layout_positions(measures, 'SystemLayout')
+        staff_positions = collect_layout_positions(measures, 'StaffLayout')
+        assert len(system_positions) == 1
+        assert len(staff_positions) == 1
+
+
+class TestLayoutPositionCalculation:
+    """レイアウト要素の反転位置計算テスト"""
+
+    def test_single_layout_at_measure_one_reversed(self):
+        """measure 1にのみある宣言は反転後もm1に配置される（威風堂々-Violinの実際のバグ）
+
+        元: m1にSystemLayoutのみ、全53小節
+        修正前: ディープコピーで小節と一緒に移動 → m53に配置（バグ）
+        修正後: 53-53+1=1 → m1に配置
+        """
+        positions = [{'measure_num': 1, 'offset': 0, 'layout_obj': layout.SystemLayout()}]
+        total_measures = 53
+
+        reversed_positions = calculate_reversed_layout_positions(positions, total_measures)
+
+        assert len(reversed_positions) == 1
+        assert reversed_positions[0]['reversed_measure_num'] == 1
+
+    def test_two_layouts_reversed(self):
+        """2つのレイアウト宣言の反転"""
+        # m1, m6 → 全10小節
+        # m1はm5まで有効 → 反転後: 10-5+1=6
+        # m6はm10まで有効 → 反転後: 10-10+1=1
+        positions = [
+            {'measure_num': 1, 'offset': 0, 'layout_obj': layout.StaffLayout(distance=78.44)},
+            {'measure_num': 6, 'offset': 0, 'layout_obj': layout.StaffLayout(distance=100.0)},
+        ]
+        total_measures = 10
+
+        reversed_positions = calculate_reversed_layout_positions(positions, total_measures)
+
+        assert len(reversed_positions) == 2
+        assert reversed_positions[0]['reversed_measure_num'] == 1
+        assert reversed_positions[0]['layout_obj'].distance == 100.0
+        assert reversed_positions[1]['reversed_measure_num'] == 6
+        assert reversed_positions[1]['layout_obj'].distance == 78.44
 
 
 class TestTempoPositionCollection:
@@ -257,6 +358,43 @@ class TestReversePartIntegration:
         final_measures = list(reversed_twice.getElementsByClass(stream.Measure))
         assert len(orig_measures) == len(final_measures)
 
+    def test_system_staff_layout_reversal_in_part(self):
+        """パート全体でのSystemLayout/StaffLayout反転（Issue #61）
+
+        m1にのみある宣言は、小節順序の反転後もm1（スコア冒頭）に
+        留まる必要がある。修正前はディープコピーで小節と一緒に
+        最終小節へ移動してしまい、それ以前の全システムがmusic21の
+        デフォルトスペーシングにフォールバックして行間が広がっていた。
+        """
+        part = stream.Part()
+        for i in range(1, 11):
+            m = stream.Measure(number=i)
+            if i == 1:
+                sl = layout.SystemLayout()
+                sl.topDistance = 305.89
+                m.insert(0, sl)
+                m.insert(0, layout.StaffLayout(distance=78.44))
+            m.append(note.Note('C4', quarterLength=4))
+            part.append(m)
+
+        reversed_part = reverse_part(part)
+        measures = list(reversed_part.getElementsByClass(stream.Measure))
+
+        m1 = next(m for m in measures if m.number == 1)
+        system_layouts = list(m1.getElementsByClass('SystemLayout'))
+        staff_layouts = list(m1.getElementsByClass('StaffLayout'))
+
+        assert len(system_layouts) == 1
+        assert system_layouts[0].topDistance == 305.89
+        assert len(staff_layouts) == 1
+        assert staff_layouts[0].distance == 78.44
+
+        # 他の小節には漏れていない
+        for m in measures:
+            if m.number != 1:
+                assert len(list(m.getElementsByClass('SystemLayout'))) == 0
+                assert len(list(m.getElementsByClass('StaffLayout'))) == 0
+
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
@@ -348,6 +486,45 @@ class TestRealDataIntegration:
 
         # 音部記号の種類が保持されていることを確認
         assert original_clef_set == final_clef_set, "音部記号の種類が一致しない"
+
+    def test_ifudodo_violin_layout_file(self):
+        """威風堂々-Violinパートで SystemLayout/StaffLayout の反転を確認（Issue #61）
+
+        実データ: m1にのみ <print>（system-layout, staff-layout）があり、
+        他に <print> はない。反転後もm1に残っている必要がある。
+        修正前はm53（最終小節）に移動してしまっていた。
+        """
+        from music21 import converter
+        from pathlib import Path
+
+        test_file = Path(__file__).parent.parent / 'work/inbox/test/威風堂々ラスト_in-Violin.mxl'
+        if not test_file.exists():
+            pytest.skip(f"Test file not found: {test_file}")
+
+        score = converter.parse(str(test_file))
+
+        for part in score.parts:
+            original_measures = list(part.getElementsByClass(stream.Measure))
+            total_measures = len(original_measures)
+
+            reversed_part = reverse_part(part)
+            reversed_measures = list(reversed_part.getElementsByClass(stream.Measure))
+
+            m1 = next(m for m in reversed_measures if m.number == 1)
+            last_measure = next(m for m in reversed_measures if m.number == total_measures)
+
+            # 最終小節に取り残されていないこと（修正前のバグ）
+            assert len(list(last_measure.getElementsByClass('SystemLayout'))) == 0
+            assert len(list(last_measure.getElementsByClass('StaffLayout'))) == 0
+
+            # 元々レイアウト宣言を持っていたパートはm1に復元されていること
+            original_system_layouts = collect_layout_positions(original_measures, 'SystemLayout')
+            original_staff_layouts = collect_layout_positions(original_measures, 'StaffLayout')
+
+            if original_system_layouts:
+                assert len(list(m1.getElementsByClass('SystemLayout'))) >= 1
+            if original_staff_layouts:
+                assert len(list(m1.getElementsByClass('StaffLayout'))) >= 1
 
 
 class TestTransitionalTempoDetection:
