@@ -11,6 +11,7 @@ MXL ファイルを「逆から演奏できる」スコアに変換する。
 
 import copy
 import sys
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -1128,6 +1129,216 @@ def reverse_score(score: stream.Score, report: ProcessingReport | None = None) -
     return new_score
 
 
+def find_joinable_staff_groups(score: stream.Score) -> list[layout.StaffGroup]:
+    """music21の書き出し時に1つの<part>へ結合されるStaffGroupを返す
+
+    music21 は StaffGroup の全メンバーが PartStaff かつ小節を持つ場合のみ、
+    それらを1つの <part staves="N"> として書き出す（joinPartStaffs()）。
+    その際、2番目以降のメンバーの <print> 要素は常に捨てられる
+    （partStaffExporter.moveMeasureContents() の "Skip <print> tags" 仕様）。
+    Issue #63 の対象を特定するために、結合対象のグループを同じ基準で抽出する。
+
+    Args:
+        score: 反転後のスコア
+
+    Returns:
+        結合されるStaffGroupのリスト（メンバーは結合順）
+    """
+    groups = []
+    for sg in score.getElementsByClass(layout.StaffGroup):
+        members = list(sg)
+        if len(members) <= 1:
+            continue
+        if not all(stream.PartStaff in m.classSet for m in members):
+            continue
+        if not all(m.getElementsByClass(stream.Measure) for m in members):
+            continue
+        groups.append(sg)
+    return groups
+
+
+def collect_dropped_print_layouts(score: stream.Score) -> list[dict]:
+    """結合により<print>が失われるレイアウト要素を収集する
+
+    結合グループの2番目以降のパートに付いている SystemLayout/StaffLayout/
+    PageLayout は、出力XMLの結合後<part>には反映されない。そのパートの
+    どの小節（結合先の<part>では同じ小節番号）にどのオブジェクトがあったかを
+    収集する。
+
+    Args:
+        score: 反転後のスコア
+
+    Returns:
+        [{anchor_part, measure_num, layout_obj}] のリスト
+        anchor_part: 結合後に出力される側のパート（グループの先頭）
+    """
+    dropped = []
+    for group in find_joinable_staff_groups(score):
+        members = list(group)
+        anchor_part = members[0]
+        for member in members[1:]:
+            for measure in member.getElementsByClass(stream.Measure):
+                for layout_obj in measure.getElementsByClass(layout.LayoutBase):
+                    dropped.append({
+                        'anchor_part': anchor_part,
+                        'measure_num': measure.number,
+                        'layout_obj': layout_obj,
+                    })
+    return dropped
+
+
+def _output_part_index_for(score: stream.Score, anchor_part) -> int | None:
+    """出力XML中で anchor_part に対応する<part>のインデックスを求める
+
+    結合グループの2番目以降のパートは出力に<part>を持たないため、
+    生き残るパート（各グループの先頭 + 単独パート）を元の順序で数える。
+    """
+    dropped_ids = set()
+    for group in find_joinable_staff_groups(score):
+        for member in list(group)[1:]:
+            dropped_ids.add(id(member))
+
+    index = 0
+    for part in score.parts:
+        if id(part) in dropped_ids:
+            continue
+        if part is anchor_part:
+            return index
+        index += 1
+    return None
+
+
+def _layout_obj_to_xml_element(layout_obj) -> ET.Element | None:
+    """music21のレイアウトオブジェクトから対応するXML要素を生成する
+
+    <print>の子として直接挿入できる <system-layout>/<staff-layout>/
+    <page-layout> 要素のみを生成する（distance系の属性のみ、staff-details
+    相当の情報は対象外）。
+    """
+    if isinstance(layout_obj, layout.StaffLayout):
+        elem = ET.Element('staff-layout')
+        if layout_obj.staffNumber is not None:
+            elem.set('number', str(layout_obj.staffNumber))
+        if layout_obj.distance is not None:
+            ET.SubElement(elem, 'staff-distance').text = str(layout_obj.distance)
+        return elem if len(elem) else None
+
+    if isinstance(layout_obj, layout.SystemLayout):
+        elem = ET.Element('system-layout')
+        if layout_obj.leftMargin is not None or layout_obj.rightMargin is not None:
+            margins = ET.SubElement(elem, 'system-margins')
+            if layout_obj.leftMargin is not None:
+                ET.SubElement(margins, 'left-margin').text = str(layout_obj.leftMargin)
+            if layout_obj.rightMargin is not None:
+                ET.SubElement(margins, 'right-margin').text = str(layout_obj.rightMargin)
+        if layout_obj.topDistance is not None:
+            ET.SubElement(elem, 'top-system-distance').text = str(layout_obj.topDistance)
+        if layout_obj.distance is not None:
+            ET.SubElement(elem, 'system-distance').text = str(layout_obj.distance)
+        return elem if len(elem) else None
+
+    if isinstance(layout_obj, layout.PageLayout):
+        elem = ET.Element('page-layout')
+        if layout_obj.pageHeight is not None:
+            ET.SubElement(elem, 'page-height').text = str(layout_obj.pageHeight)
+        if layout_obj.pageWidth is not None:
+            ET.SubElement(elem, 'page-width').text = str(layout_obj.pageWidth)
+        return elem if len(elem) else None
+
+    return None
+
+
+def _print_already_has(mx_print: ET.Element, mx_new: ET.Element) -> bool:
+    """mx_print が mx_new と同種(かつ同じstaff番号)の要素を既に持つか判定する"""
+    tag = mx_new.tag
+    if tag == 'staff-layout':
+        target_number = mx_new.get('number')
+        for existing in mx_print.findall(tag):
+            if existing.get('number') == target_number:
+                return True
+        return False
+    return mx_print.find(tag) is not None
+
+
+def restore_dropped_print_layouts(output_path: Path, score: stream.Score) -> None:
+    """結合パートで失われた<print>内レイアウト要素を出力XMLに復元する
+
+    Issue #63: PartStaff を1つの<part>に結合する際、music21は2番目以降の
+    パートの<print>要素を常に捨てる（partStaffExporter.py の既知の仕様）。
+    反転処理自体は正しく小節位置を計算済み（Issue #61）のため、ここでは
+    out力XMLに対応する要素が欠けている場合にのみ直接挿入して補う。
+
+    Args:
+        output_path: 出力MusicXMLファイル（.xml または .mxl）
+        score: 反転後のスコア（reverse_score() の結果）
+    """
+    dropped = collect_dropped_print_layouts(score)
+    if not dropped:
+        return
+
+    is_mxl = output_path.suffix == '.mxl'
+
+    if is_mxl:
+        import zipfile
+        with zipfile.ZipFile(output_path, 'r') as zf:
+            container = ET.fromstring(zf.read('META-INF/container.xml'))
+            rootfile = container.find('.//{*}rootfile')
+            xml_filename = rootfile.get('full-path')
+            content = zf.read(xml_filename).decode('utf-8')
+        root = ET.fromstring(content)
+    else:
+        tree = ET.parse(output_path)
+        root = tree.getroot()
+
+    xml_parts = root.findall('.//{*}part')
+    changed = False
+
+    for item in dropped:
+        mx_new = _layout_obj_to_xml_element(item['layout_obj'])
+        if mx_new is None:
+            continue
+
+        part_index = _output_part_index_for(score, item['anchor_part'])
+        if part_index is None or part_index >= len(xml_parts):
+            continue
+
+        xml_part = xml_parts[part_index]
+        target_measure = None
+        for measure in xml_part.findall('{*}measure'):
+            if measure.get('number') == str(item['measure_num']):
+                target_measure = measure
+                break
+        if target_measure is None:
+            continue
+
+        mx_print = target_measure.find('{*}print')
+        if mx_print is None:
+            mx_print = ET.Element('print')
+            target_measure.insert(0, mx_print)
+
+        if _print_already_has(mx_print, mx_new):
+            continue
+
+        mx_print.append(mx_new)
+        changed = True
+
+    if not changed:
+        return
+
+    if is_mxl:
+        import zipfile
+        xml_content = ET.tostring(root, encoding='utf-8', xml_declaration=True)
+        with zipfile.ZipFile(output_path, 'r') as zf_in:
+            items = {name: zf_in.read(name) for name in zf_in.namelist()}
+        items[xml_filename] = xml_content
+        with zipfile.ZipFile(output_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf_out:
+            for name, data in items.items():
+                zf_out.writestr(name, data)
+    else:
+        tree = ET.ElementTree(root)
+        tree.write(output_path, encoding='utf-8', xml_declaration=True)
+
+
 def count_notes(score: stream.Score) -> int:
     """スコア内の音符数をカウント"""
     count = 0
@@ -1228,6 +1439,13 @@ def process_file(input_path: Path, output_path: Path,
                 except Exception as layout_apply_error:
                     print(f"  警告: レイアウト復元に失敗しました: {layout_apply_error}")
                     # レイアウト適用失敗は警告のみ（反転処理自体は成功）
+
+            # ========== Phase 5: 結合パートで失われたレイアウト要素の復元 ==========
+            try:
+                restore_dropped_print_layouts(output_path, reversed_score)
+            except Exception as merged_layout_error:
+                print(f"  警告: 結合パートのレイアウト復元に失敗しました: {merged_layout_error}")
+                # 復元失敗は警告のみ（反転処理自体は成功）
 
         except Exception as write_error:
             # 書き出しエラーの詳細を解析してレポートに追加
