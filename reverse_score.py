@@ -87,11 +87,85 @@ def reverse_note_offset(element, measure_duration: float) -> None:
     element.offset = max(0, new_offset)
 
 
-def reverse_measure_contents(measure: stream.Measure) -> tuple[stream.Measure, str | None]:
-    """小節内の音符・休符・表現記号のオフセットを反転する
+def _reverse_note_group_offsets(elements_snapshot: list, window_duration: float) -> None:
+    """notesAndRestsのオフセットを、指定した時間幅の中で反転する（in-place）
 
     Grace notes are handled specially: they stay attached to their following note.
     When reversing, grace notes + main note are treated as atomic groups.
+    measure・voiceどちらの要素リストにも使える汎用ロジック。
+    """
+    if not elements_snapshot:
+        return
+
+    # Group grace notes with their following main notes
+    # Each group: [grace1, grace2, ..., main_note]
+    note_groups = []
+    current_graces = []
+
+    for element in elements_snapshot:
+        if element.duration.isGrace:
+            # Collect grace notes
+            current_graces.append(element)
+        else:
+            # Main note: create group with preceding grace notes
+            group = current_graces + [element]
+            note_groups.append(group)
+            current_graces = []
+
+    # Handle trailing grace notes (shouldn't happen in valid music, but be defensive)
+    if current_graces:
+        note_groups.append(current_graces)
+
+    # Reverse the groups (so last main note becomes first)
+    note_groups.reverse()
+
+    # Within each group, reverse the grace notes so they appear before their main note
+    # Example: [grace1, grace2, main] stays as [grace2, grace1, main] after group reversal
+    # No - actually grace notes should stay in original order relative to their note!
+    # When we reverse: [g1, g2, note1], [g3, g4, note2]
+    # Should become: [note2, g3, g4], [note1, g1, g2]
+    # But grace notes appear BEFORE their note in XML, so no intra-group reversal needed
+
+    # Now calculate new offsets for each group
+    current_offset = 0.0
+    for group in note_groups:
+        # Find the main note (last element with non-zero duration)
+        main_note = None
+        for elem in reversed(group):
+            if not elem.duration.isGrace:
+                main_note = elem
+                break
+
+        if main_note is None:
+            # Group has only grace notes (edge case)
+            for grace in group:
+                grace.offset = current_offset
+            continue
+
+        # Calculate reversed offset for the main note
+        # Original position: window_duration - original_offset - duration
+        original_offset = main_note.offset
+        original_duration = main_note.duration.quarterLength
+        new_main_offset = window_duration - original_offset - original_duration
+        new_main_offset = max(0, new_main_offset)
+
+        # Set main note offset
+        main_note.offset = new_main_offset
+
+        # Grace notes appear at the same offset as their main note
+        for elem in group:
+            if elem.duration.isGrace:
+                elem.offset = new_main_offset
+
+        # Advance offset for next group
+        current_offset = new_main_offset + original_duration
+
+
+def reverse_measure_contents(measure: stream.Measure) -> tuple[stream.Measure, str | None]:
+    """小節内の音符・休符・表現記号のオフセットを反転する
+
+    Divisi等で複数Voiceを持つ小節では、各Voiceを独立した時間軸として
+    個別に反転する（Voiceはどちらも小節先頭からの同じ時間軸を共有するため）。
 
     Returns:
         tuple: (処理後の小節, エラーメッセージ or None)
@@ -102,70 +176,12 @@ def reverse_measure_contents(measure: stream.Measure) -> tuple[stream.Measure, s
 
     try:
         # Create snapshot to avoid iterator corruption when modifying offsets
-        elements_snapshot = list(measure.notesAndRests)
+        _reverse_note_group_offsets(list(measure.notesAndRests), measure_duration)
 
-        # Group grace notes with their following main notes
-        # Each group: [grace1, grace2, ..., main_note]
-        note_groups = []
-        current_graces = []
-
-        for element in elements_snapshot:
-            if element.duration.isGrace:
-                # Collect grace notes
-                current_graces.append(element)
-            else:
-                # Main note: create group with preceding grace notes
-                group = current_graces + [element]
-                note_groups.append(group)
-                current_graces = []
-
-        # Handle trailing grace notes (shouldn't happen in valid music, but be defensive)
-        if current_graces:
-            note_groups.append(current_graces)
-
-        # Reverse the groups (so last main note becomes first)
-        note_groups.reverse()
-
-        # Within each group, reverse the grace notes so they appear before their main note
-        # Example: [grace1, grace2, main] stays as [grace2, grace1, main] after group reversal
-        # No - actually grace notes should stay in original order relative to their note!
-        # When we reverse: [g1, g2, note1], [g3, g4, note2]
-        # Should become: [note2, g3, g4], [note1, g1, g2]
-        # But grace notes appear BEFORE their note in XML, so no intra-group reversal needed
-
-        # Now calculate new offsets for each group
-        current_offset = 0.0
-        for group in note_groups:
-            # Find the main note (last element with non-zero duration)
-            main_note = None
-            for elem in reversed(group):
-                if not elem.duration.isGrace:
-                    main_note = elem
-                    break
-
-            if main_note is None:
-                # Group has only grace notes (edge case)
-                for grace in group:
-                    grace.offset = current_offset
-                continue
-
-            # Calculate reversed offset for the main note
-            # Original position: measure_duration - original_offset - duration
-            original_offset = main_note.offset
-            original_duration = main_note.duration.quarterLength
-            new_main_offset = measure_duration - original_offset - original_duration
-            new_main_offset = max(0, new_main_offset)
-
-            # Set main note offset
-            main_note.offset = new_main_offset
-
-            # Grace notes appear at the same offset as their main note
-            for elem in group:
-                if elem.duration.isGrace:
-                    elem.offset = new_main_offset
-
-            # Advance offset for next group
-            current_offset = new_main_offset + original_duration
+        # 複数Voice（Divisi等）がある場合、各Voiceも同じ時間幅で個別に反転する
+        for voice in measure.voices:
+            _reverse_note_group_offsets(list(voice.notesAndRests), measure_duration)
+            voice.sort()
 
         # 表現記号（Dynamics, TextExpression等）を反転
         # Create snapshot to avoid iterator corruption when modifying offsets
@@ -180,6 +196,13 @@ def reverse_measure_contents(measure: stream.Measure) -> tuple[stream.Measure, s
         return measure, None
     except Exception as e:
         return measure, str(e)
+
+
+def iter_notes_including_voices(measure: stream.Measure):
+    """小節直下とVoice内のnotesAndRestsを両方含めて列挙する"""
+    yield from measure.notesAndRests
+    for voice in measure.voices:
+        yield from voice.notesAndRests
 
 
 def reverse_ties(element) -> None:
@@ -837,7 +860,7 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
                         pass  # 修正失敗しても続行
 
                 # タイと連桁は反転する（小節順序が変わるため）
-                for element in fallback.notesAndRests:
+                for element in iter_notes_including_voices(fallback):
                     reverse_ties(element)
                     reverse_beams(element)
                     reverse_tuplets(element)
@@ -850,7 +873,7 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
                 continue
 
         # タイと連桁を反転
-        for element in processed_measure.notesAndRests:
+        for element in iter_notes_including_voices(processed_measure):
             reverse_ties(element)
             reverse_beams(element)
             reverse_tuplets(element)
