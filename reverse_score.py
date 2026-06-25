@@ -14,7 +14,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from music21 import converter, stream, dynamics, tie, spanner, clef, expressions
+from music21 import converter, stream, dynamics, tie, spanner, clef, expressions, layout
 from music21.spanner import Ottava
 
 
@@ -331,6 +331,91 @@ def apply_reversed_clefs(
             if measure.number == target_measure_num:
                 # 小節の先頭に音部記号を挿入
                 measure.insert(0, pos['clef'])
+                break
+
+
+def collect_layout_positions(measures: list[stream.Measure], class_name: str) -> list[dict]:
+    """パート内の全レイアウト要素（SystemLayout, StaffLayout, PageLayout）と小節番号を収集する
+
+    <print> 要素から生成される SystemLayout/StaffLayout/PageLayout は、
+    音部記号と同様に「この小節から次の同種要素が出現するまで有効」という
+    始点のみ指定される要素のため、Clef と同じ反転ロジックを使う。
+
+    Args:
+        measures: 小節のリスト（元の順序）
+        class_name: 収集するレイアウト要素のクラス名（'SystemLayout' 等）
+
+    Returns:
+        レイアウト要素の情報リスト [{measure_num, offset, layout_obj}]
+    """
+    layout_positions = []
+
+    for measure in measures:
+        for layout_obj in measure.getElementsByClass(class_name):
+            layout_positions.append({
+                'measure_num': measure.number,
+                'offset': layout_obj.offset,
+                'layout_obj': layout_obj,
+            })
+
+    layout_positions.sort(key=lambda x: (x['measure_num'], x['offset']))
+    return layout_positions
+
+
+def calculate_reversed_layout_positions(
+    layout_positions: list[dict],
+    total_measures: int
+) -> list[dict]:
+    """レイアウト要素の反転後位置を計算する（calculate_reversed_clef_positions と同じロジック）
+
+    Args:
+        layout_positions: collect_layout_positions() の結果
+        total_measures: 総小節数
+
+    Returns:
+        反転後の位置情報 [{reversed_measure_num, layout_obj}]
+    """
+    if not layout_positions:
+        return []
+
+    reversed_positions = []
+
+    for i, pos in enumerate(layout_positions):
+        if i + 1 < len(layout_positions):
+            effective_end = layout_positions[i + 1]['measure_num'] - 1
+        else:
+            effective_end = total_measures
+
+        reversed_start = total_measures - effective_end + 1
+
+        reversed_positions.append({
+            'reversed_measure_num': reversed_start,
+            'layout_obj': copy.deepcopy(pos['layout_obj']),
+        })
+
+    reversed_positions.sort(key=lambda x: x['reversed_measure_num'])
+    return reversed_positions
+
+
+def apply_reversed_layout_elements(
+    new_part: stream.Part,
+    reversed_layout_positions: list[dict]
+) -> None:
+    """反転後のパートにレイアウト要素を挿入する
+
+    Clef とは異なり、元の <print> は小節の子要素として現れるため、
+    最初の要素もパートレベルではなく対象小節に挿入する。
+
+    Args:
+        new_part: 反転後のパート（小節が追加済み）
+        reversed_layout_positions: calculate_reversed_layout_positions() の結果
+    """
+    for pos in reversed_layout_positions:
+        target_measure_num = pos['reversed_measure_num']
+
+        for measure in new_part.getElementsByClass(stream.Measure):
+            if measure.number == target_measure_num:
+                measure.insert(0, pos['layout_obj'])
                 break
 
 
@@ -670,6 +755,12 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
     # テンポ要素も同様に反転ロジックで処理
     tempo_positions = collect_tempo_positions(measures)
 
+    # <print> から生成されるレイアウト要素も同様に反転ロジックで処理
+    # （種類ごとに独立した「始点のみ要素」の系列として扱う）
+    system_layout_positions = collect_layout_positions(measures, 'SystemLayout')
+    staff_layout_positions = collect_layout_positions(measures, 'StaffLayout')
+    page_layout_positions = collect_layout_positions(measures, 'PageLayout')
+
     # 調号をコピー (KeySignature)
     key_sigs = first_original_measure.getElementsByClass('KeySignature')
     if key_sigs:
@@ -703,6 +794,11 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
         # 音部記号を小節から削除（反転ロジックで再配置するため）
         for elem in list(measure_to_process.getElementsByClass('Clef')):
             measure_to_process.remove(elem)
+
+        # レイアウト要素（System/Staff/PageLayout）を小節から削除（反転ロジックで再配置するため）
+        for layout_class in ['SystemLayout', 'StaffLayout', 'PageLayout']:
+            for elem in list(measure_to_process.getElementsByClass(layout_class)):
+                measure_to_process.remove(elem)
 
         # 小節内の音符を反転
         processed_measure, error = reverse_measure_contents(measure_to_process)
@@ -775,6 +871,11 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
     # テンポ要素を反転して適用
     reversed_tempo_positions = calculate_reversed_tempo_positions(tempo_positions, total_measures)
     apply_reversed_tempo_elements(new_part, reversed_tempo_positions)
+
+    # レイアウト要素（System/Staff/PageLayout）を反転して適用
+    for positions in (system_layout_positions, staff_layout_positions, page_layout_positions):
+        reversed_positions = calculate_reversed_layout_positions(positions, total_measures)
+        apply_reversed_layout_elements(new_part, reversed_positions)
 
     # 保存したSpanner情報を使って、新しいパートでSpannerを再構築
     for sp_info in spanner_info:
