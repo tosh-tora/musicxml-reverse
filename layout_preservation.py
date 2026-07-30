@@ -73,6 +73,8 @@ class DirectionElement:
     offset_quarters: float = 0.0  # 小節内オフセット（四分音符単位）
     measure_duration_quarters: float = 0.0  # 小節全体の長さ（四分音符単位）
     has_rehearsal: bool = False  # rehearsal（練習番号）子要素を持つか
+    staff: Optional[str] = None  # staff子要素の値（複数譜パートでの所属譜）
+    sound_pizzicato: Optional[str] = None  # sound要素のpizzicato属性（'yes'/'no'）
 
 
 @dataclass
@@ -258,6 +260,15 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
                     if words is not None and words.text:
                         words_text = words.text.strip()
 
+                    # staff（複数譜パートでは奏法状態が譜ごとに独立するため必要）
+                    staff_elem = elem.find('{*}staff')
+                    staff_value = None
+                    if staff_elem is not None and staff_elem.text:
+                        staff_value = staff_elem.text.strip()
+
+                    # sound の pizzicato 属性（pizz./arco の状態判定に使用）
+                    sound_pizzicato = sound.get('pizzicato') if sound is not None else None
+
                     # direction内のoffset要素も加味して時間位置を計算
                     _offset_elem = elem.find('.//{*}offset')
                     _direction_offset_q = 0.0
@@ -278,6 +289,8 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
                         offset_quarters=current_offset + _direction_offset_q,
                         measure_duration_quarters=measure_duration_quarters,
                         has_rehearsal=has_rehearsal,
+                        staff=staff_value,
+                        sound_pizzicato=sound_pizzicato,
                     )
                     layout_map.directions[part_id].append(direction_elem)
                     direction_index += 1
@@ -1003,6 +1016,262 @@ def _separate_octave_shift_pairs(
     return pairs, others
 
 
+# 奏法状態（pizz./arco）のテキストと状態名の対応
+# これらは「次の反対指示まで有効」な状態なので、時間反転では区間ごと反転する必要がある
+_PLAY_STATE_TEXT_MAP = {
+    'pizz.': 'pizz',
+    'pizz': 'pizz',
+    'pizzicato': 'pizz',
+    'arco': 'arco',
+}
+
+# 曲頭の暗黙の奏法状態（通常奏法）
+_PLAY_STATE_DEFAULT = 'arco'
+
+# 状態ごとの既定テキスト（元譜に該当状態の direction が無い場合の合成用）
+_PLAY_STATE_DEFAULT_TEXT = {
+    'pizz': 'pizz.',
+    'arco': 'arco',
+}
+
+_PLAY_STATE_SOUND_PIZZICATO = {
+    'pizz': 'yes',
+    'arco': 'no',
+}
+
+
+def _get_play_state(dir_elem: 'DirectionElement') -> Optional[str]:
+    """direction が奏法状態（pizz./arco）の指示なら状態名を返す。それ以外は None。
+
+    <sound pizzicato="yes"/"no"> を優先し、無い場合は words テキストで判定する
+    （楽譜ソフトによっては arco に sound 属性が付かないため両方必要）。
+    """
+    if dir_elem.sound_pizzicato == 'yes':
+        return 'pizz'
+    if dir_elem.sound_pizzicato == 'no':
+        return 'arco'
+    if dir_elem.words_text:
+        return _PLAY_STATE_TEXT_MAP.get(dir_elem.words_text.strip().lower())
+    return None
+
+
+def _separate_play_state_directions(
+    dir_elems: list['DirectionElement']
+) -> tuple[list['DirectionElement'], list['DirectionElement']]:
+    """direction リストから奏法状態（pizz./arco）指示と、それ以外に分離する。
+
+    pizz./arco は words + sound を持つため、そのままでは _is_tempo_direction() が
+    真になりテンポ指示として誤分類される。テンポ判定より前に分離する必要がある。
+    """
+    play_state_dirs: list[DirectionElement] = []
+    others: list[DirectionElement] = []
+
+    for d in dir_elems:
+        if _get_play_state(d) is not None:
+            play_state_dirs.append(d)
+        else:
+            others.append(d)
+
+    return play_state_dirs, others
+
+
+def _mirror_direction_position(
+    dir_elem: 'DirectionElement',
+    total_measures: int,
+) -> tuple[int, float]:
+    """direction の時間位置を時間反転後の (小節番号, 小節内オフセット) に写す。
+
+    反転後の小節 total-N+1 は元の小節 N の内容を反転したものなので、小節長は同じ。
+    小節頭（offset 0）の境界は反転後の小節末に相当するため、次の小節の頭に正規化する。
+    """
+    measure_num = total_measures - dir_elem.measure_num + 1
+    measure_duration = dir_elem.measure_duration_quarters
+    epsilon = 1e-6
+
+    if measure_duration <= epsilon:
+        return measure_num, 0.0
+
+    offset = measure_duration - dir_elem.offset_quarters
+    if offset >= measure_duration - epsilon:
+        # 元が小節頭 → 反転後は小節末に相当するので、次の小節の頭に正規化する
+        return measure_num + 1, 0.0
+    return measure_num, max(0.0, offset)
+
+
+def _calculate_reversed_play_state_markers(
+    play_state_dirs: list['DirectionElement'],
+    total_measures: int,
+) -> list[tuple[str, Optional[str], int, float, Optional['DirectionElement']]]:
+    """奏法状態（pizz./arco）指示の反転後マーカーを算出する
+
+    奏法状態は「その位置から次の反対指示まで有効」な区間として振る舞うため、
+    ダイナミクスやテンポと同様に有効範囲ベースで反転する。ただし区間の終端では
+    反対の状態に戻るため、元譜に無い打ち消しマーカーを新たに出力する必要がある。
+
+    元譜の区間列（暗黙の曲頭 arco を含む）を時間反転し、状態が変化する境界にだけ
+    マーカーを出す。反転後の曲頭が既定状態（arco）なら曲頭マーカーは出さない。
+
+    Args:
+        play_state_dirs: 奏法状態のDirectionElementリスト
+        total_measures: 総小節数
+
+    Returns:
+        (状態名, staff, 反転後小節番号, 反転後オフセット, テンプレートDirectionElement)
+        のリスト
+    """
+    if not play_state_dirs:
+        return []
+
+    # staff ごとに独立した状態として扱う
+    by_staff: dict[Optional[str], list[DirectionElement]] = {}
+    for d in play_state_dirs:
+        by_staff.setdefault(d.staff, []).append(d)
+
+    # 状態ごとのテンプレート（同 staff を優先、無ければ他 staff から流用）
+    global_templates: dict[str, DirectionElement] = {}
+    for d in play_state_dirs:
+        state = _get_play_state(d)
+        if state is not None:
+            global_templates.setdefault(state, d)
+
+    result: list[tuple[str, Optional[str], int, float, Optional[DirectionElement]]] = []
+
+    for staff, dirs in by_staff.items():
+        boundaries = sorted(dirs, key=lambda d: (d.measure_num, d.offset_quarters))
+        states = [_get_play_state(d) for d in boundaries]
+
+        staff_templates: dict[str, DirectionElement] = {}
+        for d, state in zip(boundaries, states):
+            if state is not None:
+                staff_templates.setdefault(state, d)
+
+        # 反転後の区間列: (状態, 開始位置)。開始位置 None は曲頭
+        reversed_regions: list[tuple[str, Optional[tuple[int, float]]]] = [
+            (states[-1], None)
+        ]
+        for k in range(len(boundaries) - 1, 0, -1):
+            reversed_regions.append(
+                (states[k - 1], _mirror_direction_position(boundaries[k], total_measures))
+            )
+        reversed_regions.append(
+            (_PLAY_STATE_DEFAULT, _mirror_direction_position(boundaries[0], total_measures))
+        )
+
+        # 状態が変化する境界にだけマーカーを出す
+        previous_state = _PLAY_STATE_DEFAULT
+        for state, position in reversed_regions:
+            if state == previous_state:
+                continue
+            previous_state = state
+
+            if position is None:
+                measure_num, offset = 1, 0.0
+            else:
+                measure_num, offset = position
+            if measure_num < 1 or measure_num > total_measures:
+                # 区間が曲の範囲外（長さ 0）ならマーカー不要
+                continue
+
+            template = staff_templates.get(state) or global_templates.get(state)
+            result.append((state, staff, measure_num, offset, template))
+
+    return result
+
+
+def _strip_words_x_attributes(direction_root: ET.Element) -> None:
+    """direction / words から default-x/relative-x を除去する。
+
+    時間反転でマーカーの時間位置が変わるため、元の水平位置を復元すると
+    音符との位置がずれる（_strip_dynamics_x_attributes と同じ理由）。
+    """
+    for attr in ('default-x', 'relative-x'):
+        if attr in direction_root.attrib:
+            del direction_root.attrib[attr]
+    for elem in direction_root.iter():
+        if elem.tag.endswith('words'):
+            for attr in ('default-x', 'relative-x'):
+                if attr in elem.attrib:
+                    del elem.attrib[attr]
+
+
+def _build_play_state_direction(
+    state: str,
+    staff: Optional[str],
+    template: Optional['DirectionElement'],
+) -> Optional[ET.Element]:
+    """奏法状態マーカーの direction 要素を組み立てる
+
+    同じ状態の元 direction があればそれを流用して書式（placement, default-y, font）を
+    保ち、無ければ最小構成を合成する。
+    """
+    if template is not None:
+        try:
+            direction = ET.fromstring(template.direction_xml)
+        except ET.ParseError:
+            direction = None
+        if direction is not None:
+            _strip_words_x_attributes(direction)
+            _strip_dynamics_x_attributes(direction)
+            _set_direction_staff(direction, staff)
+            _set_direction_sound_pizzicato(direction, state)
+            return direction
+
+    words_text = _PLAY_STATE_DEFAULT_TEXT.get(state)
+    if words_text is None:
+        return None
+
+    direction = ET.Element('direction', {'placement': 'above'})
+    direction_type = ET.SubElement(direction, 'direction-type')
+    words = ET.SubElement(direction_type, 'words')
+    words.text = words_text
+    # <direction> の子要素順は direction-type → offset → voice → staff → sound
+    _set_direction_staff(direction, staff)
+    pizzicato = _PLAY_STATE_SOUND_PIZZICATO.get(state)
+    if pizzicato is not None:
+        ET.SubElement(direction, 'sound', {'pizzicato': pizzicato})
+    return direction
+
+
+def _set_direction_sound_pizzicato(direction: ET.Element, state: str) -> None:
+    """direction の <sound pizzicato> を状態に合わせる（無ければ末尾に追加）
+
+    元譜の arco に pizzicato 属性が無いことがあるため、生成したマーカーでは
+    再生時にも奏法が戻るよう明示する。
+    """
+    pizzicato = _PLAY_STATE_SOUND_PIZZICATO.get(state)
+    if pizzicato is None:
+        return
+
+    for child in direction:
+        if child.tag.endswith('sound'):
+            child.set('pizzicato', pizzicato)
+            return
+
+    # <sound> は <direction> の最後の子要素
+    ET.SubElement(direction, 'sound', {'pizzicato': pizzicato})
+
+
+def _set_direction_staff(direction: ET.Element, staff: Optional[str]) -> None:
+    """direction の <staff> を staff に合わせる（無ければ sound の直前に追加）"""
+    if staff is None:
+        return
+
+    for child in direction:
+        if child.tag.endswith('staff'):
+            child.text = staff
+            return
+
+    staff_elem = ET.Element('staff')
+    staff_elem.text = staff
+    # <sound> より前、それ以外の要素より後ろに置く
+    insert_pos = len(direction)
+    for idx, child in enumerate(direction):
+        if child.tag.endswith('sound'):
+            insert_pos = idx
+            break
+    direction.insert(insert_pos, staff_elem)
+
+
 def _strip_dynamics_x_attributes(direction_root: ET.Element) -> None:
     """direction 内の <dynamics> から default-x/relative-x を除去する。
 
@@ -1254,14 +1523,19 @@ def restore_direction_elements(
 
         # direction要素をカテゴリに分離:
         # 1. wedge ペア (cresc/dim) → type 反転 + 時間反転オフセットで再配置
-        # 2. テンポ関連 (sound + words) → 有効範囲ベースで反転
-        # 3. ダイナミクス → 有効範囲ベースで反転 + 括弧付きマーカー
-        # 4. その他 (テキスト等) → 単純な位置反転
+        # 2. 奏法状態 (pizz./arco) → 有効範囲ベースで反転 + 打ち消しマーカー生成
+        # 3. テンポ関連 (sound + words) → 有効範囲ベースで反転
+        # 4. ダイナミクス → 有効範囲ベースで反転 + 括弧付きマーカー
+        # 5. その他 (テキスト等) → 単純な位置反転
+        #
+        # 奏法状態は words + sound を持つためテンポ判定より前に分離する
+        # （テンポとして誤分類されるだけでなく、テンポの有効範囲境界も汚染するため）
         all_directions = original_layout_map.directions[part_id]
         wedge_pairs, non_wedge_dirs = _separate_wedge_pairs(all_directions)
         octave_shift_pairs, non_pair_dirs = _separate_octave_shift_pairs(non_wedge_dirs)
-        tempo_directions = [d for d in non_pair_dirs if _is_tempo_direction(d)]
-        non_tempo_dirs = [d for d in non_pair_dirs if not _is_tempo_direction(d)]
+        play_state_directions, non_play_state_dirs = _separate_play_state_directions(non_pair_dirs)
+        tempo_directions = [d for d in non_play_state_dirs if _is_tempo_direction(d)]
+        non_tempo_dirs = [d for d in non_play_state_dirs if not _is_tempo_direction(d)]
         rehearsal_directions = [d for d in non_tempo_dirs if d.has_rehearsal]
         non_rehearsal_dirs = [d for d in non_tempo_dirs if not d.has_rehearsal]
         dynamics_directions = [d for d in non_rehearsal_dirs
@@ -1489,6 +1763,24 @@ def restore_direction_elements(
             except ET.ParseError:
                 pass
 
+        # 6. 奏法状態（pizz./arco）を有効範囲ベースで反転して挿入
+        # 区間の終端では反対の状態に戻るため、元譜に無い打ち消しマーカーも生成される
+        reversed_play_state_markers = _calculate_reversed_play_state_markers(
+            play_state_directions, total_measures
+        )
+
+        for state, staff, reversed_measure_num, offset_q, template in reversed_play_state_markers:
+            if reversed_measure_num not in measure_map:
+                continue
+
+            marker = _build_play_state_direction(state, staff, template)
+            if marker is None:
+                continue
+
+            _insert_direction_at_offset(
+                measure_map[reversed_measure_num], marker, offset_q, part_divisions
+            )
+
     # 変更後のXMLを書き出し
     if is_mxl:
         import tempfile
@@ -1643,6 +1935,228 @@ def normalize_slur_numbers(output_xml_path: Path, verbose: bool = False) -> None
                 event['slur_element'].set('number', str(new_number))
                 if verbose:
                     print(f"  Warning: Orphan {event['slur_type']} (orig={event['original_number']}) at m{event['measure_num']} -> slur {new_number}")
+
+    # 変更後のXMLを書き出し
+    if is_mxl:
+        import tempfile
+        import shutil
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_mxl = Path(tmpdir) / 'output.mxl'
+            shutil.copy2(output_xml_path, tmp_mxl)
+
+            xml_content = ET.tostring(root, encoding='utf-8', xml_declaration=True)
+
+            with zipfile.ZipFile(output_xml_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf_out:
+                with zipfile.ZipFile(tmp_mxl, 'r') as zf_in:
+                    for item in zf_in.namelist():
+                        if item == xml_filename:
+                            zf_out.writestr(item, xml_content)
+                        else:
+                            zf_out.writestr(item, zf_in.read(item))
+    else:
+        tree = ET.ElementTree(root)
+        tree.write(output_xml_path, encoding='utf-8', xml_declaration=True)
+
+
+# 調号（fifths）で変化する音名の順序
+_SHARP_STEP_ORDER = 'FCGDAEB'
+_FLAT_STEP_ORDER = 'BEADGCF'
+
+# alter 値と <accidental> の表記の対応
+_ALTER_TO_ACCIDENTAL = {
+    0: 'natural',
+    1: 'sharp',
+    -1: 'flat',
+    2: 'sharp-sharp',
+    -2: 'flat-flat',
+}
+
+# <note> 内で <accidental> より後ろに来る子要素（MusicXMLの子要素順を守るため）
+_NOTE_ELEMENTS_AFTER_ACCIDENTAL = (
+    'time-modification', 'stem', 'notehead', 'notehead-text', 'staff',
+    'beam', 'notations', 'lyric', 'play', 'listen',
+)
+
+
+def _key_alter_map(fifths: int) -> dict[str, int]:
+    """調号から音名 → alter の対応表を作る"""
+    alters = {step: 0 for step in 'ABCDEFG'}
+    if fifths > 0:
+        for step in _SHARP_STEP_ORDER[:fifths]:
+            alters[step] = 1
+    elif fifths < 0:
+        for step in _FLAT_STEP_ORDER[:-fifths]:
+            alters[step] = -1
+    return alters
+
+
+def _note_alter(note: ET.Element) -> Optional[int]:
+    """音符の alter を返す。ピッチを持たない（休符・不確定音高）場合は None"""
+    pitch = note.find('{*}pitch')
+    if pitch is None:
+        return None
+    alter_elem = pitch.find('{*}alter')
+    if alter_elem is None or not alter_elem.text:
+        return 0
+    try:
+        return int(round(float(alter_elem.text)))
+    except ValueError:
+        return 0
+
+
+def _set_note_accidental(note: ET.Element, alter: int) -> None:
+    """音符に <accidental> を設定する（既にあれば何もしない）"""
+    accidental_text = _ALTER_TO_ACCIDENTAL.get(alter)
+    if accidental_text is None:
+        return
+
+    accidental = ET.Element('accidental')
+    accidental.text = accidental_text
+
+    # <type>/<dot> の後、<stem> 等より前に挿入する
+    insert_pos = len(note)
+    for idx, child in enumerate(note):
+        tag = child.tag.split('}')[-1]
+        if tag in _NOTE_ELEMENTS_AFTER_ACCIDENTAL:
+            insert_pos = idx
+            break
+    note.insert(insert_pos, accidental)
+
+
+def _measure_notes_in_time_order(measure: ET.Element) -> list[tuple[float, int, ET.Element]]:
+    """小節内の音符を (時間位置, 文書順, 要素) のリストで時間順に返す
+
+    <chord> の音符は直前の非和音音符と同じ時間位置に置き、<backup>/<forward> で
+    カーソルを移動する。同時刻の音符は文書順を保つ。
+    """
+    divisions = _measure_divisions(measure)
+    notes: list[tuple[float, int, ET.Element]] = []
+    cursor = 0.0
+    chord_position = 0.0
+
+    def _duration(elem: ET.Element) -> float:
+        duration_elem = elem.find('{*}duration')
+        if duration_elem is None or not duration_elem.text:
+            return 0.0
+        try:
+            return float(duration_elem.text) / divisions
+        except ValueError:
+            return 0.0
+
+    for index, elem in enumerate(measure):
+        tag = elem.tag.split('}')[-1]
+        if tag == 'note':
+            is_chord = elem.find('{*}chord') is not None
+            notes.append((chord_position if is_chord else cursor, index, elem))
+            if not is_chord:
+                chord_position = cursor
+                cursor += _duration(elem)
+        elif tag == 'backup':
+            cursor = max(0.0, cursor - _duration(elem))
+            chord_position = cursor
+        elif tag == 'forward':
+            cursor += _duration(elem)
+            chord_position = cursor
+
+    notes.sort(key=lambda item: (item[0], item[1]))
+    return notes
+
+
+def recalculate_accidentals(output_xml_path: Path, verbose: bool = False) -> None:
+    """臨時記号（<accidental>）を有効範囲から再計算する
+
+    <accidental> は「表示する記号」であり、必要かどうかは調号と、同一小節・同一
+    staff・同一オクターブで直前に現れた臨時記号（＝臨時記号の有効範囲）で決まる。
+    時間反転すると小節内の音符順が変わるため、元譜の <accidental> をそのまま
+    音符に付けて動かすと冗長な記号が残り、必要な記号が欠ける。
+
+    出力XMLを走査して各音符に必要な <accidental> だけを残す:
+    - alter が有効な alter と異なる → <accidental> が必要（無ければ追加）
+    - 一致する → <accidental> は不要（あれば削除。cautionary/parentheses も対象）
+    - タイで繋がれた音（<tie type="stop">）は記号を繰り返さないが状態は更新する
+
+    Args:
+        output_xml_path: 処理対象のMusicXMLファイル(.xml または .mxl)
+        verbose: デバッグ出力を有効にする
+    """
+    is_mxl = output_xml_path.suffix == '.mxl'
+
+    if is_mxl:
+        root, xml_filename = _extract_mxl_content(output_xml_path)
+    else:
+        tree = ET.parse(output_xml_path)
+        root = tree.getroot()
+
+    added = 0
+    removed = 0
+
+    for part in root.findall('.//{*}part'):
+        # staff 別の調号（number 属性なしの <key> は全 staff 共通）
+        key_alters: dict[Optional[str], dict[str, int]] = {None: _key_alter_map(0)}
+
+        for measure in part.findall('{*}measure'):
+            for attributes in measure.findall('{*}attributes'):
+                for key in attributes.findall('{*}key'):
+                    fifths_elem = key.find('{*}fifths')
+                    if fifths_elem is None or not fifths_elem.text:
+                        continue
+                    try:
+                        fifths = int(fifths_elem.text)
+                    except ValueError:
+                        continue
+                    staff_number = key.get('number')
+                    if staff_number is None:
+                        key_alters = {None: _key_alter_map(fifths)}
+                    else:
+                        key_alters[staff_number] = _key_alter_map(fifths)
+
+            # 小節内の臨時記号の有効範囲: (staff, step, octave) → alter
+            measure_alters: dict[tuple[str, str, str], int] = {}
+
+            for _position, _index, note in _measure_notes_in_time_order(measure):
+                alter = _note_alter(note)
+                if alter is None:
+                    continue
+
+                pitch = note.find('{*}pitch')
+                step_elem = pitch.find('{*}step')
+                octave_elem = pitch.find('{*}octave')
+                if step_elem is None or not step_elem.text:
+                    continue
+                step = step_elem.text.strip()
+                octave = octave_elem.text.strip() if octave_elem is not None and octave_elem.text else ''
+
+                staff_elem = note.find('{*}staff')
+                staff = staff_elem.text.strip() if staff_elem is not None and staff_elem.text else '1'
+
+                staff_key_alters = key_alters.get(staff, key_alters.get(None, {}))
+                scope_key = (staff, step, octave)
+                effective_alter = measure_alters.get(scope_key, staff_key_alters.get(step, 0))
+
+                # タイで繋がれた音は臨時記号を繰り返さない
+                is_tie_stop = any(
+                    tie.get('type') == 'stop' for tie in note.findall('{*}tie')
+                )
+                needs_accidental = (alter != effective_alter) and not is_tie_stop
+                measure_alters[scope_key] = alter
+
+                accidental = note.find('{*}accidental')
+                if needs_accidental and accidental is None:
+                    _set_note_accidental(note, alter)
+                    added += 1
+                    if verbose:
+                        print(f"  + m{measure.get('number')} staff{staff} {step}{octave} "
+                              f"alter={alter} -> {_ALTER_TO_ACCIDENTAL.get(alter)}")
+                elif not needs_accidental and accidental is not None:
+                    note.remove(accidental)
+                    removed += 1
+                    if verbose:
+                        print(f"  - m{measure.get('number')} staff{staff} {step}{octave} "
+                              f"alter={alter} ({accidental.text} を削除)")
+
+    if verbose:
+        print(f"  臨時記号: {added} 個追加, {removed} 個削除")
 
     # 変更後のXMLを書き出し
     if is_mxl:

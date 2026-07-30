@@ -9,6 +9,7 @@ import sys
 import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -21,6 +22,10 @@ from layout_preservation import (
     DirectionElement,
     LayoutMap,
     _is_transitional_tempo_text,
+    _calculate_reversed_play_state_markers,
+    _get_play_state,
+    _is_tempo_direction,
+    _separate_play_state_directions,
 )
 from reverse_score import reverse_score
 
@@ -396,3 +401,202 @@ class TestIssue56DynamicsRangeReversal:
 
         paren_p_at_17 = any(m == '17' and dyn == '(p)' for m, _, dyn in positions)
         assert paren_p_at_17, f"(p) should be at measure 17, positions: {positions}"
+
+
+def get_words_positions_from_mxl(mxl_path: Path) -> list[tuple[str, float, str, str]]:
+    """MXLファイルから(小節番号, 小節内オフセット_quarters, staff, wordsテキスト)を取得"""
+    result = []
+    with zipfile.ZipFile(mxl_path, 'r') as z:
+        for name in z.namelist():
+            if (name.endswith('.xml') or name.endswith('.musicxml')) and not name.startswith('META-INF'):
+                root = ET.fromstring(z.read(name))
+                for part in root.findall('.//{*}part'):
+                    divs = 1.0
+                    for measure in part.findall('.//{*}measure'):
+                        measure_num = measure.get('number', '?')
+                        current_offset = 0.0
+                        for elem in measure:
+                            tag = elem.tag.split('}')[-1]
+                            if tag == 'attributes':
+                                d = elem.find('.//{*}divisions')
+                                if d is not None and d.text:
+                                    divs = float(d.text)
+                            elif tag == 'direction':
+                                words = elem.find('.//{*}direction-type/{*}words')
+                                if words is not None and words.text and words.text.strip():
+                                    staff_elem = elem.find('{*}staff')
+                                    staff = (staff_elem.text if staff_elem is not None
+                                             and staff_elem.text else '1')
+                                    result.append((measure_num, current_offset / divs,
+                                                   staff, words.text.strip()))
+                            elif tag == 'note':
+                                dur_e = elem.find('.//{*}duration')
+                                if (elem.find('.//{*}chord') is None
+                                        and dur_e is not None and dur_e.text):
+                                    current_offset += float(dur_e.text)
+                            elif tag == 'backup':
+                                dur_e = elem.find('.//{*}duration')
+                                if dur_e is not None and dur_e.text:
+                                    current_offset = max(0.0, current_offset - float(dur_e.text))
+                            elif tag == 'forward':
+                                dur_e = elem.find('.//{*}duration')
+                                if dur_e is not None and dur_e.text:
+                                    current_offset += float(dur_e.text)
+                break
+    return result
+
+
+def _play_state_direction(measure_num: int, offset_q: float, staff: str,
+                          words_text: str, pizzicato: Optional[str],
+                          measure_duration_q: float = 2.0) -> DirectionElement:
+    """pizz./arco の DirectionElement を組み立てるテスト用ヘルパー"""
+    sound = f'<sound pizzicato="{pizzicato}"/>' if pizzicato is not None else ''
+    xml = (f'<direction placement="above"><direction-type>'
+           f'<words>{words_text}</words></direction-type>'
+           f'<staff>{staff}</staff>{sound}</direction>')
+    return DirectionElement(
+        measure_num=measure_num,
+        element_index=0,
+        direction_xml=xml,
+        placement='above',
+        has_sound=pizzicato is not None,
+        has_words=True,
+        words_text=words_text,
+        offset_quarters=offset_q,
+        measure_duration_quarters=measure_duration_q,
+        staff=staff,
+        sound_pizzicato=pizzicato,
+    )
+
+
+class TestIssue68PlayStateDetection:
+    """Issue #68: pizz./arco の判定と分類"""
+
+    def test_sound_pizzicato_attribute_detects_state(self):
+        """sound の pizzicato 属性から奏法状態を判定する"""
+        pizz = _play_state_direction(46, 1.0, '2', 'pizz.', 'yes')
+        arco = _play_state_direction(48, 0.0, '2', 'arco', 'no')
+        assert _get_play_state(pizz) == 'pizz'
+        assert _get_play_state(arco) == 'arco'
+
+    def test_words_text_detects_state_without_sound(self):
+        """sound属性を持たない arco もテキストで判定できる"""
+        arco = _play_state_direction(50, 1.0, '1', 'arco', None)
+        assert _get_play_state(arco) == 'arco'
+
+    def test_tempo_direction_is_not_play_state(self):
+        """テンポ指示は奏法状態として判定されない"""
+        tempo_dir = DirectionElement(
+            measure_num=45, element_index=0,
+            direction_xml='<direction><direction-type><words>Piu mosso.</words>'
+                          '</direction-type><sound tempo="126"/></direction>',
+            has_sound=True, has_words=True, words_text='Piu mosso.',
+        )
+        assert _get_play_state(tempo_dir) is None
+
+    def test_play_state_separated_before_tempo_classification(self):
+        """pizz./arco は _is_tempo_direction が真になるため事前に分離される必要がある"""
+        pizz = _play_state_direction(46, 1.0, '2', 'pizz.', 'yes')
+        assert _is_tempo_direction(pizz) is True
+
+        play_state_dirs, others = _separate_play_state_directions([pizz])
+        assert play_state_dirs == [pizz]
+        assert others == []
+
+
+class TestIssue68PizzArcoRangeReversal:
+    """Issue #68: pizz./arco の有効範囲ベース反転"""
+
+    TOTAL_MEASURES = 53
+
+    def _markers(self, dirs):
+        """(状態, staff, 小節, オフセット) の集合を返す"""
+        return {
+            (state, staff, measure_num, offset)
+            for state, staff, measure_num, offset, _template
+            in _calculate_reversed_play_state_markers(dirs, self.TOTAL_MEASURES)
+        }
+
+    def test_cancel_marker_is_generated_at_range_end(self):
+        """区間終端に打ち消しマーカー(arco)が生成される
+
+        原譜 staff2: pizz.@m46 2拍目 → arco@m48 頭
+        反転後: m7頭から pizz.、m8 2拍目から arco（元の pizz. 開始位置）
+        """
+        dirs = [
+            _play_state_direction(46, 1.0, '2', 'pizz.', 'yes'),
+            _play_state_direction(48, 0.0, '2', 'arco', 'no'),
+        ]
+        markers = self._markers(dirs)
+
+        assert ('pizz', '2', 7, 0.0) in markers, f"pizz. should start at m7 head: {markers}"
+        assert ('arco', '2', 8, 1.0) in markers, \
+            f"arco cancel marker should be at m8 beat 2: {markers}"
+
+    def test_no_marker_at_score_start_when_state_is_default(self):
+        """反転後の曲頭が既定状態(arco)ならマーカーを出さない"""
+        dirs = [
+            _play_state_direction(46, 1.0, '2', 'pizz.', 'yes'),
+            _play_state_direction(48, 0.0, '2', 'arco', 'no'),
+        ]
+        markers = self._markers(dirs)
+
+        assert not [m for m in markers if m[2] == 1], \
+            f"no play-state marker should be emitted at measure 1: {markers}"
+
+    def test_states_are_not_swapped(self):
+        """staff1: pizz.@m48頭 → arco@m50 2拍目 が入れ替わらない
+
+        反転後は m4 2拍目から pizz.、m7 頭から arco になる。
+        """
+        dirs = [
+            _play_state_direction(48, 0.0, '1', 'pizz.', 'yes'),
+            _play_state_direction(50, 1.0, '1', 'arco', None),
+        ]
+        markers = self._markers(dirs)
+
+        assert ('pizz', '1', 4, 1.0) in markers, f"pizz. should be at m4 beat 2: {markers}"
+        assert ('arco', '1', 7, 0.0) in markers, f"arco should be at m7 head: {markers}"
+
+    def test_staves_are_handled_independently(self):
+        """複数譜パートでは staff ごとに独立した状態として扱う"""
+        dirs = [
+            _play_state_direction(46, 1.0, '2', 'pizz.', 'yes'),
+            _play_state_direction(48, 0.0, '2', 'arco', 'no'),
+            _play_state_direction(48, 0.0, '1', 'pizz.', 'yes'),
+            _play_state_direction(50, 1.0, '1', 'arco', None),
+        ]
+        markers = self._markers(dirs)
+
+        assert {m for m in markers if m[1] == '2'} == {
+            ('pizz', '2', 7, 0.0), ('arco', '2', 8, 1.0)}
+        assert {m for m in markers if m[1] == '1'} == {
+            ('pizz', '1', 4, 1.0), ('arco', '1', 7, 0.0)}
+
+    def test_violin_pizz_arco_positions_end_to_end(self, tmp_path):
+        """威風堂々Violin(2段譜): 反転出力の pizz./arco 配置を実測で検証"""
+        input_file = (Path(__file__).parent.parent
+                      / 'work/inbox/test/威風堂々ラスト_in-Violin.mxl')
+        if not input_file.exists():
+            pytest.skip(f"Test file not found: {input_file}")
+
+        output_file = tmp_path / 'test_output.mxl'
+        layout_map = extract_layout_from_xml(input_file)
+        score = converter.parse(str(input_file))
+        reversed_score = reverse_score(score, None)
+        reversed_score.write('mxl', fp=str(output_file))
+        total_measures = len(list(reversed_score.parts[0].getElementsByClass('Measure')))
+        restore_direction_elements(output_file, layout_map, total_measures)
+
+        positions = [
+            (m, offset, staff, text) for m, offset, staff, text
+            in get_words_positions_from_mxl(output_file)
+            if text.lower() in ('pizz.', 'arco')
+        ]
+
+        assert ('7', 0.0, '2', 'pizz.') in positions, positions
+        assert ('8', 1.0, '2', 'arco') in positions, positions
+        assert ('4', 1.0, '1', 'pizz.') in positions, positions
+        assert ('7', 0.0, '1', 'arco') in positions, positions
+        assert not [p for p in positions if p[0] == '1'], \
+            f"measure 1 should have no pizz./arco marker: {positions}"
