@@ -1438,7 +1438,9 @@ def process_file(input_path: Path, output_path: Path,
             try:
                 # direction要素を元のXMLから復元（music21分割バグ対策）
                 print(f"  [Phase 3] direction要素を復元中...")
-                from layout_preservation import restore_direction_elements, normalize_slur_numbers
+                from layout_preservation import (restore_direction_elements,
+                                                 normalize_slur_numbers,
+                                                 recalculate_accidentals)
                 total_measures = len(list(reversed_score.parts[0].getElementsByClass('Measure')))
                 restore_direction_elements(output_path, original_layout, total_measures)
                 print(f"  [Phase 3] direction要素の復元完了")
@@ -1447,6 +1449,11 @@ def process_file(input_path: Path, output_path: Path,
                 print(f"  [Phase 3] スラー番号を正規化中...")
                 normalize_slur_numbers(output_path, verbose=False)
                 print(f"  [Phase 3] スラー番号の正規化完了")
+
+                # 臨時記号を有効範囲から再計算（反転で小節内の音順が変わるため）
+                print(f"  [Phase 3] 臨時記号を再計算中...")
+                recalculate_accidentals(output_path, verbose=False)
+                print(f"  [Phase 3] 臨時記号の再計算完了")
             except Exception as restore_error:
                 print(f"  警告: direction要素の復元に失敗しました: {restore_error}")
                 import traceback
