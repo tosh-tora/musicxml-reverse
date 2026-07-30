@@ -230,17 +230,17 @@ class TestLayoutPositionCalculation:
         assert reversed_positions[1]['layout_obj'].distance == 78.44
 
 
-class TestSystemBreakReversal:
-    """改行・改ページ境界の反転（威風堂々-Violin で24小節目が単独で1行になった問題）
+class TestSystemBreakSuppression:
+    """改行・改ページを出力しないこと（Issue #76）
 
-    isNew は「この小節から新しい段が始まる」という境界フラグで、レイアウト要素が
-    持ち運ぶ属性ではない。反転で宣言の並び順が逆になるため、元のフラグをそのまま
-    復元すると改行位置が1段ずれ、段あたりの小節数が合わずに溢れた小節が
-    単独で1行を占めてしまう。
+    <measure width> や音符の default-x は元の行組みに合わせて justify された値なので、
+    反転すると段の構成と整合しなくなる。横方向のレイアウトは
+    strip_horizontal_layout_hints() で情報ごと取り除き、改行も強制せずに
+    楽譜ソフトの自動改行に任せる。
     """
 
-    def _system_layouts(self, breaks: list[int], total: int) -> list[dict]:
-        """(小節番号, isNew) から layout_positions を組み立てる"""
+    def _system_layouts(self, breaks: list[int]) -> list[dict]:
+        """(小節番号) から改行フラグ付きの layout_positions を組み立てる"""
         positions = []
         for measure_num in breaks:
             sl = layout.SystemLayout()
@@ -248,52 +248,16 @@ class TestSystemBreakReversal:
             positions.append({'measure_num': measure_num, 'offset': 0, 'layout_obj': sl})
         return positions
 
-    def test_breaks_mirror_the_original_systems(self):
-        """威風堂々-Violin: 段構成が入力の鏡像になる
-
-        元の段: m1-9, m10-19, m20-29, m30-39, m40-45, m46-51, m52-53
-        反転後: m1-2, m3-8, m9-14, m15-24, m25-34, m35-44, m45-53
-        """
-        positions = self._system_layouts([1, 10, 20, 30, 40, 46, 52], total=53)
-        # m46 は改ページ（new-page）なので SystemLayout の isNew は立っていない
-        positions[5]['layout_obj'].isNew = None
+    def test_no_system_break_is_emitted(self):
+        """元譜に改行があっても反転後は出力しない"""
+        positions = self._system_layouts([1, 10, 20, 30, 40, 46, 52])
 
         reversed_positions = calculate_reversed_layout_positions(positions, 53)
 
-        breaks = sorted(p['reversed_measure_num'] for p in reversed_positions
-                        if p['layout_obj'].isNew)
-        assert breaks == [3, 15, 25, 35, 45], breaks
+        assert not [p for p in reversed_positions if p['layout_obj'].isNew],             [(p['reversed_measure_num'], p['layout_obj'].isNew) for p in reversed_positions]
 
-    def test_score_start_has_no_break_flag(self):
-        """曲頭には改行フラグを付けない"""
-        positions = self._system_layouts([1, 10, 20], total=30)
-
-        reversed_positions = calculate_reversed_layout_positions(positions, 30)
-
-        first = min(reversed_positions, key=lambda p: p['reversed_measure_num'])
-        assert first['reversed_measure_num'] == 1
-        assert not first['layout_obj'].isNew
-
-    def test_print_without_break_does_not_create_one(self):
-        """isNew を持たない <print>（part-name-display のみ等）は改行にしない
-
-        威風堂々-Tambourine は改行を持たないが、m45 に part-name-display だけの
-        <print> があり、music21 はこれも SystemLayout として読み込む。
-        """
-        positions = self._system_layouts([1, 45], total=53)
-        positions[1]['layout_obj'].isNew = None
-
-        reversed_positions = calculate_reversed_layout_positions(positions, 53)
-
-        assert not [p for p in reversed_positions if p['layout_obj'].isNew], \
-            [(p['reversed_measure_num'], p['layout_obj'].isNew) for p in reversed_positions]
-
-    def test_page_break_is_synthesized_for_implicit_first_page(self):
-        """曲頭ページは宣言を持たないため、反転後の改ページを補う
-
-        元: 1ページ目 m1-45（宣言なし）、2ページ目 m46-53
-        反転後: 1ページ目 m1-8、2ページ目 m9-53 → m9 に改ページ
-        """
+    def test_page_break_and_page_number_are_dropped(self):
+        """改ページを出さないので、ページ番号も残さない"""
         page = layout.PageLayout()
         page.isNew = True
         page.pageNumber = 2
@@ -301,22 +265,27 @@ class TestSystemBreakReversal:
 
         reversed_positions = calculate_reversed_layout_positions(positions, 53)
 
-        breaks = [(p['reversed_measure_num'], p['layout_obj'].pageNumber)
-                  for p in reversed_positions if p['layout_obj'].isNew]
-        assert breaks == [(9, 2)], breaks
+        assert len(reversed_positions) == 1
+        assert not reversed_positions[0]['layout_obj'].isNew
+        assert reversed_positions[0]['layout_obj'].pageNumber is None
 
-    def test_first_page_has_no_page_number(self):
-        """曲頭のページには元譜と同じくページ番号を付けない"""
-        page = layout.PageLayout()
-        page.isNew = True
-        page.pageNumber = 2
-        positions = [{'measure_num': 46, 'offset': 0, 'layout_obj': page}]
+    def test_layout_content_is_still_reversed(self):
+        """改行は出さないが、縦方向の間隔（内容）の反転は従来どおり行う"""
+        first = layout.SystemLayout()
+        first.systemDistance = 100.0
+        second = layout.SystemLayout()
+        second.isNew = True
+        second.systemDistance = 200.0
+        positions = [
+            {'measure_num': 1, 'offset': 0, 'layout_obj': first},
+            {'measure_num': 6, 'offset': 0, 'layout_obj': second},
+        ]
 
-        reversed_positions = calculate_reversed_layout_positions(positions, 53)
+        reversed_positions = calculate_reversed_layout_positions(positions, 10)
 
-        first = min(reversed_positions, key=lambda p: p['reversed_measure_num'])
-        assert first['reversed_measure_num'] == 1
-        assert first['layout_obj'].pageNumber is None
+        assert [p['reversed_measure_num'] for p in reversed_positions] == [1, 6]
+        assert reversed_positions[0]['layout_obj'].systemDistance == 200.0
+        assert reversed_positions[1]['layout_obj'].systemDistance == 100.0
 
     def test_staff_layout_is_unaffected(self):
         """StaffLayout には改行の概念が無いので内容の反転だけ行う"""

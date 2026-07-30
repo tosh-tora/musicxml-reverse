@@ -417,102 +417,20 @@ def calculate_reversed_layout_positions(
             'layout_obj': copy.deepcopy(pos['layout_obj']),
         })
 
-    first_obj = layout_positions[0]['layout_obj']
-    if not hasattr(first_obj, 'isNew'):
-        # StaffLayout には改行の概念が無いので内容の反転だけで完了
-        reversed_positions.sort(key=lambda x: x['reversed_measure_num'])
-        return reversed_positions
-
-    # 改行・改ページ（isNew）は「範囲」ではなく小節境界のフラグなので、
-    # 内容とは別に境界そのものを反転して求める
-    reversed_breaks = _calculate_reversed_layout_breaks(layout_positions, total_measures)
-
-    # 反転後の境界に対応するレイアウト要素が無ければ補う
-    # （元譜の曲頭ブロックは宣言を持たないことがあるため）
-    existing = {pos['reversed_measure_num'] for pos in reversed_positions}
-    for break_measure in sorted(reversed_breaks - existing):
-        reversed_positions.append({
-            'reversed_measure_num': break_measure,
-            'layout_obj': type(first_obj)(),
-        })
-
-    reversed_positions.sort(key=lambda x: x['reversed_measure_num'])
-    _assign_layout_break_flags(reversed_positions, reversed_breaks)
-
-    return reversed_positions
-
-
-def _calculate_reversed_layout_breaks(
-    layout_positions: list[dict],
-    total_measures: int
-) -> set[int]:
-    """改行・改ページの境界を時間反転して、反転後の境界小節番号を求める
-
-    isNew は「この小節から新しい段/ページが始まる」という境界フラグであり、
-    レイアウト要素が持ち運ぶ属性ではない。時間反転すると宣言の並び順が逆になるため、
-    元のフラグをそのまま復元すると改行位置が1段ずれ、段あたりの小節数が合わなくなる
-    （例: 威風堂々-Violin では最初と最後の改行が落ち、19小節の段ができて
-    はみ出した小節が単独で1行を占めてしまう）。
-
-    元の段が [b, 次のb-1] なら反転後は [total-(次のb-1)+1, total-b+1] に移るので、
-    反転後の境界は total - b + 2 になる（練習番号と同じ +1 シフト）。
-
-    Args:
-        layout_positions: collect_layout_positions() の結果
-        total_measures: 総小節数
-
-    Returns:
-        反転後に新しい段/ページが始まる小節番号の集合（曲頭の 1 を含む）
-    """
-    # 曲頭は常に段の開始。isNew を持たない宣言（part-name-display のみの
-    # <print> など）は段の開始ではないので境界に含めない。
-    original_breaks = {1} | {
-        pos['measure_num'] for pos in layout_positions
-        if getattr(pos['layout_obj'], 'isNew', False)
-    }
-
-    reversed_breaks = {1}
-    for measure_num in original_breaks:
-        if measure_num <= 1:
-            continue
-        reversed_break = total_measures - measure_num + 2
-        if 1 <= reversed_break <= total_measures:
-            reversed_breaks.add(reversed_break)
-
-    return reversed_breaks
-
-
-def _assign_layout_break_flags(
-    reversed_positions: list[dict],
-    reversed_breaks: set[int]
-) -> None:
-    """反転後の境界に合わせて isNew とページ番号を付け直す
-
-    Args:
-        reversed_positions: 反転後小節番号で昇順ソート済みの位置情報
-        reversed_breaks: _calculate_reversed_layout_breaks() の結果
-    """
-    has_page_number = any(
-        getattr(pos['layout_obj'], 'pageNumber', None) is not None
-        for pos in reversed_positions
-    )
-    page_number = 1
-
+    # 改行・改ページ（new-system / new-page）は出力しない。
+    # <measure width> や音符の default-x は元の行組みに合わせて justify された値で、
+    # 反転すると段の構成が変わって整合しなくなる（Issue #76）。横方向のレイアウトは
+    # strip_horizontal_layout_hints() で情報ごと取り除き、楽譜ソフトの自動改行に任せる。
     for pos in reversed_positions:
         layout_obj = pos['layout_obj']
-        measure_num = pos['reversed_measure_num']
-        # 曲頭は既に段の開始なのでフラグは付けない。
-        # 段の開始でない場合は None にして属性自体を出力しない（元譜と同じ書式）
-        is_break = measure_num in reversed_breaks and measure_num != 1
-        layout_obj.isNew = True if is_break else None
+        if hasattr(layout_obj, 'isNew'):
+            layout_obj.isNew = None
+        if hasattr(layout_obj, 'pageNumber'):
+            # 改ページを出さないのでページ番号だけ残ると不整合になる
+            layout_obj.pageNumber = None
 
-        if has_page_number and hasattr(layout_obj, 'pageNumber'):
-            if layout_obj.isNew:
-                page_number += 1
-                layout_obj.pageNumber = page_number
-            else:
-                # 元譜と同じく曲頭のページには番号を付けない
-                layout_obj.pageNumber = None
+    reversed_positions.sort(key=lambda x: x['reversed_measure_num'])
+    return reversed_positions
 
 
 def apply_reversed_layout_elements(
@@ -1535,7 +1453,8 @@ def process_file(input_path: Path, output_path: Path,
                 from layout_preservation import (restore_direction_elements,
                                                  normalize_slur_numbers,
                                                  recalculate_accidentals,
-                                                 restore_multiple_rests)
+                                                 restore_multiple_rests,
+                                                 strip_horizontal_layout_hints)
                 total_measures = len(list(reversed_score.parts[0].getElementsByClass('Measure')))
                 restore_direction_elements(output_path, original_layout, total_measures)
                 print(f"  [Phase 3] direction要素の復元完了")
@@ -1554,6 +1473,11 @@ def process_file(input_path: Path, output_path: Path,
                 print(f"  [Phase 3] 複数小節休符を再配置中...")
                 restore_multiple_rests(output_path, original_layout, total_measures)
                 print(f"  [Phase 3] 複数小節休符の再配置完了")
+
+                # 反転で無効になる水平位置情報を除去（direction 復元より後に実行する）
+                print(f"  [Phase 3] 水平位置情報を除去中...")
+                strip_horizontal_layout_hints(output_path, verbose=False)
+                print(f"  [Phase 3] 水平位置情報の除去完了")
             except Exception as restore_error:
                 print(f"  警告: direction要素の復元に失敗しました: {restore_error}")
                 import traceback

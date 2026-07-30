@@ -2401,6 +2401,96 @@ def recalculate_accidentals(output_xml_path: Path, verbose: bool = False) -> Non
         tree.write(output_xml_path, encoding='utf-8', xml_declaration=True)
 
 
+# 反転で無効になる水平位置の属性
+_HORIZONTAL_POSITION_ATTRIBUTES = ('default-x', 'relative-x')
+
+
+def _remove_horizontal_attributes(element: ET.Element) -> int:
+    """要素から水平位置の属性を取り除き、取り除いた個数を返す"""
+    removed = 0
+    for attr in _HORIZONTAL_POSITION_ATTRIBUTES:
+        if attr in element.attrib:
+            del element.attrib[attr]
+            removed += 1
+    return removed
+
+
+def strip_horizontal_layout_hints(output_xml_path: Path, verbose: bool = False) -> None:
+    """反転で無効になる横方向のレイアウト情報を出力から取り除く
+
+    元のMusicXMLが持つ水平位置は「元の音符順・元の行組み」を前提にした値なので、
+    時間反転すると整合しなくなる:
+
+    - 音符の default-x は小節先頭からの絶対位置。反転すると音符順が変わるため、
+      値をそのまま残すと水平位置が右から左に並ぶ
+    - <measure width> は段の幅に合わせて justify された結果。反転で段の構成が変わると
+      行頭に必要な音部記号・調号のぶんが入らず、段からはみ出した小節が
+      単独で1行を占めてしまう（Issue #76）
+
+    横方向の配置は楽譜ソフトに任せる。これは元々このプロジェクトの方針
+    （transform_layout_for_reversal の「X座標は変換しない」）だが、
+    music21 が往復で持ち回る値には適用されていなかった。
+
+    縦方向（default-y / relative-y / placement）と、<notations> 配下の
+    音符基準の微調整（accent, tenuto 等）はそのまま残す。
+
+    Args:
+        output_xml_path: 処理対象のMusicXMLファイル(.xml または .mxl)
+        verbose: デバッグ出力を有効にする
+    """
+    is_mxl = output_xml_path.suffix == '.mxl'
+
+    if is_mxl:
+        root, xml_filename = _extract_mxl_content(output_xml_path)
+    else:
+        tree = ET.parse(output_xml_path)
+        root = tree.getroot()
+
+    removed_attrs = 0
+    removed_widths = 0
+
+    for measure in root.findall('.//{*}measure'):
+        if 'width' in measure.attrib:
+            del measure.attrib['width']
+            removed_widths += 1
+
+        for note in measure.findall('{*}note'):
+            removed_attrs += _remove_horizontal_attributes(note)
+
+        # direction 配下（words, rehearsal, dynamics, wedge, octave-shift 等）も
+        # 小節先頭基準なので取り除く
+        for direction in measure.findall('{*}direction'):
+            removed_attrs += _remove_horizontal_attributes(direction)
+            for child in direction.iter():
+                if child is not direction:
+                    removed_attrs += _remove_horizontal_attributes(child)
+
+    if verbose:
+        print(f"  水平位置: 属性 {removed_attrs} 個, measure width {removed_widths} 個を除去")
+
+    # 変更後のXMLを書き出し
+    if is_mxl:
+        import tempfile
+        import shutil
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_mxl = Path(tmpdir) / 'output.mxl'
+            shutil.copy2(output_xml_path, tmp_mxl)
+
+            xml_content = ET.tostring(root, encoding='utf-8', xml_declaration=True)
+
+            with zipfile.ZipFile(output_xml_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf_out:
+                with zipfile.ZipFile(tmp_mxl, 'r') as zf_in:
+                    for item in zf_in.namelist():
+                        if item == xml_filename:
+                            zf_out.writestr(item, xml_content)
+                        else:
+                            zf_out.writestr(item, zf_in.read(item))
+    else:
+        tree = ET.ElementTree(root)
+        tree.write(output_xml_path, encoding='utf-8', xml_declaration=True)
+
+
 def _measure_attributes_for_insert(measure: ET.Element) -> ET.Element:
     """小節の <attributes> を返す（無ければ小節先頭に作る）
 
