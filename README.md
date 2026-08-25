@@ -16,9 +16,22 @@ MusicXML (.mxl / .xml / .musicxml) ファイルを「逆から演奏できる」
 
 - **強弱記号・テンポ指示**: 次の同種指示までを有効範囲として反転し、元の開始位置には
   括弧付きマーカー（例: `(ff)`）を残す
-- **奏法状態（pizz. / arco）**: 譜（staff）ごとに独立した状態として扱い、区間を反転する。
-  反転により区間の終端になった位置には、元譜に無い打ち消しマーカー（pizz. → arco）を
-  新たに生成する
+- **状態指示**: 譜（staff）ごと・グループごとに独立した状態として扱い、区間を反転する。
+  反転により区間の終端になった位置には、元譜に無い打ち消しマーカーを新たに生成する
+  （例: `div.` → `unis.`、`pizz.` → `arco`）。状態を変えていない再掲は鏡像位置に残す。
+  対応する語彙:
+
+  | グループ | 語彙 | 既定状態 |
+  |---|---|---|
+  | 奏法 | `pizz.` / `pizzicato` / `arco` | arco |
+  | 分割・人数 | `div.` / `divisi` / `unis.` / `unison` / `a 2.` / `a due` / `I.` / `II.` | a 2. |
+  | ミュート | `con sord.` / `con sordino` / `senza sord.` / `via sord.` | senza sord. |
+  | 弓の位置 | `sul pont.` / `sul tasto` / `col legno` / `ord.` / `naturale` | ord. |
+
+  語彙を列挙できない状態指示（打楽器の持ち替え、オルガンのレジストレーション等）は
+  誤検出を避けるため対象外
+- **複数小節休符（multiple-rest）**: 「この小節から N 小節」という前方向スパンなので、
+  反転後のブロック先頭に置き直す（末尾に残ると音符のある小節を休符として結合してしまう）
 - **臨時記号（♯/♭/♮）**: 有効範囲は調号と「同一小節・同一 staff・同一オクターブ」で決まるため、
   反転で小節内の音順が変わった後に必要な記号だけを再計算する。冗長な記号は削除し、
   打ち消しに必要な記号は追加する（タイで繋がれた音には記号を繰り返さない）
@@ -112,8 +125,9 @@ mrev/
 ├── reverse_score.py          # メインスクリプト
 ├── layout_preservation.py    # レイアウト保存モジュール
 ├── tests/                    # pytest テストスイート
-│   ├── test_direction_preservation.py  # direction（強弱・テンポ・奏法状態）の復元
+│   ├── test_direction_preservation.py  # direction（強弱・テンポ・状態指示）の復元
 │   ├── test_accidental_scope.py        # 臨時記号の有効範囲
+│   ├── test_measure_style.py           # 複数小節休符の再配置
 │   ├── test_position_adjustment.py     # 音部記号・レイアウトの位置計算
 │   ├── test_voice_tie_reversal.py      # voice内のタイ・連桁の反転
 │   └── test_merged_staff_layout.py     # 複数譜パート結合時のレイアウト

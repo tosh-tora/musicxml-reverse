@@ -22,10 +22,11 @@ from layout_preservation import (
     DirectionElement,
     LayoutMap,
     _is_transitional_tempo_text,
-    _calculate_reversed_play_state_markers,
-    _get_play_state,
+    _build_state_marking_direction,
+    _calculate_reversed_state_markers,
+    _get_state_marking,
     _is_tempo_direction,
-    _separate_play_state_directions,
+    _separate_state_marking_directions,
 )
 from reverse_score import reverse_score
 
@@ -476,13 +477,13 @@ class TestIssue68PlayStateDetection:
         """sound の pizzicato 属性から奏法状態を判定する"""
         pizz = _play_state_direction(46, 1.0, '2', 'pizz.', 'yes')
         arco = _play_state_direction(48, 0.0, '2', 'arco', 'no')
-        assert _get_play_state(pizz) == 'pizz'
-        assert _get_play_state(arco) == 'arco'
+        assert _get_state_marking(pizz)[1] == 'pizz'
+        assert _get_state_marking(arco)[1] == 'arco'
 
     def test_words_text_detects_state_without_sound(self):
         """sound属性を持たない arco もテキストで判定できる"""
         arco = _play_state_direction(50, 1.0, '1', 'arco', None)
-        assert _get_play_state(arco) == 'arco'
+        assert _get_state_marking(arco)[1] == 'arco'
 
     def test_tempo_direction_is_not_play_state(self):
         """テンポ指示は奏法状態として判定されない"""
@@ -492,15 +493,15 @@ class TestIssue68PlayStateDetection:
                           '</direction-type><sound tempo="126"/></direction>',
             has_sound=True, has_words=True, words_text='Piu mosso.',
         )
-        assert _get_play_state(tempo_dir) is None
+        assert _get_state_marking(tempo_dir) is None
 
     def test_play_state_separated_before_tempo_classification(self):
         """pizz./arco は _is_tempo_direction が真になるため事前に分離される必要がある"""
         pizz = _play_state_direction(46, 1.0, '2', 'pizz.', 'yes')
         assert _is_tempo_direction(pizz) is True
 
-        play_state_dirs, others = _separate_play_state_directions([pizz])
-        assert play_state_dirs == [pizz]
+        state_dirs, others = _separate_state_marking_directions([pizz])
+        assert state_dirs == [pizz]
         assert others == []
 
 
@@ -512,9 +513,8 @@ class TestIssue68PizzArcoRangeReversal:
     def _markers(self, dirs):
         """(状態, staff, 小節, オフセット) の集合を返す"""
         return {
-            (state, staff, measure_num, offset)
-            for state, staff, measure_num, offset, _template
-            in _calculate_reversed_play_state_markers(dirs, self.TOTAL_MEASURES)
+            (m.state, m.staff, m.measure_num, m.offset_quarters)
+            for m in _calculate_reversed_state_markers(dirs, self.TOTAL_MEASURES)
         }
 
     def test_cancel_marker_is_generated_at_range_end(self):
@@ -600,3 +600,173 @@ class TestIssue68PizzArcoRangeReversal:
         assert ('7', 0.0, '1', 'arco') in positions, positions
         assert not [p for p in positions if p[0] == '1'], \
             f"measure 1 should have no pizz./arco marker: {positions}"
+
+
+class TestIssue70StateMarkingGroups:
+    """Issue #70: 語彙で定義できる状態指示の有効範囲反転"""
+
+    TOTAL_MEASURES = 53
+
+    def _markers(self, dirs):
+        """(状態, staff, 小節, オフセット) の集合を返す"""
+        return {
+            (m.state, m.staff, m.measure_num, m.offset_quarters)
+            for m in _calculate_reversed_state_markers(dirs, self.TOTAL_MEASURES)
+        }
+
+    def _words(self, dirs):
+        """(表示テキスト, 小節) の集合を返す（合成される打ち消し表記の検証用）"""
+        result = set()
+        for marker in _calculate_reversed_state_markers(dirs, self.TOTAL_MEASURES):
+            direction = _build_state_marking_direction(marker)
+            words = direction.find('.//{*}direction-type/{*}words')
+            result.add((words.text, marker.measure_num))
+        return result
+
+    def test_divisi_vocabulary_is_detected(self):
+        """a 2. / I. / II. / div. / unis. が divisi グループとして判定される"""
+        cases = [('a 2.', 'tutti'), ('unis.', 'tutti'), ('div.', 'div'),
+                 ('I.', 'first'), ('II.', 'second')]
+        for text, expected_state in cases:
+            d = _play_state_direction(1, 0.0, None, text, None)
+            marking = _get_state_marking(d)
+            assert marking is not None, f"{text} should be a state marking"
+            group, state = marking
+            assert group.name == 'divisi', f"{text} → {group.name}"
+            assert state == expected_state, f"{text} → {state}"
+
+    def test_mute_and_bowing_vocabulary_is_detected(self):
+        """con sord. / sul pont. 等が判定される"""
+        cases = [('con sord.', 'mute', 'muted'), ('senza sord.', 'mute', 'open'),
+                 ('sul pont.', 'bowing', 'pont'), ('sul tasto', 'bowing', 'tasto'),
+                 ('col legno', 'bowing', 'legno'), ('ord.', 'bowing', 'ord')]
+        for text, expected_group, expected_state in cases:
+            group, state = _get_state_marking(_play_state_direction(1, 0.0, None, text, None))
+            assert (group.name, state) == (expected_group, expected_state), \
+                f"{text} → ({group.name}, {state})"
+
+    def test_words_split_across_siblings_is_detected(self):
+        """<words>con</words><words>sord.</words> のように分割されていても判定できる"""
+        d = DirectionElement(
+            measure_num=1, element_index=0,
+            direction_xml='<direction><direction-type><words>con</words>'
+                          '<words>sord.</words></direction-type></direction>',
+            has_words=True, words_text='con',
+        )
+        group, state = _get_state_marking(d)
+        assert (group.name, state) == ('mute', 'muted')
+
+    def test_non_vocabulary_words_are_not_state_markings(self):
+        """語彙外のテキストは状態指示として扱わない（誤検出の防止）"""
+        for text in ('sostenuto', 'simile', 'ad lib.', 'glissando',
+                     'Tambourine', 'Sw.', 'Full.'):
+            d = _play_state_direction(1, 0.0, None, text, None)
+            assert _get_state_marking(d) is None, f"{text} should not be a state marking"
+
+    def test_a2_to_first_is_not_swapped(self):
+        """F_Trumpet: a 2.@m1 → I.@m48 の状態が入れ替わらない
+
+        I. の有効範囲は m48〜曲末なので、反転後は曲頭〜m6 が I.、m7 から a 2. に戻る。
+        """
+        dirs = [
+            _play_state_direction(1, 0.0, None, 'a 2.', None),
+            _play_state_direction(48, 0.0, None, 'I.', None),
+        ]
+        markers = self._markers(dirs)
+
+        assert ('first', None, 1, 0.0) in markers, f"I. should be at m1: {markers}"
+        assert ('tutti', None, 7, 0.0) in markers, f"a 2. should be at m7: {markers}"
+
+    def test_div_cancel_marker_is_synthesized_as_unis(self):
+        """Viola: div.@m41 に解除記号が無い場合、unis. を合成して区間終端に置く
+
+        div. の有効範囲は m41〜曲末なので、反転後は m1〜m13 が div.、m14 で解除。
+        """
+        dirs = [_play_state_direction(41, 0.0, None, 'div.', None)]
+
+        assert ('div.', 1) in self._words(dirs), self._words(dirs)
+        assert ('unis.', 14) in self._words(dirs), self._words(dirs)
+
+    def test_first_cancel_marker_is_synthesized_as_a2(self):
+        """I. の解除は unis. ではなく a 2. を合成する"""
+        dirs = [_play_state_direction(41, 0.0, None, 'I.', None)]
+
+        assert ('I.', 1) in self._words(dirs), self._words(dirs)
+        assert ('a 2.', 14) in self._words(dirs), self._words(dirs)
+
+    def test_redundant_restatement_is_kept_at_mirrored_position(self):
+        """状態を変えていない再掲は鏡像位置に残す（元譜の情報を失わない）
+
+        Flute: a 2.@m1 と a 2.@m45 はどちらも既定状態の再掲。
+        m45 の鏡像は m10、m1 の鏡像は曲末を越えるため最終小節にクランプする。
+        """
+        dirs = [
+            _play_state_direction(1, 0.0, None, 'a 2.', None),
+            _play_state_direction(45, 0.0, None, 'a 2.', None),
+        ]
+        markers = self._markers(dirs)
+
+        assert ('tutti', None, 10, 0.0) in markers, f"a 2. should be at m10: {markers}"
+        assert ('tutti', None, 53, 0.0) in markers, \
+            f"a 2. at m1 should be clamped to the last measure: {markers}"
+
+    def test_groups_are_independent(self):
+        """奏法と分割は互いに独立した状態として扱う"""
+        dirs = [
+            _play_state_direction(46, 1.0, '1', 'pizz.', 'yes'),
+            _play_state_direction(41, 0.0, '1', 'div.', None),
+        ]
+        markers = self._markers(dirs)
+
+        # pizz. の区間は m46〜曲末 → 反転後 m1〜m8 2拍目
+        assert ('pizz', '1', 1, 0.0) in markers, markers
+        assert ('arco', '1', 8, 1.0) in markers, markers
+        # div. の区間は m41〜曲末 → 反転後 m1〜m13
+        assert ('div', '1', 1, 0.0) in markers, markers
+        assert ('tutti', '1', 14, 0.0) in markers, markers
+
+    def test_f_trumpet_positions_end_to_end(self, tmp_path):
+        """威風堂々F_Trumpet: 反転出力の a 2. / I. 配置を実測で検証"""
+        input_file = (Path(__file__).parent.parent
+                      / 'work/inbox/威風堂々ラスト-F_Trumpet.mxl')
+        if not input_file.exists():
+            pytest.skip(f"Test file not found: {input_file}")
+
+        output_file = tmp_path / 'test_output.mxl'
+        layout_map = extract_layout_from_xml(input_file)
+        score = converter.parse(str(input_file))
+        reversed_score = reverse_score(score, None)
+        reversed_score.write('mxl', fp=str(output_file))
+        total_measures = len(list(reversed_score.parts[0].getElementsByClass('Measure')))
+        restore_direction_elements(output_file, layout_map, total_measures)
+
+        positions = [(m, text) for m, _offset, _staff, text
+                     in get_words_positions_from_mxl(output_file)
+                     if text in ('a 2.', 'I.')]
+
+        assert ('1', 'I.') in positions, positions
+        assert ('7', 'a 2.') in positions, positions
+        assert not [p for p in positions if p == ('1', 'a 2.')], \
+            f"measure 1 should be I., not a 2.: {positions}"
+
+    def test_viola_div_unis_end_to_end(self, tmp_path):
+        """威風堂々Viola: div. が m1、合成した unis. が m14 に来る"""
+        input_file = (Path(__file__).parent.parent
+                      / 'work/inbox/威風堂々ラスト-Viola.mxl')
+        if not input_file.exists():
+            pytest.skip(f"Test file not found: {input_file}")
+
+        output_file = tmp_path / 'test_output.mxl'
+        layout_map = extract_layout_from_xml(input_file)
+        score = converter.parse(str(input_file))
+        reversed_score = reverse_score(score, None)
+        reversed_score.write('mxl', fp=str(output_file))
+        total_measures = len(list(reversed_score.parts[0].getElementsByClass('Measure')))
+        restore_direction_elements(output_file, layout_map, total_measures)
+
+        positions = [(m, text) for m, _offset, _staff, text
+                     in get_words_positions_from_mxl(output_file)
+                     if text in ('div.', 'unis.')]
+
+        assert ('1', 'div.') in positions, positions
+        assert ('14', 'unis.') in positions, positions
