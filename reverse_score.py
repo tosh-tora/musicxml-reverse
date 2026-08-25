@@ -1440,7 +1440,8 @@ def process_file(input_path: Path, output_path: Path,
                 print(f"  [Phase 3] direction要素を復元中...")
                 from layout_preservation import (restore_direction_elements,
                                                  normalize_slur_numbers,
-                                                 recalculate_accidentals)
+                                                 recalculate_accidentals,
+                                                 restore_multiple_rests)
                 total_measures = len(list(reversed_score.parts[0].getElementsByClass('Measure')))
                 restore_direction_elements(output_path, original_layout, total_measures)
                 print(f"  [Phase 3] direction要素の復元完了")
@@ -1454,6 +1455,11 @@ def process_file(input_path: Path, output_path: Path,
                 print(f"  [Phase 3] 臨時記号を再計算中...")
                 recalculate_accidentals(output_path, verbose=False)
                 print(f"  [Phase 3] 臨時記号の再計算完了")
+
+                # 複数小節休符を反転後のブロック先頭に置き直す
+                print(f"  [Phase 3] 複数小節休符を再配置中...")
+                restore_multiple_rests(output_path, original_layout, total_measures)
+                print(f"  [Phase 3] 複数小節休符の再配置完了")
             except Exception as restore_error:
                 print(f"  警告: direction要素の復元に失敗しました: {restore_error}")
                 import traceback
