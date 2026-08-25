@@ -36,6 +36,21 @@ MusicXML (.mxl / .xml / .musicxml) ファイルを「逆から演奏できる」
   反転で小節内の音順が変わった後に必要な記号だけを再計算する。冗長な記号は削除し、
   打ち消しに必要な記号は追加する（タイで繋がれた音には記号を繰り返さない）
 
+### 横方向のレイアウトは楽譜ソフトに任せる
+
+元のMusicXMLが持つ水平位置は「元の音符順・元の行組み」を前提にした値なので、
+時間反転すると整合しない。次の情報は出力から取り除き、横方向の配置は楽譜ソフトに任せる。
+
+- **音符の `default-x` / `relative-x`**: 小節先頭からの絶対位置。反転で音符順が変わるため、
+  残すと水平位置が右から左に並ぶ
+- **`<measure width>`**: 段の幅に合わせて justify された結果。反転で段の構成が変わると
+  行頭に必要な音部記号・調号のぶんが入らず、はみ出した小節が単独で1行を占めてしまう
+- **`<direction>` 配下の `default-x` / `relative-x`**: 同じく小節先頭基準
+- **改行・改ページ（`new-system` / `new-page`）**: 強制せず、楽譜ソフトの自動改行に任せる
+
+縦方向（`default-y` / `relative-y` / `placement`、段や譜の間隔）と、`<notations>` 配下の
+音符基準の微調整（accent, tenuto 等）はそのまま保持する。
+
 ### レイアウト保存
 - **視覚的配置の保存**: 反転後もスコアの視覚的品質を維持
   - ダイナミクス（f, p等）の座標変換（X座標を小節内で鏡像反転）
@@ -128,6 +143,7 @@ mrev/
 │   ├── test_direction_preservation.py  # direction（強弱・テンポ・状態指示）の復元
 │   ├── test_accidental_scope.py        # 臨時記号の有効範囲
 │   ├── test_measure_style.py           # 複数小節休符の再配置
+│   ├── test_layout_hints.py            # 水平位置情報の除去
 │   ├── test_position_adjustment.py     # 音部記号・レイアウトの位置計算
 │   ├── test_voice_tie_reversal.py      # voice内のタイ・連桁の反転
 │   └── test_merged_staff_layout.py     # 複数譜パート結合時のレイアウト
