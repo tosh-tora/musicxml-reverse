@@ -11,6 +11,18 @@ MusicXML (.mxl / .xml / .musicxml) ファイルを「逆から演奏できる」
 - Crescendo ↔ Diminuendo を変換
 - タイの start/stop を反転
 
+### 有効範囲を持つ指示の反転
+「その位置から次の指示まで有効」な指示は、位置だけでなく有効範囲ごと反転する。
+
+- **強弱記号・テンポ指示**: 次の同種指示までを有効範囲として反転し、元の開始位置には
+  括弧付きマーカー（例: `(ff)`）を残す
+- **奏法状態（pizz. / arco）**: 譜（staff）ごとに独立した状態として扱い、区間を反転する。
+  反転により区間の終端になった位置には、元譜に無い打ち消しマーカー（pizz. → arco）を
+  新たに生成する
+- **臨時記号（♯/♭/♮）**: 有効範囲は調号と「同一小節・同一 staff・同一オクターブ」で決まるため、
+  反転で小節内の音順が変わった後に必要な記号だけを再計算する。冗長な記号は削除し、
+  打ち消しに必要な記号は追加する（タイで繋がれた音には記号を繰り返さない）
+
 ### レイアウト保存
 - **視覚的配置の保存**: 反転後もスコアの視覚的品質を維持
   - ダイナミクス（f, p等）の座標変換（X座標を小節内で鏡像反転）
@@ -99,7 +111,12 @@ python reverse_score.py -s
 mrev/
 ├── reverse_score.py          # メインスクリプト
 ├── layout_preservation.py    # レイアウト保存モジュール
-├── test_layout_preservation.py  # ユニットテスト
+├── tests/                    # pytest テストスイート
+│   ├── test_direction_preservation.py  # direction（強弱・テンポ・奏法状態）の復元
+│   ├── test_accidental_scope.py        # 臨時記号の有効範囲
+│   ├── test_position_adjustment.py     # 音部記号・レイアウトの位置計算
+│   ├── test_voice_tie_reversal.py      # voice内のタイ・連桁の反転
+│   └── test_merged_staff_layout.py     # 複数譜パート結合時のレイアウト
 ├── requirements.txt          # 依存パッケージ
 ├── README.md
 └── work/
