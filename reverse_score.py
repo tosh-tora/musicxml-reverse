@@ -417,6 +417,18 @@ def calculate_reversed_layout_positions(
             'layout_obj': copy.deepcopy(pos['layout_obj']),
         })
 
+    # 改行・改ページ（new-system / new-page）は出力しない。
+    # <measure width> や音符の default-x は元の行組みに合わせて justify された値で、
+    # 反転すると段の構成が変わって整合しなくなる（Issue #76）。横方向のレイアウトは
+    # strip_horizontal_layout_hints() で情報ごと取り除き、楽譜ソフトの自動改行に任せる。
+    for pos in reversed_positions:
+        layout_obj = pos['layout_obj']
+        if hasattr(layout_obj, 'isNew'):
+            layout_obj.isNew = None
+        if hasattr(layout_obj, 'pageNumber'):
+            # 改ページを出さないのでページ番号だけ残ると不整合になる
+            layout_obj.pageNumber = None
+
     reversed_positions.sort(key=lambda x: x['reversed_measure_num'])
     return reversed_positions
 
@@ -1441,7 +1453,8 @@ def process_file(input_path: Path, output_path: Path,
                 from layout_preservation import (restore_direction_elements,
                                                  normalize_slur_numbers,
                                                  recalculate_accidentals,
-                                                 restore_multiple_rests)
+                                                 restore_multiple_rests,
+                                                 strip_horizontal_layout_hints)
                 total_measures = len(list(reversed_score.parts[0].getElementsByClass('Measure')))
                 restore_direction_elements(output_path, original_layout, total_measures)
                 print(f"  [Phase 3] direction要素の復元完了")
@@ -1460,6 +1473,11 @@ def process_file(input_path: Path, output_path: Path,
                 print(f"  [Phase 3] 複数小節休符を再配置中...")
                 restore_multiple_rests(output_path, original_layout, total_measures)
                 print(f"  [Phase 3] 複数小節休符の再配置完了")
+
+                # 反転で無効になる水平位置情報を除去（direction 復元より後に実行する）
+                print(f"  [Phase 3] 水平位置情報を除去中...")
+                strip_horizontal_layout_hints(output_path, verbose=False)
+                print(f"  [Phase 3] 水平位置情報の除去完了")
             except Exception as restore_error:
                 print(f"  警告: direction要素の復元に失敗しました: {restore_error}")
                 import traceback
