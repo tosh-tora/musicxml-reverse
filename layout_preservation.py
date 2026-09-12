@@ -113,6 +113,9 @@ class LayoutMap:
     # Key: part_id
     instrument_refs: dict[str, list[InstrumentRef]] = field(default_factory=dict)
     # Key: part_id
+    instrument_defs_xml: dict[str, list[str]] = field(default_factory=dict)
+    # Key: part_id。<score-part>直下の<score-instrument>/<midi-device>/<midi-instrument>
+    # 要素のXML文字列（music21は複数instrumentを1つに統合してしまうため復元用）
     directions: dict[str, list[DirectionElement]] = field(default_factory=dict)
     # Key: part_id
     measure_styles: dict[str, list[MeasureStyleElement]] = field(default_factory=dict)
@@ -205,6 +208,17 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
         layout_map.technical_elements[part_id] = []
         layout_map.instrument_refs[part_id] = []
         layout_map.directions[part_id] = []
+
+        # <score-part>直下のinstrument定義を保存（music21が複数instrumentを1つに統合してしまうため）
+        score_part = root.find(f'.//{{*}}part-list/{{*}}score-part[@id="{part_id}"]')
+        if score_part is not None:
+            instrument_count = len(score_part.findall('{*}score-instrument'))
+            if instrument_count > 1:
+                layout_map.instrument_defs_xml[part_id] = [
+                    ET.tostring(child, encoding='unicode')
+                    for child in score_part
+                    if child.tag.split('}')[-1] in ('score-instrument', 'midi-device', 'midi-instrument')
+                ]
 
         # divisions はパート全体で持ち越す（MusicXML は最初の measure で
         # 1 度だけ宣言されることが多い）
@@ -3040,6 +3054,42 @@ def _restore_instrument_refs(
                         break
 
 
+def _restore_instrument_definitions(
+    root: ET.Element,
+    original_layout_map: LayoutMap,
+) -> None:
+    """<score-part>直下の複数instrument定義を復元する
+
+    Issue #78: music21は1つの<score-part>が複数の<score-instrument>を持つ場合、
+    それらを書き出し時に1つへ統合してしまう。_restore_instrument_refs()が
+    per-note<instrument id="...">を復元しても、参照先の定義が<part-list>から
+    消えていては無効な参照になり、打楽器パートの音高/音色が正しく再生されない。
+    元譜から保存した<score-instrument>/<midi-device>/<midi-instrument>一式を
+    そのままのidで<score-part>に復元する。
+
+    Args:
+        root: XMLルート要素
+        original_layout_map: 元のレイアウト情報（instrument_defs_xmlを含む）
+    """
+    for part_id, defs_xml in original_layout_map.instrument_defs_xml.items():
+        if not defs_xml:
+            continue
+
+        score_part = root.find(f'.//{{*}}part-list/{{*}}score-part[@id="{part_id}"]')
+        if score_part is None:
+            continue
+
+        for child in list(score_part):
+            if child.tag.split('}')[-1] in ('score-instrument', 'midi-device', 'midi-instrument'):
+                score_part.remove(child)
+
+        for xml_str in defs_xml:
+            try:
+                score_part.append(ET.fromstring(xml_str))
+            except ET.ParseError:
+                pass
+
+
 def apply_layout_to_xml(
     output_xml_path: Path,
     original_layout_map: LayoutMap,
@@ -3224,6 +3274,9 @@ def apply_layout_to_xml(
 
     # per-note instrument参照の復元（打楽器パート等、music21が読み込まない）
     _restore_instrument_refs(root, original_layout_map, total_measures)
+
+    # <score-part>の複数instrument定義の復元（music21が1つに統合してしまう）
+    _restore_instrument_definitions(root, original_layout_map)
 
     # 変更後のXMLを書き出し
     if is_mxl:
