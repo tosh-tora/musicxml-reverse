@@ -21,16 +21,43 @@ from layout_preservation import extract_layout_from_xml
 from reverse_score import process_file
 
 
-def _write_score(path: Path, body_xml: str) -> None:
+def _score_instrument_ids(path: Path) -> list[str]:
+    """出力の<score-part>直下にある<score-instrument id>の一覧を返す"""
+    if path.suffix == '.mxl':
+        with zipfile.ZipFile(path, 'r') as z:
+            name = next(n for n in z.namelist()
+                        if n.endswith(('.xml', '.musicxml')) and not n.startswith('META-INF'))
+            root = ET.fromstring(z.read(name))
+    else:
+        root = ET.parse(path).getroot()
+    return [si.get('id') for si in root.findall('.//{*}score-part/{*}score-instrument')]
+
+
+def _write_score(path: Path, body_xml: str, part_list_xml: str | None = None) -> None:
     """<part id="P1">の中身だけを差し替えた最小構成のMusicXMLを書き出す"""
+    if part_list_xml is None:
+        part_list_xml = '<score-part id="P1"><part-name>Test</part-name></score-part>'
     path.write_text(
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<score-partwise version="3.1">\n'
-        '  <part-list><score-part id="P1"><part-name>Test</part-name></score-part></part-list>\n'
+        f'  <part-list>{part_list_xml}</part-list>\n'
         '  <part id="P1">\n' + body_xml + '  </part>\n'
         '</score-partwise>\n',
         encoding='utf-8',
     )
+
+
+# 複数instrumentを持つ<score-part>（威風堂々ラスト-Schellenのpart-listを最小化したもの）
+_MULTI_INSTRUMENT_PART_LIST = (
+    '<score-part id="P1"><part-name>Test</part-name>'
+    '<score-instrument id="P1-IA"><instrument-name>Sound A</instrument-name></score-instrument>'
+    '<score-instrument id="P1-IB"><instrument-name>Sound B</instrument-name></score-instrument>'
+    '<midi-instrument id="P1-IA"><midi-channel>10</midi-channel>'
+    '<midi-unpitched>91</midi-unpitched></midi-instrument>'
+    '<midi-instrument id="P1-IB"><midi-channel>10</midi-channel>'
+    '<midi-unpitched>94</midi-unpitched></midi-instrument>'
+    '</score-part>'
+)
 
 
 def _notes(path: Path):
@@ -119,6 +146,26 @@ class TestInstrumentRefExtraction:
 
         assert layout_map.instrument_refs['P1'] == []
 
+    def test_multi_instrument_score_part_captures_defs(self, tmp_path):
+        """Issue #78: 複数<score-instrument>を持つ<score-part>では定義一式を保存する"""
+        score = tmp_path / 'score.xml'
+        _write_score(score, _TWO_VOICE_MEASURE, part_list_xml=_MULTI_INSTRUMENT_PART_LIST)
+
+        layout_map = extract_layout_from_xml(score)
+
+        defs = layout_map.instrument_defs_xml['P1']
+        assert sum('<score-instrument' in d for d in defs) == 2
+        assert sum('<midi-instrument' in d for d in defs) == 2
+
+    def test_single_instrument_score_part_is_not_captured(self, tmp_path):
+        """instrumentが1つだけの<score-part>は復元対象にしない（music21の出力で十分）"""
+        score = tmp_path / 'score.xml'
+        _write_score(score, _TWO_VOICE_MEASURE)  # デフォルトのpart-list（instrumentなし）
+
+        layout_map = extract_layout_from_xml(score)
+
+        assert 'P1' not in layout_map.instrument_defs_xml
+
 
 class TestInstrumentRefRestoration:
     """反転後の出力へのinstrument参照の復元（voice単位で独立して反転される）"""
@@ -140,6 +187,22 @@ class TestInstrumentRefRestoration:
         assert by_voice[('1', 'F5')] == 'P1-IA'
         # voice2: G4→休符 だったのが 休符→G4 に反転。instrumentはG4に付いたまま。
         assert by_voice[('2', 'G4')] == 'P1-IB'
+
+    def test_score_instrument_definitions_are_preserved(self, tmp_path):
+        """Issue #78: music21が1つに統合してしまう<score-instrument>定義を復元する
+
+        per-note<instrument id>を復元しても、参照先の<score-instrument>が
+        <part-list>から消えていれば無効な参照になり、実際には効果がない。
+        """
+        score = tmp_path / 'score.xml'
+        _write_score(score, _TWO_VOICE_MEASURE, part_list_xml=_MULTI_INSTRUMENT_PART_LIST)
+        output = tmp_path / 'output.xml'
+
+        report = process_file(score, output)
+        assert report.success
+
+        # music21が1つに統合していれば P1-IA/P1-IB は消えている
+        assert set(_score_instrument_ids(output)) == {'P1-IA', 'P1-IB'}
 
 
 class TestIssue78InstrumentRefEndToEnd:
@@ -170,6 +233,17 @@ class TestIssue78InstrumentRefEndToEnd:
         by_voice = {(v, k): inst for v, k, inst in notes[2]}
         assert by_voice[('1', 'F5')] == 'P1-I103'
         assert by_voice[('2', 'G4')] == 'P1-I92'
+
+    def test_glockenspiel_score_instrument_definitions_are_preserved(self, tmp_path):
+        """Issue #78: 元譜が持つ8つのscore-instrument定義が反転後も維持される
+
+        （music21が1つに統合してしまうと、復元したper-note参照が無効になる）
+        """
+        output_file = self._reverse('威風堂々ラスト-Schellen._(Jingles.).mxl', tmp_path)
+
+        assert set(_score_instrument_ids(output_file)) == {
+            'P1-I55', 'P1-I56', 'P1-I87', 'P1-I91', 'P1-I92', 'P1-I94', 'P1-I99', 'P1-I103',
+        }
 
     def test_all_unpitched_notes_have_instrument_restored(self, tmp_path):
         """反転後、元がinstrument参照を持っていた音符は全てinstrumentを持つ"""
