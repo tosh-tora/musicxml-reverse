@@ -917,15 +917,19 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
                         pass  # 修正失敗しても続行
 
                 # タイと連桁は反転する（小節順序が変わるため）
+                # NOTE: Chordの.tieと.durationは各構成音符(element.notes)と
+                # 同一オブジェクトを共有しているため、reverse_ties/reverse_tupletsを
+                # Chord本体と構成音符の両方に適用すると二重に反転され、
+                # 結果的に反転されないまま(元のstart/stopが残る)になってしまう。
+                # そのためタイ・連符はChord本体にのみ適用し、独立したオブジェクトを
+                # 持つBeamsのみ構成音符ごとに個別処理する。
                 for element in iter_notes_including_voices(fallback):
                     reverse_ties(element)
                     reverse_beams(element)
                     reverse_tuplets(element)
                     if hasattr(element, 'notes'):
                         for note in element.notes:
-                            reverse_ties(note)
                             reverse_beams(note)
-                            reverse_tuplets(note)
                 new_part.append(fallback)
                 continue
 
@@ -934,12 +938,12 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
             reverse_ties(element)
             reverse_beams(element)
             reverse_tuplets(element)
-            # 和音内の音符のタイと連桁も処理
+            # 和音内の音符のBeamsも個別処理する
+            # (タイ・連符はChordと構成音符でオブジェクトを共有しているため、
+            #  ここで重ねて反転すると二重反転により元に戻ってしまう。詳細は上記参照)
             if hasattr(element, 'notes'):
                 for note in element.notes:
-                    reverse_ties(note)
                     reverse_beams(note)
-                    reverse_tuplets(note)
 
             # 小節番号を再割り当て
         processed_measure.number = i + 1
