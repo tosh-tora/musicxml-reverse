@@ -4,6 +4,9 @@
 # 個人的なメモ
 prompt.txt
 
+# 作業ファイル(楽譜データは著作権に関わるため追跡しない)
+work/
+
 # Python
 __pycache__/
 *.py[cod]
