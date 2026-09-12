@@ -56,6 +56,20 @@ class TechnicalElement:
 
 
 @dataclass
+class InstrumentRef:
+    """打楽器パート等でのper-note <instrument>参照の保存用（music21が読み込まないもの）
+
+    打楽器パートでは、1つの<part>内で音符ごとに異なる<instrument id="...">を
+    参照することで複数の音高/音色を表現する（MuseScoreのドラムマップ等）。
+    music21はこの参照をパースしないため、反転後に出力XMLへ復元する必要がある。
+    """
+    measure_num: int
+    voice: str  # voice番号（反転はvoiceごとに独立して行われるため）
+    note_index: int  # voice内の音符インデックス
+    instrument_id: str
+
+
+@dataclass
 class DirectionElement:
     """Direction要素の保存用（music21が分割するもの）
 
@@ -96,6 +110,8 @@ class LayoutMap:
     measures: dict[tuple[str, int], MeasureLayout] = field(default_factory=dict)
     # Key: (part_id, measure_number)
     technical_elements: dict[str, list[TechnicalElement]] = field(default_factory=dict)
+    # Key: part_id
+    instrument_refs: dict[str, list[InstrumentRef]] = field(default_factory=dict)
     # Key: part_id
     directions: dict[str, list[DirectionElement]] = field(default_factory=dict)
     # Key: part_id
@@ -187,6 +203,7 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
     for part_idx, part in enumerate(root.findall('.//{*}part')):
         part_id = part.get('id', f'P{part_idx + 1}')
         layout_map.technical_elements[part_id] = []
+        layout_map.instrument_refs[part_id] = []
         layout_map.directions[part_id] = []
 
         # divisions はパート全体で持ち越す（MusicXML は最初の measure で
@@ -219,6 +236,7 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
             current_offset = 0.0
             note_index = 0  # 小節内の音符インデックス
             direction_index = 0  # 小節内のdirection要素のインデックス
+            voice_note_index: dict[str, int] = {}  # voice別の音符インデックス（instrument参照用）
 
             # attributes要素からdivisionsを取得
             for attributes in measure.findall('.//{*}attributes'):
@@ -410,6 +428,29 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
                                     technical_xml=tech_xml
                                 )
                                 layout_map.technical_elements[part_id].append(tech_elem)
+
+                    # per-note instrument参照を保存（打楽器パート等、music21が読み込まない）
+                    # 反転はvoiceごとに独立して行われる（reverse_measure_contents）ため、
+                    # インデックスもvoice単位で数える（chord要素はインデックスを増やさない）
+                    if elem.find('.//{*}chord') is None:
+                        voice_elem = elem.find('{*}voice')
+                        voice_value = voice_elem.text.strip() if voice_elem is not None and voice_elem.text else '1'
+                        voice_note_idx = voice_note_index.get(voice_value, 0)
+
+                        instrument_elem = elem.find('{*}instrument')
+                        if instrument_elem is not None:
+                            inst_id = instrument_elem.get('id')
+                            if inst_id:
+                                layout_map.instrument_refs[part_id].append(
+                                    InstrumentRef(
+                                        measure_num=measure_num,
+                                        voice=voice_value,
+                                        note_index=voice_note_idx,
+                                        instrument_id=inst_id,
+                                    )
+                                )
+
+                        voice_note_index[voice_value] = voice_note_idx + 1
 
                     # オフセット更新
                     duration_elem = elem.find('.//{*}duration')
@@ -2886,6 +2927,119 @@ def _restore_technical_elements(
                 note_index += 1
 
 
+def _insert_instrument_element(note_elem: ET.Element, instrument_id: str) -> None:
+    """<note>にper-note<instrument id="...">を正しいスキーマ順で挿入する
+
+    MusicXMLのnote要素は (pitch|unpitched|rest), duration, tie*, instrument,
+    voice, type, ... の順を取る。<voice>があればその直前、無ければ最後の
+    <tie>（無ければ<duration>）の直後に挿入する。既に<instrument>があれば何もしない。
+    """
+    if note_elem.find('{*}instrument') is not None:
+        return
+
+    new_elem = ET.Element('instrument')
+    new_elem.set('id', instrument_id)
+
+    children = list(note_elem)
+    voice_elem = note_elem.find('{*}voice')
+    if voice_elem is not None:
+        note_elem.insert(children.index(voice_elem), new_elem)
+        return
+
+    insert_idx = len(children)
+    last_tie_idx = None
+    for i, child in enumerate(children):
+        if child.tag.split('}')[-1] == 'tie':
+            last_tie_idx = i
+    if last_tie_idx is not None:
+        insert_idx = last_tie_idx + 1
+    else:
+        duration_elem = note_elem.find('{*}duration')
+        if duration_elem is not None:
+            insert_idx = children.index(duration_elem) + 1
+
+    note_elem.insert(insert_idx, new_elem)
+
+
+def _note_voice(note_elem: ET.Element) -> str:
+    """<note>の<voice>値を返す（無ければデフォルトの'1'）"""
+    voice_elem = note_elem.find('{*}voice')
+    return voice_elem.text.strip() if voice_elem is not None and voice_elem.text else '1'
+
+
+def _restore_instrument_refs(
+    root: ET.Element,
+    original_layout_map: LayoutMap,
+    total_measures: int
+) -> None:
+    """打楽器パート等でmusic21が読み込まなかったper-note<instrument>参照を復元
+
+    Issue #78: 1つの<part>内で音符ごとに異なる<instrument id="...">を参照して
+    複数の音高/音色を表現する打楽器パート（例: グロッケンシュピールの音高を
+    打楽器譜内に記譜する構成）では、music21がこの参照を読み込まないため、
+    反転後に書き出すと全音符が同じ音（デフォルトの音色）になってしまう。
+    元譜から保存した参照を、反転後の音符インデックスに対応付けて復元する。
+
+    Args:
+        root: XMLルート要素
+        original_layout_map: 元のレイアウト情報（instrument_refsを含む）
+        total_measures: 総小節数（反転計算用）
+    """
+    for part_idx, part in enumerate(root.findall('.//{*}part')):
+        part_id = part.get('id', f'P{part_idx + 1}')
+
+        if part_id not in original_layout_map.instrument_refs:
+            continue
+
+        inst_refs = original_layout_map.instrument_refs[part_id]
+        if not inst_refs:
+            continue
+
+        for measure in part.findall('.//{*}measure'):
+            measure_num_str = measure.get('number')
+            if measure_num_str is None:
+                continue
+
+            try:
+                reversed_measure_num = int(measure_num_str)
+            except ValueError:
+                continue
+
+            original_measure_num = total_measures - reversed_measure_num + 1
+
+            matching_refs = [r for r in inst_refs if r.measure_num == original_measure_num]
+            if not matching_refs:
+                continue
+
+            # 反転はvoiceごとに独立して行われる（reverse_measure_contents）ため、
+            # voiceごとにnote_indexを数え、voice内で反転後→元のインデックスを求める
+            notes = [elem for elem in measure if elem.tag.endswith('note') and
+                     elem.find('.//{*}chord') is None]
+            total_notes_by_voice: dict[str, int] = {}
+            for n in notes:
+                v = _note_voice(n)
+                total_notes_by_voice[v] = total_notes_by_voice.get(v, 0) + 1
+
+            voice_note_index: dict[str, int] = {}
+            for elem in measure:
+                if not elem.tag.endswith('note'):
+                    continue
+
+                is_chord = elem.find('.//{*}chord') is not None
+                if is_chord:
+                    continue
+
+                voice_value = _note_voice(elem)
+                idx = voice_note_index.get(voice_value, 0)
+                original_note_index = total_notes_by_voice[voice_value] - 1 - idx
+                voice_note_index[voice_value] = idx + 1
+
+                for ref in matching_refs:
+                    if ref.voice == voice_value and ref.note_index == original_note_index:
+                        _insert_instrument_element(elem, ref.instrument_id)
+                        break
+
+
 def apply_layout_to_xml(
     output_xml_path: Path,
     original_layout_map: LayoutMap,
@@ -3067,6 +3221,9 @@ def apply_layout_to_xml(
 
     # technical要素の復元（music21が読み込まなかった要素）
     _restore_technical_elements(root, original_layout_map, total_measures)
+
+    # per-note instrument参照の復元（打楽器パート等、music21が読み込まない）
+    _restore_instrument_refs(root, original_layout_map, total_measures)
 
     # 変更後のXMLを書き出し
     if is_mxl:
