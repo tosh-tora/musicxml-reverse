@@ -649,13 +649,42 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
     spanner_info = []
     measure_based_spanners = []  # RepeatBracket等の小節ベースSpanner
 
-    for sp in part.spannerBundle:
-        spanned_elements_original = list(sp.getSpannedElements())
-        # Allow single-element spanners for dynamics wedges
-        if len(spanned_elements_original) < 2:
-            if not isinstance(sp, (dynamics.Crescendo, dynamics.Diminuendo)):
+    # Grand staff（PartStaff）の楽器では、music21がSlur等のSpannerを
+    # 実際の所属Staffとは異なる方のPartStaffのspannerBundleにまとめて
+    # 格納することがある。そのままpart.spannerBundleだけを見ると、
+    # もう一方のStaffに属するSpannerを取りこぼしてしまう。
+    # そのため、同じStaffGroupに属する他のPartStaffのspannerBundleも
+    # 候補に加える（後続の音符位置マッチングで実際の所属パートに絞り込む）。
+    # Score全体まで対象を広げると、無関係な別楽器の同一形状のフレーズに
+    # 誤マッチする恐れがあるため、対象は同じStaffGroup内のPartStaffに限定する。
+    spanner_source = list(part.spannerBundle)
+    score_context = part.activeSite if isinstance(part.activeSite, stream.Score) else None
+    if score_context is not None and isinstance(part, stream.PartStaff):
+        seen_ids = set(id(sp) for sp in spanner_source)
+        for staff_group in score_context.getElementsByClass(layout.StaffGroup):
+            if not any(p is part for p in staff_group):
                 continue
-            # For dynamics with < 2 elements, skip if no elements at all
+            for sibling in staff_group:
+                if sibling is part:
+                    continue
+                for sp in sibling.spannerBundle:
+                    if id(sp) not in seen_ids:
+                        spanner_source.append(sp)
+                        seen_ids.add(id(sp))
+
+    for sp in spanner_source:
+        # StaffGroup等、Part/PartStaff自体をつなぐSpannerはここでは扱わない
+        # （reverse_score()側でStaffGroupとして別途複製される）
+        if isinstance(sp, layout.StaffGroup):
+            continue
+
+        spanned_elements_original = list(sp.getSpannedElements())
+        # Allow single-element spanners for dynamics wedges and trill extensions
+        # (1音の持続音上に描かれるwavy-lineは開始・終了とも同じ1音にしか付かない)
+        if len(spanned_elements_original) < 2:
+            if not isinstance(sp, (dynamics.Crescendo, dynamics.Diminuendo, expressions.TrillExtension)):
+                continue
+            # 要素が1つもない場合はスキップ
             if len(spanned_elements_original) == 0:
                 continue
 
@@ -677,56 +706,72 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
             # まず、要素が属する小節をgetContextByClassで特定
             containing_measure = elem.getContextByClass(stream.Measure)
             if containing_measure is not None:
-                # 特定の小節のみを検索（誤マッチング防止）
-                target_measures = [m for m in measures if m.number == containing_measure.number]
+                # 自パートの小節かどうかをオブジェクト同一性で厳密に判定する
+                # (同じStaffGroup内の他のPartStaffのSpannerも候補に含めているため、
+                #  小節番号だけで照合すると、他パートの同じ番号の小節にある
+                #  別の音符へ誤って結び付いてしまう恐れがある)
+                if any(m is containing_measure for m in measures):
+                    target_measures = [containing_measure]
+                else:
+                    target_measures = []  # 自パートの小節ではない
             else:
                 # フォールバック：全小節を検索（従来の動作）
                 target_measures = measures
 
             for measure in target_measures:
-                measure_notes = list(measure.notesAndRests)
-                for note_idx, note in enumerate(measure_notes):
-                    # プロパティで一致を判定
-                    offset_match = abs(elem.offset - note.offset) < 0.0001
-                    duration_match = abs(elem.duration.quarterLength - note.duration.quarterLength) < 0.0001
+                # 小節直下のnotesAndRestsと、各Voice内のnotesAndRestsを個別のグループとして候補にする
+                # (Divisi等でVoiceを持つ小節では、直下のnotesAndRestsだけでは
+                #  Voice内の音符に付いたSpanner（スラー等）を見失う)
+                note_groups = [(None, list(measure.notesAndRests))]
+                for voice in measure.voices:
+                    note_groups.append((voice.id, list(voice.notesAndRests)))
 
-                    pitch_match = False
-                    if elem.isRest and note.isRest:
-                        pitch_match = True
-                    elif hasattr(elem, 'pitches') and hasattr(note, 'pitches'):
-                        # Chord: compare all pitches
-                        elem_pitches = sorted(p.nameWithOctave for p in elem.pitches)
-                        note_pitches = sorted(p.nameWithOctave for p in note.pitches)
-                        pitch_match = (elem_pitches == note_pitches)
-                    elif hasattr(elem, 'pitch') and hasattr(note, 'pitch'):
-                        pitch_match = (str(elem.pitch) == str(note.pitch))
-                    elif not elem.isRest and not note.isRest:
-                        # Both are notes but neither has pitch (unpitched percussion)
-                        # Match by grace status instead
-                        pitch_match = (elem.duration.isGrace == note.duration.isGrace)
+                for voice_id, measure_notes in note_groups:
+                    for note_idx, note in enumerate(measure_notes):
+                        # プロパティで一致を判定
+                        offset_match = abs(elem.offset - note.offset) < 0.0001
+                        duration_match = abs(elem.duration.quarterLength - note.duration.quarterLength) < 0.0001
 
-                    if offset_match and duration_match and pitch_match:
-                        # 単音符と和音の両方に対応
-                        if hasattr(note, 'pitches'):
-                            pitch_name = None  # Chordの場合はpitchはNone
-                            pitches_list = sorted(p.nameWithOctave for p in note.pitches)
-                        elif hasattr(note, 'pitch'):
-                            pitch_name = str(note.pitch)
-                            pitches_list = None
-                        else:
-                            pitch_name = None
-                            pitches_list = None
-                        note_positions.append({
-                            'measure_num': measure.number,
-                            'offset': note.offset,
-                            'duration': note.duration.quarterLength,
-                            'pitch': pitch_name,
-                            'pitches': pitches_list,  # 和音用
-                            'is_rest': note.isRest,
-                            'is_grace': note.duration.isGrace,  # Grace note flag for matching
-                            'note_index': note_idx
-                        })
-                        found = True
+                        pitch_match = False
+                        if elem.isRest and note.isRest:
+                            pitch_match = True
+                        elif hasattr(elem, 'pitches') and hasattr(note, 'pitches'):
+                            # Chord: compare all pitches
+                            elem_pitches = sorted(p.nameWithOctave for p in elem.pitches)
+                            note_pitches = sorted(p.nameWithOctave for p in note.pitches)
+                            pitch_match = (elem_pitches == note_pitches)
+                        elif hasattr(elem, 'pitch') and hasattr(note, 'pitch'):
+                            pitch_match = (str(elem.pitch) == str(note.pitch))
+                        elif not elem.isRest and not note.isRest:
+                            # Both are notes but neither has pitch (unpitched percussion)
+                            # Match by grace status instead
+                            pitch_match = (elem.duration.isGrace == note.duration.isGrace)
+
+                        if offset_match and duration_match and pitch_match:
+                            # 単音符と和音の両方に対応
+                            if hasattr(note, 'pitches'):
+                                pitch_name = None  # Chordの場合はpitchはNone
+                                pitches_list = sorted(p.nameWithOctave for p in note.pitches)
+                            elif hasattr(note, 'pitch'):
+                                pitch_name = str(note.pitch)
+                                pitches_list = None
+                            else:
+                                pitch_name = None
+                                pitches_list = None
+                            note_positions.append({
+                                'measure_num': measure.number,
+                                'offset': note.offset,
+                                'duration': note.duration.quarterLength,
+                                'pitch': pitch_name,
+                                'pitches': pitches_list,  # 和音用
+                                'is_rest': note.isRest,
+                                'is_grace': note.duration.isGrace,  # Grace note flag for matching
+                                'note_index': note_idx,
+                                'voice_id': voice_id,  # Voice内の音符ならそのid、小節直下ならNone
+                            })
+                            found = True
+                            break
+                    if found:
                         break
                 if found:
                     break
@@ -872,15 +917,19 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
                         pass  # 修正失敗しても続行
 
                 # タイと連桁は反転する（小節順序が変わるため）
+                # NOTE: Chordの.tieと.durationは各構成音符(element.notes)と
+                # 同一オブジェクトを共有しているため、reverse_ties/reverse_tupletsを
+                # Chord本体と構成音符の両方に適用すると二重に反転され、
+                # 結果的に反転されないまま(元のstart/stopが残る)になってしまう。
+                # そのためタイ・連符はChord本体にのみ適用し、独立したオブジェクトを
+                # 持つBeamsのみ構成音符ごとに個別処理する。
                 for element in iter_notes_including_voices(fallback):
                     reverse_ties(element)
                     reverse_beams(element)
                     reverse_tuplets(element)
                     if hasattr(element, 'notes'):
                         for note in element.notes:
-                            reverse_ties(note)
                             reverse_beams(note)
-                            reverse_tuplets(note)
                 new_part.append(fallback)
                 continue
 
@@ -889,12 +938,12 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
             reverse_ties(element)
             reverse_beams(element)
             reverse_tuplets(element)
-            # 和音内の音符のタイと連桁も処理
+            # 和音内の音符のBeamsも個別処理する
+            # (タイ・連符はChordと構成音符でオブジェクトを共有しているため、
+            #  ここで重ねて反転すると二重反転により元に戻ってしまう。詳細は上記参照)
             if hasattr(element, 'notes'):
                 for note in element.notes:
-                    reverse_ties(note)
                     reverse_beams(note)
-                    reverse_tuplets(note)
 
             # 小節番号を再割り当て
         processed_measure.number = i + 1
@@ -930,8 +979,15 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
 
                     # 元の小節内のインデックスから、反転後のインデックスを計算
                     # 反転により、notesAndRestsリストも逆順になるため
+                    # Voice内の音符だった場合は、同じVoice（idで対応付け）のnotesAndRestsを
+                    # 参照する（各Voiceは独立した時間軸として個別に反転されるため）
                     original_note_index = pos.get('note_index')
-                    notes_list = list(new_measure.notesAndRests)
+                    pos_voice_id = pos.get('voice_id')
+                    if pos_voice_id is not None:
+                        target_voice = next((v for v in new_measure.voices if v.id == pos_voice_id), None)
+                        notes_list = list(target_voice.notesAndRests) if target_voice is not None else []
+                    else:
+                        notes_list = list(new_measure.notesAndRests)
 
                     # note_indexが記録されている場合は、それを使って一意に識別
                     # SKIP for unpitched percussion (pitch is None) because grace note grouping changes indices
@@ -951,9 +1007,13 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
                                 pass
                             else:
                                 # オフセットとピッチの最終確認（sanity check）
-                                # For grace notes, use looser offset matching since they now share offset with main note
-                                offset_tolerance = 0.5 if pos.get('is_grace', False) else 0.01
-                                offset_match = abs(new_elem.offset - reversed_offset) < offset_tolerance
+                                # Grace noteは主音符と同じオフセットを共有し、その主音符自体の
+                                # 反転後オフセットは「小節長 - offset - duration」という単純計算では
+                                # 求まらないため、offsetでの照合は行わずgrace状態とピッチのみで判定する
+                                if pos.get('is_grace', False):
+                                    offset_match = True
+                                else:
+                                    offset_match = abs(new_elem.offset - reversed_offset) < 0.01
                                 # 和音と単音符の両方に対応
                                 pitch_match = False
                                 if pos['is_rest'] and new_elem.isRest:
@@ -987,9 +1047,12 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
                                     break
                             else:
                                 # Pitched note or rest: use offset matching
-                                # Looser offset matching for grace notes
-                                offset_tolerance = 0.5 if pos.get('is_grace', False) else 0.01
-                                offset_match = abs(new_elem.offset - reversed_offset) < offset_tolerance
+                                # Grace note:主音符と同じオフセットを共有し、その主音符の反転後
+                                # オフセットは単純計算では求まらないためoffsetでは照合しない
+                                if pos.get('is_grace', False):
+                                    offset_match = True
+                                else:
+                                    offset_match = abs(new_elem.offset - reversed_offset) < 0.01
                                 if offset_match:
                                     # ピッチまたは休符かをチェック（和音対応）
                                     if pos['is_rest'] and new_elem.isRest:
@@ -1008,7 +1071,7 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
 
         # すべての音符が見つかった場合のみSpannerを作成
         # ダイナミクスは1要素でもOK、それ以外は2要素以上必要
-        min_elements = 1 if issubclass(sp_info['type'], (dynamics.Crescendo, dynamics.Diminuendo)) else 2
+        min_elements = 1 if issubclass(sp_info['type'], (dynamics.Crescendo, dynamics.Diminuendo, expressions.TrillExtension)) else 2
 
         if len(new_spanned_elements) == len(sp_info['positions']) and len(new_spanned_elements) >= min_elements:
             # IMPORTANT: Spannerは時系列順(小節番号→オフセット順)に要素を持つ必要がある
@@ -1016,9 +1079,8 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
             new_spanned_elements_sorted = sorted(
                 new_spanned_elements,
                 key=lambda elem: (
-                    # 要素が属する小節番号を取得
-                    next((m.number for m in new_part.getElementsByClass(stream.Measure)
-                          if elem in m.notesAndRests), 0),
+                    # 要素が属する小節番号を取得（Voice内の音符にも対応）
+                    getattr(elem.getContextByClass(stream.Measure), 'number', 0),
                     # 小節内のオフセット
                     elem.offset
                 )
