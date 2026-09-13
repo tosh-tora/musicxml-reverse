@@ -70,6 +70,11 @@ class InstrumentRef:
     offset_quarters: float = 0.0  # 小節内の開始オフセット（持ち替えラベルの検出用）
 
 
+# 演奏順序のジャンプを指定する <sound> の属性
+NAVIGATION_SOUND_ATTRIBUTES = ('dacapo', 'dalsegno', 'tocoda', 'fine', 'segno', 'coda',
+                               'forward-repeat')
+
+
 @dataclass
 class DirectionElement:
     """Direction要素の保存用（music21が分割するもの）
@@ -91,6 +96,8 @@ class DirectionElement:
     staff: Optional[str] = None  # staff子要素の値（複数譜パートでの所属譜）
     sound_pizzicato: Optional[str] = None  # sound要素のpizzicato属性（'yes'/'no'）
     has_metronome: bool = False  # direction-type に metronome を持つか
+    sound_navigation: tuple[str, ...] = ()  # sound が持つジャンプ指定の属性名（dacapo 等）
+    has_segno_coda: bool = False  # direction-type に segno / coda の記号を持つか
 
 
 @dataclass
@@ -319,6 +326,14 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
                     words = elem.find('.//{*}direction-type/{*}words')
                     rehearsal = elem.find('.//{*}direction-type/{*}rehearsal')
                     metronome = elem.find('.//{*}direction-type/{*}metronome')
+                    sound_navigation = tuple(
+                        attr for attr in NAVIGATION_SOUND_ATTRIBUTES
+                        if sound is not None and sound.get(attr) is not None
+                    )
+                    has_segno_coda = any(
+                        elem.find('.//{*}direction-type/{*}' + tag) is not None
+                        for tag in ('segno', 'coda')
+                    )
 
                     has_sound = sound is not None
                     has_words = words is not None
@@ -359,6 +374,8 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
                         staff=staff_value,
                         sound_pizzicato=sound_pizzicato,
                         has_metronome=metronome is not None,
+                        sound_navigation=sound_navigation,
+                        has_segno_coda=has_segno_coda,
                     )
                     layout_map.directions[part_id].append(direction_elem)
                     direction_index += 1
@@ -1733,6 +1750,31 @@ def _swap_metric_modulation(metronome: ET.Element) -> None:
         metronome.append(child)
 
 
+def _separate_navigation_directions(
+    dir_elems: list['DirectionElement']
+) -> tuple[list['DirectionElement'], list['DirectionElement']]:
+    """D.C. / D.S. / To Coda / segno / coda 等の演奏順序の指示と、それ以外に分離する。
+
+    時間反転後の演奏順序は、曲頭以外から始まる・先に前方へ飛んでから戻る等、標準記譜で
+    表せないことが多い。記号と文字は境界として鏡像位置に置き、再生用のジャンプ指定は
+    削除する（Issue #74）。To Coda 等は words + sound を持つため、テンポ判定より前に分離する。
+    """
+    navigation: list[DirectionElement] = []
+    others: list[DirectionElement] = []
+    for d in dir_elems:
+        (navigation if d.sound_navigation or d.has_segno_coda else others).append(d)
+    return navigation, others
+
+
+def _remove_navigation_sound(direction: ET.Element) -> None:
+    """<sound> からジャンプ指定を削除し、意味のある指定が残らなければ <sound> ごと削除する"""
+    for sound in list(direction.findall('{*}sound')):
+        for attr in NAVIGATION_SOUND_ATTRIBUTES:
+            sound.attrib.pop(attr, None)
+        if set(sound.attrib) <= {'time-only'} and len(sound) == 0:
+            direction.remove(sound)
+
+
 def _replace_words_text(direction: ET.Element, text: str) -> None:
     """direction の words を text 1つにまとめる（分割された words は先頭以外を削除）"""
     words_elems = [e for e in direction.iter() if e.tag.split('}')[-1] == 'words']
@@ -2123,11 +2165,15 @@ def restore_direction_elements(
         # 4. ダイナミクス → 有効範囲ベースで反転 + 括弧付きマーカー
         # 5. 打楽器の持ち替えラベル → 区間の先頭へ移す
         # 6. その他 (テキスト等) → 単純な位置反転
+        # 7. 設定 (harp-pedals 等) → 区間の先頭へ移す
+        # 8. メトリック・モジュレーション → 境界として鏡像位置、左右の音価を入れ替え
+        # 9. 演奏順序 (D.C. / D.S. / segno 等) → 境界として鏡像位置、ジャンプ指定は削除
         #
-        # 奏法状態は words + sound を持つためテンポ判定より前に分離する
+        # 奏法状態や To Coda は words + sound を持つためテンポ判定より前に分離する
         # （テンポとして誤分類されるだけでなく、テンポの有効範囲境界も汚染するため）
         all_directions = original_layout_map.directions[part_id]
         spanner_pairs, non_pair_dirs = _separate_spanner_pairs(all_directions)
+        navigation_directions, non_pair_dirs = _separate_navigation_directions(non_pair_dirs)
         state_marking_directions, non_state_dirs = _separate_state_marking_directions(non_pair_dirs)
         setting_directions, non_state_dirs = _separate_setting_directions(non_state_dirs)
         metric_modulations, non_state_dirs = _separate_metric_modulations(non_state_dirs)
@@ -2388,6 +2434,23 @@ def restore_direction_elements(
             metronome = _metric_modulation_metronome(restored_direction)
             if metronome is not None:
                 _swap_metric_modulation(metronome)
+            _insert_direction_at_offset(
+                measure_map[measure_num], restored_direction, offset, part_divisions
+            )
+
+        # 10. 演奏順序の指示は境界として鏡像位置に置き、再生用のジャンプ指定は削除する
+        for dir_elem in navigation_directions:
+            measure_num, offset = _mirror_boundary_position(dir_elem, total_measures)
+            if measure_num not in measure_map:
+                continue
+
+            try:
+                restored_direction = ET.fromstring(dir_elem.direction_xml)
+            except ET.ParseError:
+                continue
+            _strip_words_x_attributes(restored_direction)
+            _strip_dynamics_x_attributes(restored_direction)
+            _remove_navigation_sound(restored_direction)
             _insert_direction_at_offset(
                 measure_map[measure_num], restored_direction, offset, part_divisions
             )

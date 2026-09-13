@@ -1239,3 +1239,88 @@ class TestIssue74StatefulDirections:
                                     for c in e])
                        for m, offset, e, _d in metronomes if e.find('{*}per-minute') is None]
         assert modulations == [(6, 0.0, ['beat-unit:eighth', 'beat-unit-dot', 'beat-unit:quarter'])]
+
+
+def _words_positions(events) -> list[tuple[int, float, str]]:
+    return [(m, offset, e.text) for m, offset, e, _d in _elements(events, 'words')]
+
+
+class TestIssue74SoundNavigation:
+    """Issue #74: D.C. / D.S. / To Coda 等は保守的に扱う（境界に置き、ジャンプ指定は削除する）"""
+
+    TOTAL = 10
+
+    def _navigation_score(self, path: Path) -> None:
+        """Allegro@m1 / To Coda@m4 / Più mosso@m7（テンポはどちらも words + sound）"""
+        _write_direction_score(path, self.TOTAL, {
+            1: [(0, _dir(_dt('<words>Allegro</words>'), sound='<sound tempo="120"/>'))],
+            4: [(0, _dir(_dt('<words>To Coda</words>'), sound='<sound tocoda="coda"/>'))],
+            7: [(0, _dir(_dt('<words>Più mosso</words>'), sound='<sound tempo="140"/>'))],
+        })
+
+    def test_to_coda_does_not_contaminate_tempo_ranges(self, tmp_path):
+        """To Coda（words + sound）をテンポに数えない
+
+        Allegro の区間 m1–6 は反転後 m5–10、Più mosso の区間 m7–10 は m1–4。
+        To Coda をテンポに数えると Allegro の区間が m1–3 に縮み、反転後 m8 に来てしまう。
+        """
+        score = tmp_path / 'score.xml'
+        self._navigation_score(score)
+
+        words = _words_positions(_reverse_directions(score, self.TOTAL))
+
+        assert (5, 0.0, 'Allegro') in words, words
+        assert (1, 0.0, 'Più mosso') in words, words
+
+    def test_to_coda_is_placed_at_mirrored_boundary_without_jump(self, tmp_path):
+        """To Coda は境界（m3|m4 → 反転後 m7|m8）に置き、再生用の tocoda 指定は削除する"""
+        score = tmp_path / 'score.xml'
+        self._navigation_score(score)
+
+        events = _reverse_directions(score, self.TOTAL)
+        to_coda = [(m, offset, d) for m, offset, e, d in _elements(events, 'words')
+                   if e.text == 'To Coda']
+
+        assert [(m, offset) for m, offset, _d in to_coda] == [(8, 0.0)]
+        assert to_coda[0][2].find('{*}sound') is None
+
+    def test_segno_symbol_and_da_capo_positions(self, tmp_path):
+        """境界 b（小節 b の頭）は反転後 total - b + 2 の頭に置く。記号と文字は残す
+
+        segno@m2頭（b=2）→ m10頭、Fine@m5末（b=6）→ m6頭、D.C.@m10末（b=11）→ m1頭
+        """
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            2: [(0, _dir(_dt('<segno/>'), sound='<sound segno="s1"/>'))],
+            5: [(2, _dir(_dt('<words>Fine</words>'), sound='<sound fine="yes"/>'))],
+            10: [(2, _dir(_dt('<words>D.C. al Fine</words>'), sound='<sound dacapo="yes"/>'))],
+        })
+
+        events = _reverse_directions(score, self.TOTAL)
+
+        assert [(m, offset) for m, offset, _e, _d in _elements(events, 'segno')] == [(10, 0.0)]
+        assert sorted(_words_positions(events)) == [(1, 0.0, 'D.C. al Fine'), (6, 0.0, 'Fine')]
+        assert _elements(events, 'sound') == []
+
+    def test_other_sound_attributes_are_kept(self, tmp_path):
+        """ジャンプ以外の sound 属性（dynamics 等）は残す"""
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            3: [(0, _dir(_dt('<words>D.S.</words>'), sound='<sound dalsegno="s1" dynamics="80"/>'))],
+        })
+
+        sounds = [e.attrib for _m, _o, e, _d
+                  in _elements(_reverse_directions(score, self.TOTAL), 'sound')]
+
+        assert sounds == [{'dynamics': '80'}]
+
+    def test_report_warns_that_jumps_were_removed(self, tmp_path):
+        """ジャンプ指定を削除したことを処理レポートに警告として出す"""
+        score = tmp_path / 'score.xml'
+        self._navigation_score(score)
+
+        report = process_file(score, tmp_path / 'score_rev.xml')
+
+        assert report.success
+        warnings = [i for i in report.issues if not i.skipped and 'D.C./D.S.' in i.error_message]
+        assert [(w.part_name, w.measure_number) for w in warnings] == [('P1', 4)]
