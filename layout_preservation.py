@@ -90,6 +90,7 @@ class DirectionElement:
     has_rehearsal: bool = False  # rehearsal（練習番号）子要素を持つか
     staff: Optional[str] = None  # staff子要素の値（複数譜パートでの所属譜）
     sound_pizzicato: Optional[str] = None  # sound要素のpizzicato属性（'yes'/'no'）
+    has_metronome: bool = False  # direction-type に metronome を持つか
 
 
 @dataclass
@@ -317,6 +318,7 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
                     sound = elem.find('.//{*}sound')
                     words = elem.find('.//{*}direction-type/{*}words')
                     rehearsal = elem.find('.//{*}direction-type/{*}rehearsal')
+                    metronome = elem.find('.//{*}direction-type/{*}metronome')
 
                     has_sound = sound is not None
                     has_words = words is not None
@@ -356,6 +358,7 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
                         has_rehearsal=has_rehearsal,
                         staff=staff_value,
                         sound_pizzicato=sound_pizzicato,
+                        has_metronome=metronome is not None,
                     )
                     layout_map.directions[part_id].append(direction_elem)
                     direction_index += 1
@@ -1157,6 +1160,8 @@ class StateMarkingGroup:
     state_to_text: dict[str, str]  # 状態名 → 合成用テキスト
     sound_attribute: Optional[str] = None  # 状態を表す <sound> の属性名
     state_to_sound_value: dict[str, str] = field(default_factory=dict)
+    element_tag: Optional[str] = None  # 状態を記号で表す direction-type の要素名
+    state_to_element_type: dict[str, str] = field(default_factory=dict)
     cancel_text_overrides: dict[str, str] = field(default_factory=dict)
     # 打ち消しマーカーを合成する際の表記の上書き（キー: 打ち消される状態名）
 
@@ -1216,6 +1221,8 @@ STATE_MARKING_GROUPS = (
             'ohne dämpfer': 'open',
         },
         state_to_text={'muted': 'con sord.', 'open': 'senza sord.'},
+        element_tag='string-mute',
+        state_to_element_type={'muted': 'on', 'open': 'off'},
     ),
     # 弓の位置・奏法: sul pont. / sul tasto / col legno ↔ ord.
     StateMarkingGroup(
@@ -1271,13 +1278,25 @@ def _direction_words_variants(dir_elem: 'DirectionElement') -> list[str]:
     return [v for v in variants if v and not (v in seen or seen.add(v))]
 
 
+def _state_element(direction: ET.Element, group: StateMarkingGroup) -> Optional[ET.Element]:
+    """direction から group の状態を表す記号要素（<string-mute> 等）を探す"""
+    if group.element_tag is None:
+        return None
+    for direction_type in direction.findall('{*}direction-type'):
+        for child in direction_type:
+            if child.tag.split('}')[-1] == group.element_tag:
+                return child
+    return None
+
+
 def _get_state_marking(
     dir_elem: 'DirectionElement'
 ) -> Optional[tuple[StateMarkingGroup, str]]:
     """direction が状態指示ならその (グループ, 状態名) を返す。それ以外は None。
 
     グループが sound 属性を持つ場合はそれを優先し（楽譜ソフトによっては
-    arco に sound 属性が付かないため）、無ければ words テキストで判定する。
+    arco に sound 属性が付かないため）、次に記号（<string-mute type="on"> 等）、
+    無ければ words テキストで判定する。
     """
     # <sound> 属性による判定（現状は pizzicato のみ）
     if dir_elem.sound_pizzicato is not None:
@@ -1286,6 +1305,19 @@ def _get_state_marking(
                 continue
             for state, value in group.state_to_sound_value.items():
                 if value == dir_elem.sound_pizzicato:
+                    return group, state
+
+    try:
+        root = ET.fromstring(dir_elem.direction_xml)
+    except ET.ParseError:
+        root = None
+    if root is not None:
+        for group in STATE_MARKING_GROUPS:
+            element = _state_element(root, group)
+            if element is None:
+                continue
+            for state, element_type in group.state_to_element_type.items():
+                if element.get('type') == element_type:
                     return group, state
 
     variants = _direction_words_variants(dir_elem)
@@ -1340,6 +1372,17 @@ def _mirror_direction_position(
     return measure_num, max(0.0, offset)
 
 
+def _mirror_boundary_position(
+    dir_elem: 'DirectionElement',
+    total_measures: int,
+) -> tuple[int, float]:
+    """境界に置かれた記号の反転後位置。曲頭の境界は曲末（最終小節の末尾）に対応する"""
+    measure_num, offset = _mirror_direction_position(dir_elem, total_measures)
+    if measure_num > total_measures:
+        return total_measures, dir_elem.measure_duration_quarters
+    return measure_num, offset
+
+
 @dataclass
 class StateMarker:
     """反転後に配置する状態マーカー"""
@@ -1350,6 +1393,7 @@ class StateMarker:
     offset_quarters: float
     template: Optional['DirectionElement'] = None
     replaces: Optional[str] = None  # このマーカーが打ち消す直前の状態
+    replaced_template: Optional['DirectionElement'] = None  # 打ち消される状態の元 direction
 
 
 def _calculate_reversed_state_markers(
@@ -1447,6 +1491,8 @@ def _calculate_reversed_state_markers(
                 offset_quarters=offset,
                 template=template,
                 replaces=replaced_state,
+                replaced_template=(scope_templates.get(replaced_state)
+                                   or global_templates.get((group_name, replaced_state))),
             ))
 
         # 元譜で状態を変えていなかった指示（既に有効な状態の再掲）は、
@@ -1586,6 +1632,121 @@ def _calculate_reversed_instrument_change_labels(
     return result
 
 
+SETTING_DIRECTION_TAGS = frozenset({'harp-pedals', 'scordatura', 'accordion-registration'})
+
+
+def _setting_tag(dir_elem: 'DirectionElement') -> Optional[str]:
+    """direction が設定（harp-pedals 等）ならその要素名を返す"""
+    try:
+        root = ET.fromstring(dir_elem.direction_xml)
+    except ET.ParseError:
+        return None
+    for direction_type in root.findall('{*}direction-type'):
+        for child in direction_type:
+            tag = child.tag.split('}')[-1]
+            if tag in SETTING_DIRECTION_TAGS:
+                return tag
+    return None
+
+
+def _separate_setting_directions(
+    dir_elems: list['DirectionElement']
+) -> tuple[list['DirectionElement'], list['DirectionElement']]:
+    """direction リストから harp-pedals / scordatura / accordion-registration と、それ以外に分離する。
+
+    いずれも「次の同種の指示まで有効」な設定だが、既定状態が無いので打ち消しは合成できない。
+    打楽器の持ち替えラベルと同じく、区間の先頭（次の指示の鏡像位置）へ移す（Issue #74）。
+    """
+    settings: list[DirectionElement] = []
+    others: list[DirectionElement] = []
+    for d in dir_elems:
+        (settings if _setting_tag(d) is not None else others).append(d)
+    return settings, others
+
+
+def _calculate_reversed_setting_directions(
+    settings: list['DirectionElement'],
+    total_measures: int,
+) -> list[tuple['DirectionElement', int, float]]:
+    """設定の反転後位置を (要素名, staff) ごとに独立した区間列として算出する"""
+    by_scope: dict[tuple[Optional[str], Optional[str]], list[DirectionElement]] = {}
+    for d in settings:
+        by_scope.setdefault((_setting_tag(d), d.staff), []).append(d)
+
+    result: list[tuple[DirectionElement, int, float]] = []
+    for dirs in by_scope.values():
+        result.extend(_calculate_reversed_instrument_change_labels(dirs, total_measures))
+    return result
+
+
+def _metric_modulation_metronome(direction: ET.Element) -> Optional[ET.Element]:
+    """♩ = ♪. のように2つの音価を結ぶ metronome（メトリック・モジュレーション）を返す"""
+    for metronome in direction.iter():
+        if metronome.tag.split('}')[-1] != 'metronome':
+            continue
+        tags = [child.tag.split('}')[-1] for child in metronome]
+        if tags.count('beat-unit') >= 2 or 'metronome-relation' in tags:
+            return metronome
+    return None
+
+
+def _separate_metric_modulations(
+    dir_elems: list['DirectionElement']
+) -> tuple[list['DirectionElement'], list['DirectionElement']]:
+    """メトリック・モジュレーションを分離する。
+
+    テンポのような「次の指示まで有効」な範囲ではなく、前後のテンポを結ぶ境界なので、
+    テンポ判定より前に分離して境界として鏡像位置に置く。
+    """
+    modulations: list[DirectionElement] = []
+    others: list[DirectionElement] = []
+    for d in dir_elems:
+        is_modulation = False
+        if d.has_metronome:
+            try:
+                is_modulation = _metric_modulation_metronome(ET.fromstring(d.direction_xml)) is not None
+            except ET.ParseError:
+                pass
+        (modulations if is_modulation else others).append(d)
+    return modulations, others
+
+
+def _swap_metric_modulation(metronome: ET.Element) -> None:
+    """メトリック・モジュレーションの左右を入れ替える（時間反転で前後のテンポが逆になる）"""
+    children = list(metronome)
+    tags = [child.tag.split('}')[-1] for child in children]
+    if 'metronome-relation' in tags:
+        split = tags.index('metronome-relation')
+        first_note = next((i for i, t in enumerate(tags) if t == 'metronome-note'), split)
+        prefix, left = children[:first_note], children[first_note:split]
+        relation, right = [children[split]], children[split + 1:]
+    else:
+        starts = [i for i, t in enumerate(tags) if t == 'beat-unit']
+        if len(starts) != 2:
+            return
+        prefix, left = children[:starts[0]], children[starts[0]:starts[1]]
+        relation, right = [], children[starts[1]:]
+
+    for child in children:
+        metronome.remove(child)
+    for child in prefix + right + relation + left:
+        metronome.append(child)
+
+
+def _replace_words_text(direction: ET.Element, text: str) -> None:
+    """direction の words を text 1つにまとめる（分割された words は先頭以外を削除）"""
+    words_elems = [e for e in direction.iter() if e.tag.split('}')[-1] == 'words']
+    if not words_elems:
+        return
+    words_elems[0].text = text
+    for direction_type in direction.findall('{*}direction-type'):
+        for child in list(direction_type):
+            if any(child is w for w in words_elems[1:]):
+                direction_type.remove(child)
+        if len(direction_type) == 0:
+            direction.remove(direction_type)
+
+
 def _strip_words_x_attributes(direction_root: ET.Element) -> None:
     """direction / words から default-x/relative-x を除去する。
 
@@ -1612,9 +1773,24 @@ def _build_state_marking_direction(marker: 'StateMarker') -> Optional[ET.Element
     """
     group, state = marker.group, marker.state
 
-    if marker.template is not None:
+    if state == group.default_state and marker.replaces is not None:
+        words_text = group.cancel_text(marker.replaces)
+    else:
+        words_text = group.state_to_text.get(state)
+
+    template, template_is_other_state = marker.template, False
+    if template is None and marker.replaced_template is not None:
+        # 記号（string-mute 等）で書かれた指示の打ち消しは、words ではなく同じ記号で合成する
         try:
-            direction = ET.fromstring(marker.template.direction_xml)
+            replaced = ET.fromstring(marker.replaced_template.direction_xml)
+        except ET.ParseError:
+            replaced = None
+        if replaced is not None and _state_element(replaced, group) is not None:
+            template, template_is_other_state = marker.replaced_template, True
+
+    if template is not None:
+        try:
+            direction = ET.fromstring(template.direction_xml)
         except ET.ParseError:
             direction = None
         if direction is not None:
@@ -1622,12 +1798,13 @@ def _build_state_marking_direction(marker: 'StateMarker') -> Optional[ET.Element
             _strip_dynamics_x_attributes(direction)
             _set_direction_staff(direction, marker.staff)
             _set_direction_state_sound(direction, group, state)
+            element = _state_element(direction, group)
+            if element is not None and state in group.state_to_element_type:
+                element.set('type', group.state_to_element_type[state])
+            if template_is_other_state and words_text is not None:
+                _replace_words_text(direction, words_text)
             return direction
 
-    if state == group.default_state and marker.replaces is not None:
-        words_text = group.cancel_text(marker.replaces)
-    else:
-        words_text = group.state_to_text.get(state)
     if words_text is None:
         return None
 
@@ -1822,9 +1999,10 @@ def _create_parenthesized_dynamics_direction(
 def _is_tempo_direction(dir_elem: DirectionElement) -> bool:
     """direction要素がテンポ関連かどうかを判定する
 
-    sound子要素を持つwordsはテンポ指示と判断する。
+    sound子要素を持つwords、または metronome を持つ direction はテンポ指示と判断する。
+    メトリック・モジュレーションは範囲ではなく境界なので、呼び出し前に分離しておく。
     """
-    return dir_elem.has_sound and dir_elem.has_words
+    return (dir_elem.has_sound and dir_elem.has_words) or dir_elem.has_metronome
 
 
 def _calculate_reversed_tempo_directions(
@@ -1951,6 +2129,8 @@ def restore_direction_elements(
         all_directions = original_layout_map.directions[part_id]
         spanner_pairs, non_pair_dirs = _separate_spanner_pairs(all_directions)
         state_marking_directions, non_state_dirs = _separate_state_marking_directions(non_pair_dirs)
+        setting_directions, non_state_dirs = _separate_setting_directions(non_state_dirs)
+        metric_modulations, non_state_dirs = _separate_metric_modulations(non_state_dirs)
         instrument_change_labels, non_state_dirs = _separate_instrument_change_labels(
             non_state_dirs, original_layout_map.instrument_refs.get(part_id, [])
         )
@@ -2170,6 +2350,44 @@ def restore_direction_elements(
                 continue
             _strip_words_x_attributes(restored_direction)
             _strip_dynamics_x_attributes(restored_direction)
+            _insert_direction_at_offset(
+                measure_map[measure_num], restored_direction, offset, part_divisions
+            )
+
+        # 8. 設定（harp-pedals / scordatura / accordion-registration）を区間の先頭に移して挿入
+        reversed_settings = _calculate_reversed_setting_directions(
+            setting_directions, total_measures
+        )
+
+        for dir_elem, measure_num, offset in reversed_settings:
+            if measure_num not in measure_map:
+                continue
+
+            try:
+                restored_direction = ET.fromstring(dir_elem.direction_xml)
+            except ET.ParseError:
+                continue
+            _strip_words_x_attributes(restored_direction)
+            _strip_dynamics_x_attributes(restored_direction)
+            _insert_direction_at_offset(
+                measure_map[measure_num], restored_direction, offset, part_divisions
+            )
+
+        # 9. メトリック・モジュレーションは境界として鏡像位置に置き、左右の音価を入れ替える
+        for dir_elem in metric_modulations:
+            measure_num, offset = _mirror_boundary_position(dir_elem, total_measures)
+            if measure_num not in measure_map:
+                continue
+
+            try:
+                restored_direction = ET.fromstring(dir_elem.direction_xml)
+            except ET.ParseError:
+                continue
+            _strip_words_x_attributes(restored_direction)
+            _strip_dynamics_x_attributes(restored_direction)
+            metronome = _metric_modulation_metronome(restored_direction)
+            if metronome is not None:
+                _swap_metric_modulation(metronome)
             _insert_direction_at_offset(
                 measure_map[measure_num], restored_direction, offset, part_divisions
             )
