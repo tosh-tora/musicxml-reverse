@@ -1836,6 +1836,27 @@ def write_with_part_fallback(score: stream.Score, output_path: Path, report: Pro
         return False
 
 
+def suppress_midi_channel_warning() -> None:
+    """music21 の「MIDI チャンネル不足」警告を表示しないようにする
+
+    MIDI の 16 チャンネルを使い切るほどパートが多いスコアを書き出すと、music21 は <midi-channel> を
+    振り直せず "we are out of midi channels! help!" を stderr に直接出す。
+    重複したチャンネルのまま書き出されるだけで、元の楽譜でも重複しているため
+    利用者が対処すべき問題ではない。他の警告はそのまま表示する。
+    """
+    from music21.musicxml import m21ToXml
+
+    env = m21ToXml.environLocal
+    original_warn = env.warn
+
+    def warn(msg, header=None):
+        if 'out of midi channels' in str(msg):
+            return
+        original_warn(msg, header)
+
+    env.warn = warn
+
+
 def main():
     """メイン処理"""
     import argparse
@@ -1847,6 +1868,7 @@ def main():
 
     error_handling = (ErrorHandling.SKIP_MEASURE_CONTENT if args.skip_measure_content
                       else ErrorHandling.SKIP_PART)
+    suppress_midi_channel_warning()
 
     inbox = Path("work/inbox")
     outbox = Path("work/outbox")

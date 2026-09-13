@@ -1,5 +1,33 @@
 # TODO
 
+## Issue #94: 実行ログを簡素化し、処理ステップを README に記載する
+
+- [x] `process_file()` の Phase 開始/完了行・パート数の出力を削除
+- [x] 音符数を `音符数: 入力 → 出力` の 1 行に集約（不一致時の警告は維持）
+- [x] Phase 3 の例外メッセージを「XML後処理に失敗しました」に修正
+- [x] README に「処理の流れ」「実行時の出力」を追加し、古い「3段階処理」の記述を削除
+- [x] music21 の「out of midi channels」警告を非表示にする
+
+### レビュー
+
+ユーザーに必要なのは成否・出力先・警告のみで、各ステップの内容は README で読めれば十分という方針。
+`layout_preservation.py` 側の詳細出力は既に `verbose=False` で抑制されているため変更していない。
+
+`WARNING: we are out of midi channels! help!` は総譜（24パート）の書き出し時に music21 が
+`<midi-channel>` を振り直せず出すもの。重複チャンネルのまま書き出されるだけで、元の総譜でも
+チャンネルは重複している（反転で変わるのは元で重複していた `1, 2` が `9, 12` になる 1 か所のみ）。
+ユーザー判断で元の `<midi-instrument>` の復元はせず、警告の非表示だけにした。
+music21 は `sys.stderr` へ直接書くため、`m21ToXml.environLocal.warn` を包んでこのメッセージだけ捨てる。
+
+### 検証
+
+- `python -m pytest tests/` → 162 passed, 19 skipped
+- `python reverse_score.py` → 26/26 ファイル成功、警告なし。ログは 506 行 → 107 行（進捗行の削除に加え、music21 の midi channel 警告 9 行も消えた）
+- 変更前（master）と変更後の outbox 26 ファイルを展開後 XML で比較 → 差分 0 件
+  （`encoding-date` と、music21 が実行ごとにランダム生成する `score-instrument` / `midi-instrument` の id は除外）
+
+---
+
 ## Issue #92: CLAUDE.md を本プロジェクト向けに作り直す
 
 - [x] 旧 CLAUDE.md の別プロジェクト由来の記述を洗い出す（`uv run abap-review`, `npm test`, `main` ブランチ等）
@@ -358,22 +386,3 @@ m22 は 1拍目の ♮ を残して 2拍目の C♯ に ♯ を追加。
 - `python reverse_score.py` → 27/27 ファイル成功、警告なし
 - 生成した27ファイル全小節を独立の検証関数で走査 → 臨時記号の不整合 0 件
   （Harp/Organ の複数譜、Percussion の unpitched を含む）
-
-## Issue #94: 実行ログを簡素化し、処理ステップを README に記載する
-
-- [x] `process_file()` の Phase 開始/完了行・パート数の出力を削除
-- [x] 音符数を `音符数: 入力 → 出力` の 1 行に集約（不一致時の警告は維持）
-- [x] Phase 3 の例外メッセージを「XML後処理に失敗しました」に修正
-- [x] README に「処理の流れ」「実行時の出力」を追加し、古い「3段階処理」の記述を削除
-
-### レビュー
-
-ユーザーに必要なのは成否・出力先・警告のみで、各ステップの内容は README で読めれば十分という方針。
-`layout_preservation.py` 側の詳細出力は既に `verbose=False` で抑制されているため変更していない。
-
-### 検証
-
-- `python -m pytest tests/` → 162 passed, 19 skipped
-- `python reverse_score.py` → 26/26 ファイル成功、警告なし。ログは 506 行 → 107 行（うち 9 行は music21 自身の midi channel 警告で変更前から出ている）
-- 変更前（master）と変更後の outbox 26 ファイルを展開後 XML で比較 → 差分 0 件
-  （`encoding-date` と、music21 が実行ごとにランダム生成する `score-instrument` / `midi-instrument` の id は除外）
