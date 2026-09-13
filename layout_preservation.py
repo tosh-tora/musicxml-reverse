@@ -830,6 +830,29 @@ def _is_transitional_tempo_text(text: str) -> bool:
     return any(pattern in text_lower for pattern in TRANSITIONAL_TEMPO_PATTERNS)
 
 
+# 終端が不明な状態語のパターン
+# 「次の指示まで有効」だが元譜に終端の構造的手がかりが無く、有効範囲を計算できない
+# （sound子要素も無いため _is_tempo_direction の対象にもならない）。
+# 反転時は有効方向が逆になるため、経過的テンポと同様に単純位置反転 + ←記号を付与する
+UNCLEAR_END_WORD_PATTERNS = [
+    'sostenuto', 'sost.',
+    'simile', 'sim.',
+    'ad lib.', 'ad libitum',
+    'dolce', 'cantabile', 'espressivo',
+    'marcato', 'legato',
+    'sempre', 'poco a poco',
+    'con moto', 'agitato', 'tranquillo', 'grazioso', 'leggiero',
+]
+
+
+def _is_unclear_end_word(text: str) -> bool:
+    """終端不明の状態語かどうかを判定する"""
+    if not text:
+        return False
+    text_lower = text.lower()
+    return any(pattern in text_lower for pattern in UNCLEAR_END_WORD_PATTERNS)
+
+
 # テキスト形式の強弱変化指示 (cresc./decresc.) の反転マッピング
 # 時間反転に伴い crescendo ↔ decrescendo をフリップする
 _DYNAMICS_TEXT_FLIP_MAP = {
@@ -2192,6 +2215,8 @@ def restore_direction_elements(
 
     テンポ関連direction要素（sound+wordsを持つもの）は有効範囲ベースで反転し、
     経過的テンポ（rit., accel.等）のwordsテキストには←記号を付与する。
+    sound を持たない終端不明の状態語（sostenuto, simile, ad lib.等）も同様に
+    単純位置反転 + ←記号を付与する（"6. その他" のカテゴリで処理）。
 
     ダイナミクス（強弱記号）も有効範囲ベースで反転し、元の開始位置には
     括弧付きの強弱記号（例: (ff)）を配置する。臨時のダイナミクス（sfz等）は
@@ -2242,6 +2267,7 @@ def restore_direction_elements(
         # 4. ダイナミクス → 有効範囲ベースで反転 + 括弧付きマーカー
         # 5. 打楽器の持ち替えラベル → 区間の先頭へ移す
         # 6. その他 (テキスト等) → 単純な位置反転
+        #    終端不明の状態語 (sostenuto/simile/ad lib.等) は←記号を付与
         # 7. 設定 (harp-pedals 等) → 区間の先頭へ移す
         # 8. メトリック・モジュレーション → 境界として鏡像位置、左右の音価を入れ替え
         # 9. 演奏順序 (D.C. / D.S. / segno 等) → 境界として鏡像位置、ジャンプ指定は削除
@@ -2405,6 +2431,13 @@ def restore_direction_elements(
                         words_elem.text = _flip_dynamics_text(words_elem.text)
                     _insert_into_measure(target_measure, restored_direction)
                 else:
+                    # 終端不明の状態語（sostenuto/simile/ad lib. 等）に←記号を付与する
+                    if dir_elem.words_text and _is_unclear_end_word(dir_elem.words_text):
+                        words_elem = restored_direction.find('.//{*}direction-type/{*}words')
+                        if (words_elem is not None and words_elem.text
+                                and not words_elem.text.startswith('←')):
+                            words_elem.text = '←' + words_elem.text
+
                     target_offset = _compute_reversed_insert_offset(
                         target_measure,
                         dir_elem.offset_quarters,
