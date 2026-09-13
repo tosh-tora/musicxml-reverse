@@ -1587,7 +1587,6 @@ def process_file(input_path: Path, output_path: Path,
 
     try:
         # ========== Phase 1: レイアウト抽出 ==========
-        print(f"  [Phase 1] レイアウト情報を抽出中...")
         from layout_preservation import extract_layout_from_xml
         try:
             original_layout = extract_layout_from_xml(input_path)
@@ -1629,14 +1628,12 @@ def process_file(input_path: Path, output_path: Path,
 
         report.input_note_count = count_notes(score)
         report.part_count = len(score.parts)
-        print(f"  入力音符数: {report.input_note_count}")
-        print(f"  パート数: {report.part_count}")
 
         # 反転処理
         reversed_score = reverse_score(score, report)
 
         report.output_note_count = count_notes(reversed_score)
-        print(f"  出力音符数: {report.output_note_count}")
+        print(f"  音符数: {report.input_note_count} → {report.output_note_count}")
 
         if report.input_note_count != report.output_note_count:
             print(f"  警告: 音符数が一致しません！")
@@ -1651,7 +1648,6 @@ def process_file(input_path: Path, output_path: Path,
             # ========== Phase 3: XML後処理 ==========
             try:
                 # direction要素を元のXMLから復元（music21分割バグ対策）
-                print(f"  [Phase 3] direction要素を復元中...")
                 from layout_preservation import (restore_direction_elements,
                                                  normalize_slur_numbers,
                                                  recalculate_accidentals,
@@ -1659,40 +1655,29 @@ def process_file(input_path: Path, output_path: Path,
                                                  strip_horizontal_layout_hints)
                 total_measures = len(list(reversed_score.parts[0].getElementsByClass('Measure')))
                 restore_direction_elements(output_path, original_layout, total_measures)
-                print(f"  [Phase 3] direction要素の復元完了")
 
                 # スラーのnumber属性を正規化
-                print(f"  [Phase 3] スラー番号を正規化中...")
                 normalize_slur_numbers(output_path, verbose=False)
-                print(f"  [Phase 3] スラー番号の正規化完了")
 
                 # 臨時記号を有効範囲から再計算（反転で小節内の音順が変わるため）
-                print(f"  [Phase 3] 臨時記号を再計算中...")
                 recalculate_accidentals(output_path, verbose=False)
-                print(f"  [Phase 3] 臨時記号の再計算完了")
 
                 # 複数小節休符・繰り返し記号を反転後の位置に置き直す
-                print(f"  [Phase 3] 複数小節休符・繰り返し記号を再配置中...")
                 restore_measure_styles(output_path, original_layout, total_measures)
-                print(f"  [Phase 3] 複数小節休符・繰り返し記号の再配置完了")
 
                 # 反転で無効になる水平位置情報を除去（direction 復元より後に実行する）
-                print(f"  [Phase 3] 水平位置情報を除去中...")
                 strip_horizontal_layout_hints(output_path, verbose=False)
-                print(f"  [Phase 3] 水平位置情報の除去完了")
             except Exception as restore_error:
-                print(f"  警告: direction要素の復元に失敗しました: {restore_error}")
+                print(f"  警告: XML後処理に失敗しました: {restore_error}")
                 import traceback
                 traceback.print_exc()
 
             # ========== Phase 4: レイアウト復元 ==========
             if layout_extraction_success and original_layout is not None:
-                print(f"  [Phase 4] レイアウト情報を復元中...")
                 from layout_preservation import apply_layout_to_xml
                 try:
                     apply_layout_to_xml(output_path, original_layout, total_measures,
                                         original_title=original_title)
-                    print(f"  [Phase 4] レイアウト復元完了")
                 except Exception as layout_apply_error:
                     print(f"  警告: レイアウト復元に失敗しました: {layout_apply_error}")
                     # レイアウト適用失敗は警告のみ（反転処理自体は成功）
