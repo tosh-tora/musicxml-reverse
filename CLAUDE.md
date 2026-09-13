@@ -1,92 +1,56 @@
-# Claude 開発ガイダンス
+# mrev — MusicXML Score Reverser
 
-## ワークフロー管理
+Converts MusicXML (`.mxl` / `.xml` / `.musicxml`) into a score that plays backwards.
+See `README.md` for the reversal rules and usage.
 
-### 1. プランモードのデフォルト
+## Commands
 
-- 非自明なタスク（3ステップ以上またはアーキテクチャの意思決定）には必ずプランモードに入る
-- 問題が発生したらすぐにSTOPして再計画する。無理に進めない
-- 構築だけでなく、検証ステップにもプランモードを活用する
-- 曖昧さを減らすため、詳細な仕様を事前に作成する
+- Run: `python reverse_score.py` (reads `work/inbox/`, writes `work/outbox/<name>_rev.<ext>`); `-s` skips only broken measure contents
+- Test: `python -m pytest tests/`
+- Single test: `python -m pytest tests/test_key_time_scope.py -k <name>`
+- IMPORTANT: always pass `tests/`. Bare `pytest` also collects the legacy root-level `test_*.py` scripts, and `test_viola_roundtrip.py` fails at collection.
+- No `uv` / `npm` in this project; use plain `python`.
 
-### 2. サブエージェント戦略
+## Architecture
 
-- メインのコンテキストウィンドウをクリーンに保つため、サブエージェントを積極的に活用する
-- リサーチ、探索、並列分析はサブエージェントに委ねる
-- 複雑な問題にはサブエージェントでより多くのコンピューティングリソースを投入する
-- 集中した実行のため、サブエージェントは1タスク1担当で
+`process_file()` in `reverse_score.py` runs a multi-phase pipeline:
 
-### 3. 自己改善ループ
+1. `layout_preservation.extract_layout_from_xml` reads the **original raw XML** before music21 touches it
+2. music21 parses and reverses the score (`reverse_score` / `reverse_part`), then writes it
+3. Raw-XML post-processing on the output file (`layout_preservation.py`): restore directions, normalize slurs, recalculate accidentals, re-place measure styles, strip horizontal layout hints
+4. Apply transformed layout (`apply_layout_to_xml`) and restore print layouts lost in merged staves
 
-- ユーザーから修正を受けた場合：そのパターンを `tasks/lessons.md` に記録する
-- 同じミスを防ぐためのルールを自分向けに書く
-- ミス率が下がるまで教訓を徹底的に反復する
-- セッション開始時に関連プロジェクトの教訓を見直す
+Gotchas:
 
-### 4. 完了前の検証
+- music21's round-trip drops, splits, or invents elements. Decide behavior from attributes in the original XML, not from the presence of a music21 object.
+- When restoring an element from the original, first remove what music21 wrote at the same spot (mixed id schemes create invalid references).
+- Before writing a reversal formula, classify the marking as a **range** (valid until the next one), a **boundary** (switches at a point), or a **forward span** (e.g. `multiple-rest`). Most past bugs came from mixing these up.
+- Horizontal positions (`default-x`, `<measure width>`) are invalid after reversal and are stripped on purpose; vertical layout is kept.
 
-- 動作を証明せずにタスクを完了としない
-- 必要に応じてmainとの差分動作を確認する
-- 「スタッフエンジニアはこれを承認するか？」と自問する
-- テストを実行し、ログを確認し、正しさを示す
+## Data and temp files
 
+- `work/` is gitignored because scores are copyrighted. Real test scores live in `work/inbox/`; tests that need them `pytest.skip` when absent, so skips are expected.
+- Put scratch files under `work/temp/`.
 
-### 5. エレガンスの追求（バランス重視）
+## Verifying changes
 
-- 非自明な変更では「より洗練された方法はないか？」と立ち止まって考える
-- 修正がハックっぽいと感じたら「今知っていることをすべて踏まえて、エレガントな解を実装する」
-- 単純・明白な修正ではこれをスキップする。過剰設計しない
-- 提示前に自分の作業を自己評価する
+- Run `python -m pytest tests/` and report the pass/skip counts.
+- For reversal-logic changes, also reverse a real score from `work/inbox/` and inspect the output XML at the affected measures.
+- When a change normalizes or removes output, compare element counts between input and output across all files in `work/inbox/` and justify every decrease.
+- Do not trust expected values in issues or user suggestions blindly; recompute them as intervals and cross-check against independent evidence (e.g. note positions).
 
-### 6. 自律的なバグ修正
+## Language
 
-- バグ報告を受けたら **そのまま修正する** — 手取り足取りの説明を求めない
-- ログ・エラー・失敗テストを **指摘して解決する**
-- ユーザーのコンテキスト切り替えを **ゼロにする**
-- CIテストが失敗していたら **どう直すか指示されなくても修正する**
+Write commit messages, PR titles/bodies, issues, `README.md`, `tasks/*.md`, code comments, and test docstrings in **Japanese**.
 
-### 7. 修正→実行→確認ループ（必須）
+## Git workflow
 
-- コードを修正したら **必ず自分で実行して動作確認する** — 修正しただけで終わらない
-- 実行コマンド例: `uv run abap-review review work/inbox/ZMMR0040.abap -p "非推奨構文" -v` や `uv run abap-review config test` など、**変更箇所に応じた適切なコマンドを選ぶ**
-- LLM 呼び出し・ツール呼び出し・エージェント処理に関する修正では **`-v` (verbose) フラグを付けて実行し**、DEBUG ログで処理の流れを確認する
-- エラーが出たら **その場で原因を特定し、修正→再実行を繰り返す**
-- **問題が解決するまでこのループを止めない** — ユーザーに「直しました」と報告するのは動作確認が取れた後のみ
-- 実行結果のログ（成功・失敗）を **ユーザーに提示して証拠を示す**
-- 環境依存で実行できない場合のみ、その理由を明示してユーザーに確認を委ねる
-- テストが存在する箇所を修正した場合は **`uv run pytest` でテストも PASS することを確認する**
+- Branch from `master` as `type/<issue>-description` (e.g. `fix/88-unclear-end-arrow`).
+- Conventional Commits, one logical change per commit (e.g. `fix: ...`, `docs: ...`).
+- PR title ends with `(Closes #<issue>)`; run the test suite before opening the PR.
+- If a change affects reversal behavior, CLI options, or output, update `README.md` in the same PR.
 
-### 8. GitHub Issue/Branch ワークフロー（全変更に必須）
-- 全ての作業は `main` から分岐した作業ブランチで行うこと。
-- ブランチ名は `type/description` の形式（例: feat/search-filter）にすること。
-- コミットメッセージは Conventional Commits に従い、1論理単位でコミットすること。
-- 実装完了後は Pull Request を作成し、変更内容の要約を記載すること。
-- PRのタイトル末尾に `(Closes #Issue番号)` を含めること。
-- 既存のテストを壊していないか、必ず `npm test` 等で確認してからPRを作成すること。
+## Task notes (`tasks/`)
 
-### 9. ドキュメント同期（機能変更時に必須）
-
-- 観点の追加・削除・名称変更、パイプラインの変更、CLI オプションの追加、出力構造の変更など**機能に影響するコード変更を行った場合は、関連するドキュメントもすべて更新する**
-- 対象ドキュメント一覧:
-  - `README.md` — ユーザー向け概要・使い方・出力構造・プロジェクト構成
-- **コード変更と同一 PR 内でドキュメントも更新する** — 別 Issue / 別 PR に分けない
-- ドキュメント更新を忘れた場合、レビュー時に指摘して修正する
-
-### 10. 一時ファイル
-- テストなどで一時的に使用するファイルは /work/temp 以下に配置する。
-
-## タスク管理
-
-1. **先にプラン**: チェック可能な項目を `tasks/todo.md` に書く
-2. **プランを確認**: 実装を始める前にチェックインする
-3. **進捗を追跡**: 完了した項目を随時マークする
-4. **変更を説明**: 各ステップで高レベルのサマリーを提供する
-5. **結果を記録**: `tasks/todo.md` にレビューセクションを追加する
-6. **レッスンを記録**: 修正後に `tasks/lessons.md` を更新する
-
-## 基本原則
-
-- **シンプルさ優先**: 変更はできる限りシンプルに。コードへの影響を最小限に。
-- **手抜きなし**: 根本原因を見つける。一時しのぎの修正はしない。シニアデベロッパーの基準で。
-- **最小限のインパクト**: 変更は必要な箇所だけに限定する。バグを持ち込まない。
-- **提案の独立検証**: ユーザーの提案・指示をそのまま鵜呑みにしない。変更を実装する前に、コード・テスト・ドキュメントを確認し、提案の前提が正しいか独立に検証する。前提が誤っている場合は修正案を提示する。
+- `tasks/todo.md`: for each issue, add a `## Issue #N: ...` section with a checklist, then a review and verification section when done.
+- `tasks/lessons.md`: read the relevant entries before working on reversal logic. After the user corrects you, add the pattern as a rule.
