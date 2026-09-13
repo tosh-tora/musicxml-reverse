@@ -920,6 +920,7 @@ class TestIssue73InstrumentChangeLabels:
         assert labels == []
         assert others == dirs
 
+
 # ---------------------------------------------------------------------------
 # Issue #74: 最小構成の楽譜で direction の反転を検証するヘルパー
 # ---------------------------------------------------------------------------
@@ -1124,3 +1125,117 @@ class TestIssue74SpannerPairs:
 
         assert divides == [(8, 'up')]
 
+
+def _harp_pedals(d_alter: int) -> str:
+    return (f'<harp-pedals><pedal-tuning><pedal-step>D</pedal-step>'
+            f'<pedal-alter>{d_alter}</pedal-alter></pedal-tuning></harp-pedals>')
+
+
+def _metronome(per_minute: int) -> str:
+    return (f'<metronome><beat-unit>quarter</beat-unit>'
+            f'<per-minute>{per_minute}</per-minute></metronome>')
+
+
+class TestIssue74StatefulDirections:
+    """Issue #74: 次の指示まで有効な記号（string-mute / harp-pedals / metronome）の有効範囲反転"""
+
+    TOTAL = 10
+
+    def test_string_mute_region_is_reversed_with_synthesized_off(self, tmp_path):
+        """string-mute on@m3 の区間 m3〜曲末は、反転後 m1〜m8。解除の off を m9 に合成する"""
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            3: [(0, _dir(_dt('<string-mute type="on"/>')))],
+        })
+
+        events = _reverse_directions(score, self.TOTAL)
+        mutes = [(m, offset, e.get('type')) for m, offset, e, _d in _elements(events, 'string-mute')]
+
+        assert mutes == [(1, 0.0, 'on'), (9, 0.0, 'off')]
+        assert _elements(events, 'words') == [], "記号で書かれた指示に words を合成しない"
+
+    def test_string_mute_on_off_are_not_swapped(self, tmp_path):
+        """on@m3頭 → off@m5 2拍目 は、反転後 on@m6 2拍目 → off@m9頭"""
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            3: [(0, _dir(_dt('<string-mute type="on"/>')))],
+            5: [(1, _dir(_dt('<string-mute type="off"/>')))],
+        })
+
+        mutes = [(m, offset, e.get('type')) for m, offset, e, _d
+                 in _elements(_reverse_directions(score, self.TOTAL), 'string-mute')]
+
+        assert mutes == [(6, 1.0, 'on'), (9, 0.0, 'off')]
+
+    def test_harp_pedals_move_to_region_start(self, tmp_path):
+        """harp-pedals A@m3 / B@m7 の区間 m3–6 / m7–10 は、反転後 m5–8 / m1–4
+
+        設定は区間の先頭に移る。最初の指示より前の区間（m1–2 → 反転後 m9–10）は
+        設定が分からないので何も出さない。
+        """
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            3: [(0, _dir(_dt(_harp_pedals(0))))],
+            7: [(0, _dir(_dt(_harp_pedals(1))))],
+        })
+
+        pedals = [(m, offset, e.findtext('.//{*}pedal-alter')) for m, offset, e, _d
+                  in _elements(_reverse_directions(score, self.TOTAL), 'harp-pedals')]
+
+        assert pedals == [(1, 0.0, '1'), (5, 0.0, '0')]
+
+    def test_scordatura_and_accordion_registration_are_settings(self):
+        """scordatura / accordion-registration も設定として分離される"""
+        from layout_preservation import _separate_setting_directions
+
+        scordatura = _play_state_direction(2, 0.0, None, '', None)
+        scordatura.direction_xml = _dir(_dt(
+            '<scordatura><accord string="6"><tuning-step>D</tuning-step>'
+            '<tuning-octave>2</tuning-octave></accord></scordatura>'))
+        accordion = _play_state_direction(4, 0.0, None, '', None)
+        accordion.direction_xml = _dir(_dt('<accordion-registration><accordion-high/>'
+                                           '</accordion-registration>'))
+        words = _play_state_direction(5, 0.0, None, 'espressivo', None)
+
+        settings, others = _separate_setting_directions([scordatura, accordion, words])
+
+        assert settings == [scordatura, accordion]
+        assert others == [words]
+
+    def test_metronome_only_tempo_is_range_reversed(self, tmp_path):
+        """words を持たない metronome も words のテンポと同じく有効範囲で反転する
+
+        ♩=120@m1（区間 m1–5）/ ♩=80@m6（区間 m6–10）→ 反転後 ♩=80@m1 / ♩=120@m6
+        """
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            1: [(0, _dir(_dt(_metronome(120)), sound='<sound tempo="120"/>'))],
+            6: [(0, _dir(_dt(_metronome(80)), sound='<sound tempo="80"/>'))],
+        })
+
+        tempos = [(m, e.findtext('{*}per-minute')) for m, _offset, e, _d
+                  in _elements(_reverse_directions(score, self.TOTAL), 'metronome')]
+
+        assert tempos == [(1, '80'), (6, '120')]
+
+    def test_metric_modulation_is_a_boundary_with_swapped_units(self, tmp_path):
+        """メトリック・モジュレーション（♩ = ♪.）は境界として鏡像位置に置き、左右を入れ替える
+
+        元 m6 頭（m5|m6 の境界）→ 反転後 m5|m6 の境界 = m6 頭。テンポの境界にはならないので
+        m1 の ♩=120（全曲が有効範囲）は反転後も m1 に来る。
+        """
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            1: [(0, _dir(_dt(_metronome(120)), sound='<sound tempo="120"/>'))],
+            6: [(0, _dir(_dt('<metronome><beat-unit>quarter</beat-unit>'
+                             '<beat-unit>eighth</beat-unit><beat-unit-dot/></metronome>')))],
+        })
+
+        metronomes = _elements(_reverse_directions(score, self.TOTAL), 'metronome')
+
+        assert [(m, e.findtext('{*}per-minute')) for m, _o, e, _d in metronomes
+                if e.find('{*}per-minute') is not None] == [(1, '120')]
+        modulations = [(m, offset, [c.tag.split('}')[-1] + (':' + c.text if c.text else '')
+                                    for c in e])
+                       for m, offset, e, _d in metronomes if e.find('{*}per-minute') is None]
+        assert modulations == [(6, 0.0, ['beat-unit:eighth', 'beat-unit-dot', 'beat-unit:quarter'])]
