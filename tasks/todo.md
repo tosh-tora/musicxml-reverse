@@ -1,5 +1,21 @@
 # TODO
 
+## Issue #92: CLAUDE.md を本プロジェクト向けに作り直す
+
+- [x] 旧 CLAUDE.md の別プロジェクト由来の記述を洗い出す（`uv run abap-review`, `npm test`, `main` ブランチ等）
+- [x] 公式ガイドライン（memory / best-practices）に沿って英語で書き直す（200行未満、コードから推測できない事実のみ）
+- [x] 実コマンドの動作確認（`python -m pytest tests/`、単一テスト指定）
+
+### レビュー
+
+成果物の言語は日本語のまま、`tasks/` は運用継続・参照のみ（@import しない）、汎用ルールは削る方針をユーザーに確認して決定。
+`lessons.md` のうち全作業に効く落とし穴（範囲/境界/前方向スパン、music21 往復の扱い）だけを Architecture に要約した。
+引数なしの `pytest` はルート直下の旧スクリプト `test_viola_roundtrip.py` の収集エラーで止まるため、`tests/` 指定を明記した。
+
+### 検証
+
+- `python -m pytest tests/` → 162 passed, 19 skipped
+
 ## Issue #88: 終端が不明な指示（sostenuto・simile 等）の反転に←を付与する
 
 - [x] 対象語彙の列挙（実コーパスで確認済み: sostenuto, simile, ad lib. + ユーザー判断で
