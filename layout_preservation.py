@@ -3009,6 +3009,17 @@ def _restore_instrument_refs(
         if not inst_refs:
             continue
 
+        # Issue #84: music21 はパート内に Instrument が2つ以上あると（曲の途中で
+        # <transpose> が変わると Instrument を複製する）、全音符に自前の id で
+        # <instrument> を付けて書き出す。
+        # その id は復元する元譜の <score-instrument> 定義に存在せず、残っていると
+        # _insert_instrument_element() が元の参照を書き込めないため、先に取り除く。
+        for note_elem in part.iter():
+            if note_elem.tag.split('}')[-1] != 'note':
+                continue
+            for existing in note_elem.findall('{*}instrument'):
+                note_elem.remove(existing)
+
         for measure in part.findall('.//{*}measure'):
             measure_num_str = measure.get('number')
             if measure_num_str is None:
