@@ -1647,7 +1647,7 @@ def process_file(input_path: Path, output_path: Path,
                 from layout_preservation import (restore_direction_elements,
                                                  normalize_slur_numbers,
                                                  recalculate_accidentals,
-                                                 restore_multiple_rests,
+                                                 restore_measure_styles,
                                                  strip_horizontal_layout_hints)
                 total_measures = len(list(reversed_score.parts[0].getElementsByClass('Measure')))
                 restore_direction_elements(output_path, original_layout, total_measures)
@@ -1663,10 +1663,10 @@ def process_file(input_path: Path, output_path: Path,
                 recalculate_accidentals(output_path, verbose=False)
                 print(f"  [Phase 3] 臨時記号の再計算完了")
 
-                # 複数小節休符を反転後のブロック先頭に置き直す
-                print(f"  [Phase 3] 複数小節休符を再配置中...")
-                restore_multiple_rests(output_path, original_layout, total_measures)
-                print(f"  [Phase 3] 複数小節休符の再配置完了")
+                # 複数小節休符・繰り返し記号を反転後の位置に置き直す
+                print(f"  [Phase 3] 複数小節休符・繰り返し記号を再配置中...")
+                restore_measure_styles(output_path, original_layout, total_measures)
+                print(f"  [Phase 3] 複数小節休符・繰り返し記号の再配置完了")
 
                 # 反転で無効になる水平位置情報を除去（direction 復元より後に実行する）
                 print(f"  [Phase 3] 水平位置情報を除去中...")

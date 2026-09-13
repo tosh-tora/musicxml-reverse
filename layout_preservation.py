@@ -113,6 +113,27 @@ class MeasureStyleElement:
     measure_style_xml: str  # measure-style要素全体のXML文字列
 
 
+# start / stop で区間を表す measure-style の子要素
+MEASURE_STYLE_RANGE_KINDS = ('measure-repeat', 'beat-repeat', 'slash')
+
+
+@dataclass
+class MeasureStyleRange:
+    """小節・拍の繰り返し記号とスラッシュ記譜（measure-repeat / beat-repeat / slash）の保存用
+
+    いずれも start と stop で区間を表し、stop は「表示が終わった最初の小節（拍）」に置かれる。
+    繰り返される実音はファイルに書かれているので、反転では記号だけを付け直す（Issue #74）。
+    """
+    kind: str  # MEASURE_STYLE_RANGE_KINDS のいずれか
+    number: Optional[str]  # measure-style の number 属性（譜の番号）
+    start_measure: int
+    start_time: float  # パート先頭からの時間（四分音符単位）
+    start_xml: str  # start 要素だけを持つ measure-style の XML 文字列
+    stop_measure: Optional[int] = None  # stop が無ければ曲末まで
+    stop_time: Optional[float] = None
+    stop_xml: Optional[str] = None
+
+
 @dataclass
 class LayoutMap:
     """スコア全体のレイアウト情報"""
@@ -129,9 +150,50 @@ class LayoutMap:
     # Key: part_id
     measure_styles: dict[str, list[MeasureStyleElement]] = field(default_factory=dict)
     # Key: part_id
+    measure_style_ranges: dict[str, list[MeasureStyleRange]] = field(default_factory=dict)
+    # Key: part_id
     defaults_xml: Optional[str] = None  # defaults要素をXML文字列として保存
     credits_xml: list[str] = field(default_factory=list)  # credit要素のXML文字列（順序保持）
     part_name: Optional[str] = None  # 表示用パート名（part-name credit のマッチング用）
+
+
+def _collect_measure_style_ranges(
+    layout_map: 'LayoutMap',
+    open_ranges: dict[tuple[str, Optional[str]], MeasureStyleRange],
+    part_id: str,
+    measure_style: ET.Element,
+    measure_num: int,
+    time: float,
+) -> None:
+    """measure-style の start / stop を区間として対応付けて保存する"""
+    number = measure_style.get('number')
+    for child in measure_style:
+        kind = child.tag.split('}')[-1]
+        if kind not in MEASURE_STYLE_RANGE_KINDS:
+            continue
+
+        wrapper = ET.Element(measure_style.tag, measure_style.attrib)
+        wrapper.append(child)
+        xml = ET.tostring(wrapper, encoding='unicode')
+        key = (kind, number)
+
+        if child.get('type') == 'start':
+            previous = open_ranges.pop(key, None)
+            if previous is not None:
+                # stop が無いまま次の start が来たら、そこで前の区間が終わったとみなす
+                previous.stop_measure, previous.stop_time = measure_num, time
+                layout_map.measure_style_ranges.setdefault(part_id, []).append(previous)
+            open_ranges[key] = MeasureStyleRange(
+                kind=kind, number=number, start_measure=measure_num,
+                start_time=time, start_xml=xml,
+            )
+        elif child.get('type') == 'stop':
+            style_range = open_ranges.pop(key, None)
+            if style_range is None:
+                continue
+            style_range.stop_measure, style_range.stop_time = measure_num, time
+            style_range.stop_xml = xml
+            layout_map.measure_style_ranges.setdefault(part_id, []).append(style_range)
 
 
 def _extract_mxl_content(mxl_path: Path) -> tuple[ET.Element, str]:
@@ -232,6 +294,8 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
         # divisions はパート全体で持ち越す（MusicXML は最初の measure で
         # 1 度だけ宣言されることが多い）
         divisions = 1.0
+        part_time = 0.0  # 小節先頭のパート内時間（四分音符単位）
+        open_style_ranges: dict[tuple[str, Optional[str]], MeasureStyleRange] = {}
 
         # 各小節を走査
         for measure in part.findall('.//{*}measure'):
@@ -521,7 +585,20 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
                         except ValueError:
                             pass
 
+                # 繰り返し記号・スラッシュ記譜の区間（小節の途中に置かれることもある）
+                elif elem.tag.endswith('attributes'):
+                    for measure_style in elem.findall('{*}measure-style'):
+                        _collect_measure_style_ranges(
+                            layout_map, open_style_ranges, part_id, measure_style,
+                            measure_num, part_time + current_offset,
+                        )
+
             layout_map.measures[measure_key] = measure_layout
+            part_time += measure_duration_quarters
+
+        # stop の無い区間は曲末まで続く
+        for style_range in open_style_ranges.values():
+            layout_map.measure_style_ranges.setdefault(part_id, []).append(style_range)
 
     return layout_map
 
@@ -2954,6 +3031,8 @@ def _measure_attributes_for_insert(measure: ET.Element) -> ET.Element:
     for child in measure:
         if child.tag.endswith('attributes'):
             return child
+        if child.tag.endswith(('note', 'backup', 'forward')):
+            break
 
     attributes = ET.Element('attributes')
     insert_pos = 0
@@ -2966,13 +3045,146 @@ def _measure_attributes_for_insert(measure: ET.Element) -> ET.Element:
     return attributes
 
 
-def restore_multiple_rests(
+_NOTE_TYPE_QUARTERS = {
+    'maxima': 32.0, 'long': 16.0, 'breve': 8.0, 'whole': 4.0, 'half': 2.0,
+    'quarter': 1.0, 'eighth': 0.5, '16th': 0.25, '32nd': 0.125, '64th': 1 / 16,
+    '128th': 1 / 32, '256th': 1 / 64, '512th': 1 / 128, '1024th': 1 / 256,
+}
+
+
+def _measure_style_range_child(measure_style_xml: str) -> Optional[ET.Element]:
+    """measure-style の XML から measure-repeat / beat-repeat / slash 要素を返す"""
+    try:
+        measure_style = ET.fromstring(measure_style_xml)
+    except ET.ParseError:
+        return None
+    for child in measure_style:
+        if child.tag.split('}')[-1] in MEASURE_STYLE_RANGE_KINDS:
+            return child
+    return None
+
+
+def _measure_style_stop_xml(start_xml: str) -> str:
+    """元譜に stop が無い区間の stop を start から合成する"""
+    measure_style = ET.fromstring(start_xml)
+    for child in measure_style:
+        if child.tag.split('}')[-1] in MEASURE_STYLE_RANGE_KINDS:
+            child.set('type', 'stop')
+            child.attrib.pop('slashes', None)
+            child.text = None
+    return ET.tostring(measure_style, encoding='unicode')
+
+
+def _measure_timeline(part: ET.Element, divisions: float) -> list[tuple[int, float, float]]:
+    """(小節番号, パート内の開始時刻, 小節長) を小節の並び順に返す（四分音符単位）"""
+    timeline: list[tuple[int, float, float]] = []
+    start = 0.0
+    for measure in part.findall('{*}measure'):
+        try:
+            measure_num = int(measure.get('number'))
+        except (TypeError, ValueError):
+            continue
+        duration = _measure_total_quarters(measure, divisions)
+        timeline.append((measure_num, start, duration))
+        start += duration
+    return timeline
+
+
+def _timeline_position(
+    timeline: list[tuple[int, float, float]], time: float
+) -> Optional[tuple[int, float]]:
+    """パート内時刻を (小節番号, 小節内オフセット) に変換する。曲末以降なら None"""
+    epsilon = 1e-6
+    for measure_num, start, duration in timeline:
+        if start - epsilon <= time < start + duration - epsilon:
+            return measure_num, max(0.0, time - start)
+    return None
+
+
+def _reversed_measure_style_placements(
+    style_range: MeasureStyleRange,
+    total_measures: int,
+    timeline: list[tuple[int, float, float]],
+) -> list[tuple[int, float, str]]:
+    """繰り返し記号・スラッシュ記譜の反転後の (小節番号, 小節内オフセット, measure-style XML)
+
+    slash は表示区間 [a, b) をそのまま時間反転する。measure-repeat / beat-repeat は元になる
+    N 小節（1単位の拍）が区間の直前にあり、反転後はそれがブロックの末尾に来てしまう。
+    周期的な並びは反転しても同じ周期なので、反転後のブロックの先頭 N 小節（1単位）を実音として
+    残し、その直後から繰り返しにする。
+    """
+    epsilon = 1e-6
+    start_xml = style_range.start_xml
+    stop_xml = style_range.stop_xml or _measure_style_stop_xml(start_xml)
+    start_child = _measure_style_range_child(start_xml)
+    if start_child is None:
+        return []
+
+    if style_range.kind == 'measure-repeat':
+        try:
+            count = int((start_child.text or '1').strip())
+        except ValueError:
+            count = 1
+        # 元: 実音 [M-N, M)、繰り返し [M, S) → 反転後のブロック [T-S+2, T-M+N+2)
+        stop_measure = style_range.stop_measure or total_measures + 1
+        start = total_measures - stop_measure + 2 + count
+        stop = total_measures - style_range.start_measure + count + 2
+        if start >= stop or not 1 <= start <= total_measures:
+            return []
+        placements = [(start, 0.0, start_xml)]
+        if stop <= total_measures:
+            placements.append((stop, 0.0, stop_xml))
+        return placements
+
+    if not timeline:
+        return []
+    total_time = timeline[-1][1] + timeline[-1][2]
+
+    unit = 0.0
+    if style_range.kind == 'beat-repeat':
+        base = _NOTE_TYPE_QUARTERS.get((start_child.findtext('{*}slash-type') or '').strip(), 1.0)
+        dots = len(start_child.findall('{*}slash-dot'))
+        unit = base * (2 - 0.5 ** dots)
+
+    original_stop = style_range.stop_time if style_range.stop_time is not None else total_time
+    start_time = total_time - original_stop + unit
+    stop_time = total_time - style_range.start_time + unit
+    if start_time >= stop_time - epsilon:
+        return []
+
+    start_position = _timeline_position(timeline, start_time)
+    if start_position is None:
+        return []
+    placements = [(*start_position, start_xml)]
+    stop_position = _timeline_position(timeline, stop_time)
+    if stop_position is not None:
+        placements.append((*stop_position, stop_xml))
+    return placements
+
+
+def _insert_measure_style(
+    measure: ET.Element,
+    measure_style: ET.Element,
+    offset_quarters: float,
+    divisions: float,
+) -> None:
+    """measure-style を小節内のオフセット位置の <attributes> に入れる"""
+    if offset_quarters <= 1e-6:
+        # <measure-style> は <attributes> の子要素順で最後なので末尾に追加する
+        _measure_attributes_for_insert(measure).append(measure_style)
+        return
+    attributes = ET.Element('attributes')
+    attributes.append(measure_style)
+    _insert_direction_at_offset(measure, attributes, offset_quarters, divisions)
+
+
+def restore_measure_styles(
     output_xml_path: Path,
     original_layout_map: LayoutMap,
     total_measures: int,
     verbose: bool = False,
 ) -> None:
-    """複数小節休符（multiple-rest）を反転後のブロック先頭に置き直す
+    """複数小節休符・繰り返し記号・スラッシュ記譜（measure-style）を反転後の位置に置き直す
 
     <multiple-rest>N</multiple-rest> は「この小節から N 小節」という前方向スパン。
     時間反転すると元の小節 M..M+N-1 のブロックは反転後の
@@ -2980,16 +3192,20 @@ def restore_multiple_rests(
     total-M-N+2 に置く必要がある。小節と一緒に運ばれるとブロック末尾に付いたままになり、
     音符のある小節を休符として結合してしまう。
 
+    <measure-repeat> / <beat-repeat> / <slash> は start / stop の区間として置き直す
+    （_reversed_measure_style_placements、Issue #74）。
+
     出力に残っているものを動かすのではなく、元譜から保存した情報で置き直す
     （music21 が N=1 の multiple-rest を落とすため、消失も同時に回復できる）。
 
     Args:
         output_xml_path: 処理対象のMusicXMLファイル(.xml または .mxl)
-        original_layout_map: 元のレイアウト情報（measure_styles を含む）
+        original_layout_map: 元のレイアウト情報（measure_styles / measure_style_ranges を含む）
         total_measures: 総小節数（反転計算用）
         verbose: デバッグ出力を有効にする
     """
-    if not original_layout_map or not original_layout_map.measure_styles:
+    if not original_layout_map or not (original_layout_map.measure_styles
+                                       or original_layout_map.measure_style_ranges):
         return
 
     is_mxl = output_xml_path.suffix == '.mxl'
@@ -3003,7 +3219,9 @@ def restore_multiple_rests(
     for part_idx, part in enumerate(root.findall('.//{*}part')):
         part_id = part.get('id', f'P{part_idx + 1}')
 
-        if part_id not in original_layout_map.measure_styles:
+        multiple_rests = original_layout_map.measure_styles.get(part_id, [])
+        style_ranges = original_layout_map.measure_style_ranges.get(part_id, [])
+        if not multiple_rests and not style_ranges:
             continue
 
         measure_map: dict[int, ET.Element] = {}
@@ -3015,18 +3233,40 @@ def restore_multiple_rests(
                 except ValueError:
                     pass
 
-        # music21 が出力した multiple-rest を全て削除する
+        # music21 が小節と一緒に運んだ measure-style を削除する
         for measure in part.findall('{*}measure'):
             for attributes in list(measure.findall('{*}attributes')):
                 for measure_style in list(attributes.findall('{*}measure-style')):
-                    if measure_style.find('{*}multiple-rest') is None:
+                    if measure_style.find('{*}multiple-rest') is not None:
+                        attributes.remove(measure_style)
                         continue
-                    attributes.remove(measure_style)
+                    for child in list(measure_style):
+                        if child.tag.split('}')[-1] in MEASURE_STYLE_RANGE_KINDS:
+                            measure_style.remove(child)
+                    if len(measure_style) == 0:
+                        attributes.remove(measure_style)
                 if len(attributes) == 0:
                     measure.remove(attributes)
 
-        # 反転後のブロック先頭に挿入する
-        for style in original_layout_map.measure_styles[part_id]:
+        # 繰り返し記号・スラッシュ記譜を区間として置き直す
+        part_divisions = _find_part_divisions(part)
+        timeline = _measure_timeline(part, part_divisions)
+        for style_range in style_ranges:
+            for measure_num, offset, xml in _reversed_measure_style_placements(
+                    style_range, total_measures, timeline):
+                if measure_num not in measure_map:
+                    continue
+                try:
+                    restored = ET.fromstring(xml)
+                except ET.ParseError:
+                    continue
+                _insert_measure_style(measure_map[measure_num], restored, offset, part_divisions)
+                if verbose:
+                    print(f"  {style_range.kind}: 元 m{style_range.start_measure} "
+                          f"→ 反転後 m{measure_num} ({offset}拍)")
+
+        # 複数小節休符を反転後のブロック先頭に挿入する
+        for style in multiple_rests:
             target = total_measures - style.measure_num - style.count + 2
             if target not in measure_map:
                 if verbose:
