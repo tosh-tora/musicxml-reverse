@@ -125,6 +125,8 @@ python reverse_score.py
 - `work/inbox/score.xml` → `work/outbox/score_rev.xml`
 - `work/inbox/score.musicxml` → `work/outbox/score_rev.musicxml`
 
+反転版であることが分かるように、スコアのタイトル（work-title / movement-title およびタイトルのcredit）には ` 反転` が追記されます（例: `Pomp and Circumstance March No. 1 反転`）。
+
 ### オプション
 
 | オプション | 説明 |

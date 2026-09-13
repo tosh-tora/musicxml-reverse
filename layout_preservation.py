@@ -3347,20 +3347,25 @@ def _restore_credits_with_retrograde(
     root: ET.Element,
     credits_xml: list[str],
     part_name: Optional[str],
-    retrograde_label: str = "(retrograde)"
+    retrograde_label: str = "(retrograde)",
+    title: Optional[str] = None,
+    title_suffix: str = "反転"
 ) -> None:
     """
-    保存されたcredit要素を復元し、part-name credit に retrograde ラベルを付与
+    保存されたcredit要素を復元し、part-name/title credit にラベルを付与
 
     music21はcredit要素を出力XMLから削除してしまうため、
     元のXMLから抽出したcredit要素を再挿入する。
     パート名を表示しているcredit-wordsには " (retrograde)" を追記する。
+    タイトルを表示しているcredit-wordsには " 反転" を追記する。
 
     Args:
         root: 出力XMLのルート要素
         credits_xml: 元のcredit要素のXML文字列リスト
         part_name: パート名（マッチングに使用）
-        retrograde_label: 追記するラベル
+        retrograde_label: パート名に追記するラベル
+        title: 元のスコアタイトル（マッチングに使用）
+        title_suffix: タイトルに追記するラベル
     """
     if not credits_xml:
         return
@@ -3412,6 +3417,15 @@ def _restore_credits_with_retrograde(
                 for words_elem in new_credit.findall('credit-words'):
                     if words_elem.text and words_elem.text.strip() == pn:
                         words_elem.text = f"{pn}\n{retrograde_label}"
+                        break
+
+        # credit-words のテキストがタイトルと一致するか確認し、反転ラベルを追記
+        if title:
+            t = title.strip()
+            if not t.endswith(title_suffix):
+                for words_elem in new_credit.findall('credit-words'):
+                    if words_elem.text and words_elem.text.strip() == t:
+                        words_elem.text = f"{t} {title_suffix}"
                         break
 
         parent.insert(insert_idx, new_credit)
@@ -3776,7 +3790,8 @@ def _restore_instrument_definitions(
 def apply_layout_to_xml(
     output_xml_path: Path,
     original_layout_map: LayoutMap,
-    total_measures: int
+    total_measures: int,
+    original_title: Optional[str] = None
 ) -> None:
     """
     music21の出力XMLにレイアウト属性を適用
@@ -3787,6 +3802,7 @@ def apply_layout_to_xml(
         output_xml_path: 出力MusicXMLファイル(.xml または .mxl)
         original_layout_map: 元のレイアウト情報
         total_measures: 総小節数（反転計算用）
+        original_title: 元のスコアタイトル（タイトルcreditへの「反転」付与に使用）
     """
     # ファイルを読み込み
     is_mxl = output_xml_path.suffix == '.mxl'
@@ -3950,6 +3966,7 @@ def apply_layout_to_xml(
         root,
         original_layout_map.credits_xml,
         original_layout_map.part_name,
+        title=original_title,
     )
 
     # technical要素の復元（music21が読み込まなかった要素）
