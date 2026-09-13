@@ -20,7 +20,7 @@ from layout_preservation import (
     LayoutMap,
     MeasureStyleElement,
     extract_layout_from_xml,
-    restore_multiple_rests,
+    restore_measure_styles,
 )
 from reverse_score import process_file
 
@@ -107,7 +107,7 @@ class TestMultipleRestRelocation:
         # 反転後の出力を模して、小節番号だけ鏡像化した状態を作る
         # （music21 は multiple-rest を小節と一緒に運ぶので m7 に付いている）
         _write_score(score, 10, {7: 3})
-        restore_multiple_rests(score, layout_map, total_measures=10)
+        restore_measure_styles(score, layout_map, total_measures=10)
 
         assert _multiple_rests(score) == [(5, 3)]
 
@@ -119,7 +119,7 @@ class TestMultipleRestRelocation:
 
         # 出力側には multiple-rest が無い状態
         _write_score(score, 10, {})
-        restore_multiple_rests(score, layout_map, total_measures=10)
+        restore_measure_styles(score, layout_map, total_measures=10)
 
         # 10 - 3 - 1 + 2 = 8
         assert _multiple_rests(score) == [(8, 1)]
@@ -130,7 +130,7 @@ class TestMultipleRestRelocation:
         _write_score(score, 10, {4: 3})
         layout_map = extract_layout_from_xml(score)
         _write_score(score, 10, {})
-        restore_multiple_rests(score, layout_map, total_measures=10)
+        restore_measure_styles(score, layout_map, total_measures=10)
 
         root = ET.parse(score).getroot()
         target = next(m for m in root.findall('.//{*}measure') if m.get('number') == '5')
@@ -144,7 +144,7 @@ class TestMultipleRestRelocation:
         _write_score(score, 10, {})
         before = score.read_text(encoding='utf-8')
 
-        restore_multiple_rests(score, LayoutMap(), total_measures=10)
+        restore_measure_styles(score, LayoutMap(), total_measures=10)
 
         assert score.read_text(encoding='utf-8') == before
 
@@ -160,7 +160,7 @@ class TestMultipleRestRelocation:
         ]
         _write_score(score, 10, {})
 
-        restore_multiple_rests(score, layout_map, total_measures=10)
+        restore_measure_styles(score, layout_map, total_measures=10)
 
         assert _multiple_rests(score) == []
 
@@ -221,3 +221,189 @@ class TestIssue70MultipleRestEndToEnd:
         output_file = self._reverse('運命_冒頭-Violins_I.mxl', tmp_path)
 
         assert _multiple_rests(output_file) == [(14, 1), (18, 2)]
+
+
+def _write_style_score(path: Path, total_measures: int,
+                       styles: dict[int, list[tuple[float, str]]]) -> None:
+    """divisions=1, 2/4、各小節に四分音符2つ。styles の measure-style を指定オフセットに置く
+
+    Args:
+        styles: {小節番号: [(小節内オフセット, measure-style の子要素 XML)]}
+    """
+    measures = []
+    for num in range(1, total_measures + 1):
+        body = ''
+        placed = styles.get(num, [])
+        for beat in range(2):
+            attrs = ''
+            if num == 1 and beat == 0:
+                attrs += ('<divisions>1</divisions><key><fifths>0</fifths></key>'
+                          '<time><beats>2</beats><beat-type>4</beat-type></time>'
+                          '<clef><sign>G</sign><line>2</line></clef>')
+            attrs += ''.join(f'<measure-style>{xml}</measure-style>'
+                             for offset, xml in placed if offset == beat)
+            if attrs:
+                body += f'<attributes>{attrs}</attributes>'
+            body += ('<note><pitch><step>C</step><octave>5</octave></pitch>'
+                     '<duration>1</duration><voice>1</voice><type>quarter</type></note>')
+        measures.append(f'    <measure number="{num}">{body}</measure>\n')
+    path.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<score-partwise version="4.0">\n'
+        '  <part-list><score-part id="P1"><part-name>Test</part-name></score-part></part-list>\n'
+        '  <part id="P1">\n' + ''.join(measures) + '  </part>\n'
+        '</score-partwise>\n',
+        encoding='utf-8',
+    )
+
+
+def _style_events(path: Path) -> list[tuple[int, float, str, str, str]]:
+    """(小節, 小節内オフセット, 要素名, type, テキスト) のリストを出現順に返す"""
+    root = ET.parse(path).getroot()
+    events = []
+    for measure in root.findall('.//{*}measure'):
+        offset = 0.0
+        for child in measure:
+            tag = child.tag.split('}')[-1]
+            if tag == 'note' and child.find('{*}chord') is None:
+                offset += float(child.findtext('{*}duration'))
+            elif tag == 'attributes':
+                for style in child.findall('{*}measure-style'):
+                    for elem in style:
+                        name = elem.tag.split('}')[-1]
+                        if name in ('measure-repeat', 'beat-repeat', 'slash'):
+                            events.append((int(measure.get('number')), offset, name,
+                                           elem.get('type'), (elem.text or '').strip()))
+    return events
+
+
+def _relocate(path: Path, total_measures: int, styles: dict, output_styles=None):
+    """元譜から抽出し、出力（既定は measure-style 無し）に置き直した結果を返す"""
+    from layout_preservation import restore_measure_styles
+
+    _write_style_score(path, total_measures, styles)
+    layout_map = extract_layout_from_xml(path)
+    _write_style_score(path, total_measures, output_styles or {})
+    restore_measure_styles(path, layout_map, total_measures)
+    return _style_events(path)
+
+
+MEASURE_REPEAT_START = '<measure-repeat type="start" slashes="1">{n}</measure-repeat>'
+MEASURE_REPEAT_STOP = '<measure-repeat type="stop"/>'
+SLASH_START = '<slash type="start"><slash-type>quarter</slash-type></slash>'
+SLASH_STOP = '<slash type="stop"><slash-type>quarter</slash-type></slash>'
+BEAT_REPEAT_START = '<beat-repeat type="start"><slash-type>quarter</slash-type></beat-repeat>'
+BEAT_REPEAT_STOP = '<beat-repeat type="stop"><slash-type>quarter</slash-type></beat-repeat>'
+
+
+class TestIssue74MeasureRepeat:
+    """Issue #74: measure-repeat は反転後のブロックの先頭 N 小節を実音にして付け直す
+
+    MusicXML では繰り返される実音も各小節に書かれているので、マーカーだけを動かせばよい。
+    stop は「繰り返し表示が終わった最初の小節」に置かれる。
+    """
+
+    TOTAL = 10
+
+    def test_single_measure_repeat(self, tmp_path):
+        """元: m3 が実音、m4–6 が繰り返し（stop@m7）
+
+        ブロック m3–6 は反転後 m5–8。先頭の m5 を実音にして m6–8 を繰り返し、stop@m9。
+        """
+        events = _relocate(tmp_path / 'score.xml', self.TOTAL, {
+            4: [(0, MEASURE_REPEAT_START.format(n=1))],
+            7: [(0, MEASURE_REPEAT_STOP)],
+        })
+
+        assert events == [(6, 0.0, 'measure-repeat', 'start', '1'),
+                          (9, 0.0, 'measure-repeat', 'stop', '')]
+
+    def test_two_measure_pattern(self, tmp_path):
+        """元: m2–3 が実音、m4–7 が2小節単位の繰り返し（stop@m8）
+
+        ブロック m2–7 は反転後 m4–9。m4–5 を実音にして m6–9 を繰り返し、stop@m10。
+        """
+        events = _relocate(tmp_path / 'score.xml', self.TOTAL, {
+            4: [(0, MEASURE_REPEAT_START.format(n=2))],
+            8: [(0, MEASURE_REPEAT_STOP)],
+        })
+
+        assert events == [(6, 0.0, 'measure-repeat', 'start', '2'),
+                          (10, 0.0, 'measure-repeat', 'stop', '')]
+
+    def test_repeat_through_end_of_part(self, tmp_path):
+        """stop が無い（曲末まで繰り返し）: m7 実音 + m8–10 → 反転後 m1 実音 + m2–4、stop@m5"""
+        events = _relocate(tmp_path / 'score.xml', self.TOTAL, {
+            8: [(0, MEASURE_REPEAT_START.format(n=1))],
+        })
+
+        assert events == [(2, 0.0, 'measure-repeat', 'start', '1'),
+                          (5, 0.0, 'measure-repeat', 'stop', '')]
+
+    def test_stop_is_omitted_when_repeat_reaches_end(self, tmp_path):
+        """m1 実音 + m2–3（stop@m4）→ 反転後 m8 実音 + m9–10 は曲末まで続くので stop を出さない"""
+        events = _relocate(tmp_path / 'score.xml', self.TOTAL, {
+            2: [(0, MEASURE_REPEAT_START.format(n=1))],
+            4: [(0, MEASURE_REPEAT_STOP)],
+        })
+
+        assert events == [(9, 0.0, 'measure-repeat', 'start', '1')]
+
+    def test_markers_carried_by_music21_are_replaced(self, tmp_path):
+        """出力に小節と一緒に運ばれたマーカーが残っていても、取り除いてから置き直す"""
+        events = _relocate(tmp_path / 'score.xml', self.TOTAL, {
+            4: [(0, MEASURE_REPEAT_START.format(n=1))],
+            7: [(0, MEASURE_REPEAT_STOP)],
+        }, output_styles={
+            7: [(0, MEASURE_REPEAT_START.format(n=1))],
+            4: [(0, MEASURE_REPEAT_STOP)],
+        })
+
+        assert events == [(6, 0.0, 'measure-repeat', 'start', '1'),
+                          (9, 0.0, 'measure-repeat', 'stop', '')]
+
+
+class TestIssue74SlashAndBeatRepeat:
+    """Issue #74: slash は表示区間、beat-repeat は拍単位の繰り返しとして付け直す"""
+
+    TOTAL = 10
+
+    def test_slash_region_is_reversed(self, tmp_path):
+        """slash 区間 m3–5（stop@m6頭）→ 反転後 m6–8（stop@m9頭）"""
+        events = _relocate(tmp_path / 'score.xml', self.TOTAL, {
+            3: [(0, SLASH_START)],
+            6: [(0, SLASH_STOP)],
+        })
+
+        assert events == [(6, 0.0, 'slash', 'start', ''), (9, 0.0, 'slash', 'stop', '')]
+
+    def test_slash_mid_measure_boundaries(self, tmp_path):
+        """小節の途中の境界は時間点として鏡像にする: m3 2拍目–m5 2拍目 → m6 2拍目–m8 2拍目"""
+        events = _relocate(tmp_path / 'score.xml', self.TOTAL, {
+            3: [(1, SLASH_START)],
+            5: [(1, SLASH_STOP)],
+        })
+
+        assert events == [(6, 1.0, 'slash', 'start', ''), (8, 1.0, 'slash', 'stop', '')]
+
+    def test_slash_through_end_of_part(self, tmp_path):
+        """stop が無い slash 区間 m8–10 → 反転後 m1–3（stop@m4頭）"""
+        events = _relocate(tmp_path / 'score.xml', self.TOTAL, {
+            8: [(0, SLASH_START)],
+        })
+
+        assert events == [(1, 0.0, 'slash', 'start', ''), (4, 0.0, 'slash', 'stop', '')]
+
+    def test_beat_repeat_keeps_source_beat_before_repeats(self, tmp_path):
+        """元: m3 1拍目が実音、m3 2拍目–m4 1拍目が繰り返し（stop@m4 2拍目）
+
+        ブロック m3 1拍目–m4 1拍目 は反転後 m7 2拍目–m8 2拍目。先頭の1拍（m7 2拍目）を
+        実音にして、繰り返しは m8 頭から、stop は m9 頭。
+        """
+        events = _relocate(tmp_path / 'score.xml', self.TOTAL, {
+            3: [(1, BEAT_REPEAT_START)],
+            4: [(1, BEAT_REPEAT_STOP)],
+        })
+
+        assert events == [(8, 0.0, 'beat-repeat', 'start', ''),
+                          (9, 0.0, 'beat-repeat', 'stop', '')]

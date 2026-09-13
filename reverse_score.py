@@ -282,11 +282,12 @@ def collect_clef_positions(measures: list[stream.Measure]) -> list[dict]:
     return clef_positions
 
 
-def calculate_reversed_clef_positions(
-    clef_positions: list[dict],
-    total_measures: int
+def calculate_reversed_start_only_positions(
+    positions: list[dict],
+    total_measures: int,
+    element_key: str,
 ) -> list[dict]:
-    """音部記号の反転後位置を計算する
+    """「始点のみ要素」の反転後位置を計算する
 
     「始点のみ要素」は「次の同種要素が出現するまで有効」という性質を持つ。
     1. 各要素の適用終了位置を計算:
@@ -296,37 +297,67 @@ def calculate_reversed_clef_positions(
        reversed_start = total_measures - effective_end + 1
 
     Args:
+        positions: [{measure_num, offset, <element_key>}]（元の順序でソート済み）
+        total_measures: 総小節数
+        element_key: 要素オブジェクトを格納しているキー
+
+    Returns:
+        反転後の位置情報 [{reversed_measure_num, <element_key>}]
+    """
+    if not positions:
+        return []
+
+    reversed_positions = []
+
+    for i, pos in enumerate(positions):
+        if i + 1 < len(positions):
+            # 次の同種要素の直前まで有効
+            effective_end = positions[i + 1]['measure_num'] - 1
+        else:
+            # 最後の要素は曲の最後まで有効
+            effective_end = total_measures
+
+        reversed_positions.append({
+            'reversed_measure_num': total_measures - effective_end + 1,
+            element_key: copy.deepcopy(pos[element_key]),
+        })
+
+    reversed_positions.sort(key=lambda x: x['reversed_measure_num'])
+    return reversed_positions
+
+
+def apply_reversed_start_only_elements(
+    new_part: stream.Part,
+    reversed_positions: list[dict],
+    element_key: str,
+) -> None:
+    """反転後のパートに「始点のみ要素」を挿入する（最初の要素はパートレベル、以降は小節の先頭）"""
+    if not reversed_positions:
+        return
+
+    new_part.insert(0, reversed_positions[0][element_key])
+
+    for pos in reversed_positions[1:]:
+        for measure in new_part.getElementsByClass(stream.Measure):
+            if measure.number == pos['reversed_measure_num']:
+                measure.insert(0, pos[element_key])
+                break
+
+
+def calculate_reversed_clef_positions(
+    clef_positions: list[dict],
+    total_measures: int
+) -> list[dict]:
+    """音部記号の反転後位置を計算する
+
+    Args:
         clef_positions: collect_clef_positions() の結果
         total_measures: 総小節数
 
     Returns:
         反転後の位置情報 [{reversed_measure_num, clef}]
     """
-    if not clef_positions:
-        return []
-
-    reversed_positions = []
-
-    for i, pos in enumerate(clef_positions):
-        # 適用終了位置を計算
-        if i + 1 < len(clef_positions):
-            # 次の音部記号の直前まで有効
-            effective_end = clef_positions[i + 1]['measure_num'] - 1
-        else:
-            # 最後の音部記号は曲の最後まで有効
-            effective_end = total_measures
-
-        # 反転後の開始位置を計算
-        reversed_start = total_measures - effective_end + 1
-
-        reversed_positions.append({
-            'reversed_measure_num': reversed_start,
-            'clef': copy.deepcopy(pos['clef']),
-        })
-
-    # 反転後の小節番号順でソート
-    reversed_positions.sort(key=lambda x: x['reversed_measure_num'])
-    return reversed_positions
+    return calculate_reversed_start_only_positions(clef_positions, total_measures, 'clef')
 
 
 def apply_reversed_clefs(
@@ -339,23 +370,35 @@ def apply_reversed_clefs(
         new_part: 反転後のパート（小節が追加済み）
         reversed_clef_positions: calculate_reversed_clef_positions() の結果
     """
-    if not reversed_clef_positions:
-        return
+    apply_reversed_start_only_elements(new_part, reversed_clef_positions, 'clef')
 
-    # m1に最初の音部記号を挿入（パートレベル）
-    first_clef = reversed_clef_positions[0]
-    new_part.insert(0, first_clef['clef'])
 
-    # m2以降に音部記号の変更を挿入
-    for pos in reversed_clef_positions[1:]:
-        target_measure_num = pos['reversed_measure_num']
+def collect_signature_positions(measures: list[stream.Measure], class_name: str) -> list[dict]:
+    """パート内の調号（KeySignature）・拍子記号（TimeSignature）と小節番号を収集する
 
-        # 対象の小節を検索
-        for measure in new_part.getElementsByClass(stream.Measure):
-            if measure.number == target_measure_num:
-                # 小節の先頭に音部記号を挿入
-                measure.insert(0, pos['clef'])
-                break
+    音部記号と同じく「この小節から次の同種要素が出現するまで有効」な始点のみ要素。
+    小節と一緒に運ぶと適用区間がずれ、元 m1 のコピーが最終小節に余分に出る（Issue #74）。
+
+    Returns:
+        [{measure_num, offset, element}]
+    """
+    positions = []
+    for measure in measures:
+        for element in measure.getElementsByClass(class_name):
+            positions.append({
+                'measure_num': measure.number,
+                'offset': element.offset,
+                'element': element,
+            })
+    positions.sort(key=lambda x: (x['measure_num'], x['offset']))
+    return positions
+
+
+def _remove_signatures(measure: stream.Measure) -> None:
+    """小節から調号・拍子記号を取り除く（反転ロジックで付け直すため）"""
+    for class_name in ('KeySignature', 'TimeSignature'):
+        for element in list(measure.getElementsByClass(class_name)):
+            measure.remove(element)
 
 
 def collect_layout_positions(measures: list[stream.Measure], class_name: str) -> list[dict]:
@@ -399,23 +442,9 @@ def calculate_reversed_layout_positions(
     Returns:
         反転後の位置情報 [{reversed_measure_num, layout_obj}]
     """
-    if not layout_positions:
-        return []
-
-    reversed_positions = []
-
-    for i, pos in enumerate(layout_positions):
-        if i + 1 < len(layout_positions):
-            effective_end = layout_positions[i + 1]['measure_num'] - 1
-        else:
-            effective_end = total_measures
-
-        reversed_start = total_measures - effective_end + 1
-
-        reversed_positions.append({
-            'reversed_measure_num': reversed_start,
-            'layout_obj': copy.deepcopy(pos['layout_obj']),
-        })
+    reversed_positions = calculate_reversed_start_only_positions(
+        layout_positions, total_measures, 'layout_obj'
+    )
 
     # 改行・改ページ（new-system / new-page）は出力しない。
     # <measure width> や音符の default-x は元の行組みに合わせて justify された値で、
@@ -905,8 +934,6 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
     if part.partAbbreviation:
         new_part.partAbbreviation = part.partAbbreviation
 
-    # 最初の小節から楽器、調号、拍子記号を取得してコピー
-    first_original_measure = measures[0]
     total_measures = len(measures)
 
     # 楽器をコピー
@@ -929,19 +956,9 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
     # 右バーライン（bar-style）も同様に反転ロジックで処理
     barline_positions = collect_barline_positions(measures)
 
-    # 調号をコピー (KeySignature)
-    key_sigs = first_original_measure.getElementsByClass('KeySignature')
-    if key_sigs:
-        first_key = key_sigs.first()
-        if first_key:
-            new_part.insert(0, first_key)
-
-    # 拍子記号をコピー (TimeSignature)
-    time_sigs = first_original_measure.getElementsByClass('TimeSignature')
-    if time_sigs:
-        first_time = time_sigs.first()
-        if first_time:
-            new_part.insert(0, first_time)
+    # 調号・拍子記号も音部記号と同様に反転ロジックで処理
+    key_positions = collect_signature_positions(measures, 'KeySignature')
+    time_positions = collect_signature_positions(measures, 'TimeSignature')
 
     # 各小節を処理して追加
     for i, measure in enumerate(reversed_measures):
@@ -959,9 +976,10 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
             for elem in list(measure_to_process.getElementsByClass(tempo_class)):
                 measure_to_process.remove(elem)
 
-        # 音部記号を小節から削除（反転ロジックで再配置するため）
+        # 音部記号・調号・拍子記号を小節から削除（反転ロジックで再配置するため）
         for elem in list(measure_to_process.getElementsByClass('Clef')):
             measure_to_process.remove(elem)
+        _remove_signatures(measure_to_process)
 
         # 右バーラインを小節から除去（反転ロジックで再配置するため）
         measure_to_process.rightBarline = None
@@ -984,6 +1002,7 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
                 fallback = measure
             fallback.number = i + 1
             fallback.rightBarline = None
+            _remove_signatures(fallback)
             new_part.append(fallback)
             continue
 
@@ -998,6 +1017,7 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
                 fallback = copy.deepcopy(original_measures[original_index])
                 fallback.number = i + 1
                 fallback.rightBarline = None
+                _remove_signatures(fallback)
 
                 # 元の小節も書き出せるかテスト
                 fallback_error = test_measure_write(fallback)
@@ -1044,6 +1064,13 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
     # 音部記号を反転して適用
     reversed_clef_positions = calculate_reversed_clef_positions(clef_positions, total_measures)
     apply_reversed_clefs(new_part, reversed_clef_positions)
+
+    # 調号・拍子記号を反転して適用（それぞれ独立した系列として扱う）
+    for positions in (key_positions, time_positions):
+        reversed_positions = calculate_reversed_start_only_positions(
+            positions, total_measures, 'element'
+        )
+        apply_reversed_start_only_elements(new_part, reversed_positions, 'element')
 
     # テンポ要素を反転して適用
     reversed_tempo_positions = calculate_reversed_tempo_positions(tempo_positions, total_measures)
@@ -1564,6 +1591,15 @@ def process_file(input_path: Path, output_path: Path,
         try:
             original_layout = extract_layout_from_xml(input_path)
             layout_extraction_success = True
+            for part_id, directions in original_layout.directions.items():
+                for d in directions:
+                    if d.sound_navigation:
+                        report.add_issue(
+                            part_id, d.measure_num,
+                            "D.C./D.S. 等の演奏順序は反転後に変換できないため、再生用のジャンプ指定"
+                            f"（{', '.join(d.sound_navigation)}）を削除しました。演奏順序を確認してください",
+                            skipped=False,
+                        )
         except Exception as layout_error:
             print(f"  警告: レイアウト抽出に失敗しました: {layout_error}")
             original_layout = None
@@ -1611,7 +1647,7 @@ def process_file(input_path: Path, output_path: Path,
                 from layout_preservation import (restore_direction_elements,
                                                  normalize_slur_numbers,
                                                  recalculate_accidentals,
-                                                 restore_multiple_rests,
+                                                 restore_measure_styles,
                                                  strip_horizontal_layout_hints)
                 total_measures = len(list(reversed_score.parts[0].getElementsByClass('Measure')))
                 restore_direction_elements(output_path, original_layout, total_measures)
@@ -1627,10 +1663,10 @@ def process_file(input_path: Path, output_path: Path,
                 recalculate_accidentals(output_path, verbose=False)
                 print(f"  [Phase 3] 臨時記号の再計算完了")
 
-                # 複数小節休符を反転後のブロック先頭に置き直す
-                print(f"  [Phase 3] 複数小節休符を再配置中...")
-                restore_multiple_rests(output_path, original_layout, total_measures)
-                print(f"  [Phase 3] 複数小節休符の再配置完了")
+                # 複数小節休符・繰り返し記号を反転後の位置に置き直す
+                print(f"  [Phase 3] 複数小節休符・繰り返し記号を再配置中...")
+                restore_measure_styles(output_path, original_layout, total_measures)
+                print(f"  [Phase 3] 複数小節休符・繰り返し記号の再配置完了")
 
                 # 反転で無効になる水平位置情報を除去（direction 復元より後に実行する）
                 print(f"  [Phase 3] 水平位置情報を除去中...")
