@@ -67,6 +67,7 @@ class InstrumentRef:
     voice: str  # voice番号（反転はvoiceごとに独立して行われるため）
     note_index: int  # voice内の音符インデックス
     instrument_id: str
+    offset_quarters: float = 0.0  # 小節内の開始オフセット（持ち替えラベルの検出用）
 
 
 @dataclass
@@ -461,6 +462,7 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
                                         voice=voice_value,
                                         note_index=voice_note_idx,
                                         instrument_id=inst_id,
+                                        offset_quarters=current_offset,
                                     )
                                 )
 
@@ -1130,8 +1132,9 @@ class StateMarkingGroup:
 
 # 語彙で定義できる状態指示のグループ
 # ここに登録された words / sound を持つ direction は有効範囲ベースで反転される。
-# 語彙を列挙できない状態指示（打楽器の持ち替え、オルガンのレジストレーション等）は
-# 誤検出を避けるため対象外とする（Issue #73）。
+# 語彙を列挙できない状態指示のうち、打楽器の持ち替えは楽器参照の切り替わりから
+# 検出する（_separate_instrument_change_labels）。オルガンのレジストレーション等、
+# 構造的な手がかりの無いものは誤検出を避けるため対象外とする（Issue #73）。
 STATE_MARKING_GROUPS = (
     # 奏法: pizz. ↔ arco
     StateMarkingGroup(
@@ -1442,6 +1445,107 @@ def _calculate_reversed_state_markers(
         unique.append(marker)
 
     return unique
+
+
+def _separate_instrument_change_labels(
+    dir_elems: list['DirectionElement'],
+    instrument_refs: list['InstrumentRef'],
+) -> tuple[list['DirectionElement'], list['DirectionElement']]:
+    """direction リストから打楽器の持ち替えラベルと、それ以外に分離する。
+
+    'Tambourine' / 'Glockensp.' のような持ち替えラベルは「次の持ち替えまで有効」な
+    状態指示だが、語彙が開いているため STATE_MARKING_GROUPS には登録できない。
+    実際の楽器状態は音符の <instrument id> が持っているので、その切り替わりと
+    一致する words をラベルとみなす（Issue #73）。条件:
+
+    - sound / rehearsal を持たない words で、cresc. 等の強弱変化テキストではない
+    - その位置で開始する楽器参照付き音符があり、その楽器が直前の持ち替え地点
+      （無ければ曲頭）以降まだ使われていない
+    - その位置より前にパート内で楽器参照付き音符がある
+
+    「直前の持ち替え以降に未使用」とすることで、音高ごとに楽器 id が変わる
+    グロッケン区間の途中にある words を誤検出しない。位置は厳密一致のみとし、
+    後続の入りまで離れた words（cresc. 等）を巻き込まない。
+    """
+    if not instrument_refs:
+        return [], list(dir_elems)
+
+    epsilon = 1e-6
+
+    def is_before(ref: 'InstrumentRef', measure_num: int, offset: float) -> bool:
+        return (ref.measure_num < measure_num
+                or (ref.measure_num == measure_num
+                    and ref.offset_quarters < offset - epsilon))
+
+    candidates = sorted(
+        (d for d in dir_elems
+         if d.has_words and not d.has_sound and not d.has_rehearsal
+         and not _is_dynamics_text_direction(d)),
+        key=lambda d: (d.measure_num, d.offset_quarters),
+    )
+
+    label_ids: set[int] = set()
+    window_start = (0, 0.0)  # 直前の持ち替え地点
+    for d in candidates:
+        starting = [r for r in instrument_refs
+                    if r.measure_num == d.measure_num
+                    and abs(r.offset_quarters - d.offset_quarters) <= epsilon]
+        if not starting:
+            continue
+        if not any(is_before(r, d.measure_num, d.offset_quarters) for r in instrument_refs):
+            continue
+
+        used_since_change = {
+            r.instrument_id for r in instrument_refs
+            if not is_before(r, *window_start)
+            and is_before(r, d.measure_num, d.offset_quarters)
+        }
+        if any(r.instrument_id not in used_since_change for r in starting):
+            label_ids.add(id(d))
+            window_start = (d.measure_num, d.offset_quarters)
+
+    labels = [d for d in dir_elems if id(d) in label_ids]
+    others = [d for d in dir_elems if id(d) not in label_ids]
+    return labels, others
+
+
+def _calculate_reversed_instrument_change_labels(
+    labels: list['DirectionElement'],
+    total_measures: int,
+) -> list[tuple['DirectionElement', int, float]]:
+    """持ち替えラベルの反転後位置 (DirectionElement, 小節番号, 小節内オフセット) を算出する
+
+    ラベル B_i の有効範囲は [B_i, B_(i+1)) なので、反転後は B_(i+1) の鏡像位置から始まる。
+    最後のラベルは曲頭に移る。最初のラベルより前の区間（ラベル無しの初期状態）は
+    表記が分からないため、その反転後の先頭には何も出さない。
+
+    #70 の状態グループと異なり既定状態が無いので、打ち消しマーカーは合成しない。
+    同じ位置の複数ラベル（'Gl.' と 'Schellen.'）は1つの境界として一緒に移す。
+    """
+    epsilon = 1e-6
+    boundaries: list[list[DirectionElement]] = []
+    for d in sorted(labels, key=lambda d: (d.measure_num, d.offset_quarters)):
+        if (boundaries
+                and boundaries[-1][0].measure_num == d.measure_num
+                and abs(boundaries[-1][0].offset_quarters - d.offset_quarters) <= epsilon):
+            boundaries[-1].append(d)
+        else:
+            boundaries.append([d])
+
+    result: list[tuple[DirectionElement, int, float]] = []
+    for k, boundary in enumerate(boundaries):
+        if k == len(boundaries) - 1:
+            measure_num, offset = 1, 0.0
+        else:
+            measure_num, offset = _mirror_direction_position(
+                boundaries[k + 1][0], total_measures
+            )
+        if not 1 <= measure_num <= total_measures:
+            continue
+        for d in boundary:
+            result.append((d, measure_num, offset))
+
+    return result
 
 
 def _strip_words_x_attributes(direction_root: ET.Element) -> None:
@@ -1800,7 +1904,8 @@ def restore_direction_elements(
         # 2. 奏法状態 (pizz./arco) → 有効範囲ベースで反転 + 打ち消しマーカー生成
         # 3. テンポ関連 (sound + words) → 有効範囲ベースで反転
         # 4. ダイナミクス → 有効範囲ベースで反転 + 括弧付きマーカー
-        # 5. その他 (テキスト等) → 単純な位置反転
+        # 5. 打楽器の持ち替えラベル → 区間の先頭へ移す
+        # 6. その他 (テキスト等) → 単純な位置反転
         #
         # 奏法状態は words + sound を持つためテンポ判定より前に分離する
         # （テンポとして誤分類されるだけでなく、テンポの有効範囲境界も汚染するため）
@@ -1808,6 +1913,9 @@ def restore_direction_elements(
         wedge_pairs, non_wedge_dirs = _separate_wedge_pairs(all_directions)
         octave_shift_pairs, non_pair_dirs = _separate_octave_shift_pairs(non_wedge_dirs)
         state_marking_directions, non_state_dirs = _separate_state_marking_directions(non_pair_dirs)
+        instrument_change_labels, non_state_dirs = _separate_instrument_change_labels(
+            non_state_dirs, original_layout_map.instrument_refs.get(part_id, [])
+        )
         tempo_directions = [d for d in non_state_dirs if _is_tempo_direction(d)]
         non_tempo_dirs = [d for d in non_state_dirs if not _is_tempo_direction(d)]
         rehearsal_directions = [d for d in non_tempo_dirs if d.has_rehearsal]
@@ -2054,6 +2162,25 @@ def restore_direction_elements(
             _insert_direction_at_offset(
                 measure_map[state_marker.measure_num], marker,
                 state_marker.offset_quarters, part_divisions
+            )
+
+        # 7. 打楽器の持ち替えラベルを有効範囲の先頭（次のラベルの鏡像位置）に移して挿入
+        reversed_labels = _calculate_reversed_instrument_change_labels(
+            instrument_change_labels, total_measures
+        )
+
+        for dir_elem, measure_num, offset in reversed_labels:
+            if measure_num not in measure_map:
+                continue
+
+            try:
+                restored_direction = ET.fromstring(dir_elem.direction_xml)
+            except ET.ParseError:
+                continue
+            _strip_words_x_attributes(restored_direction)
+            _strip_dynamics_x_attributes(restored_direction)
+            _insert_direction_at_offset(
+                measure_map[measure_num], restored_direction, offset, part_divisions
             )
 
     # 変更後のXMLを書き出し
