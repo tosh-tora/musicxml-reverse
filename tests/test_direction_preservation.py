@@ -30,6 +30,7 @@ from layout_preservation import (
     _get_state_marking,
     _is_tempo_direction,
     _separate_state_marking_directions,
+    _is_unclear_end_word,
 )
 from reverse_score import process_file, reverse_score
 
@@ -90,6 +91,40 @@ class TestTransitionalTempoDetection:
     def test_empty_text_is_not_transitional(self):
         assert _is_transitional_tempo_text('') is False
         assert _is_transitional_tempo_text(None) is False
+
+
+class TestUnclearEndWordDetection:
+    """終端不明の状態語検出のテスト（Issue #88）"""
+
+    def test_sostenuto_is_unclear_end(self):
+        assert _is_unclear_end_word('sostenuto') is True
+        assert _is_unclear_end_word('Sostenuto') is True
+        assert _is_unclear_end_word('sost.') is True
+
+    def test_simile_is_unclear_end(self):
+        assert _is_unclear_end_word('simile') is True
+        assert _is_unclear_end_word('sim.') is True
+
+    def test_ad_lib_is_unclear_end(self):
+        assert _is_unclear_end_word('ad lib.') is True
+        assert _is_unclear_end_word('ad libitum') is True
+
+    def test_style_words_are_unclear_end(self):
+        assert _is_unclear_end_word('dolce') is True
+        assert _is_unclear_end_word('cantabile') is True
+        assert _is_unclear_end_word('marcato') is True
+
+    def test_a_tempo_is_not_unclear_end(self):
+        # a tempo は経過的テンポの終了を示す側なので対象外
+        assert _is_unclear_end_word('a tempo') is False
+
+    def test_main_tempo_is_not_unclear_end(self):
+        assert _is_unclear_end_word('Tempo primo.') is False
+        assert _is_unclear_end_word('Molto Maestoso.') is False
+
+    def test_empty_text_is_not_unclear_end(self):
+        assert _is_unclear_end_word('') is False
+        assert _is_unclear_end_word(None) is False
 
 
 class TestDirectionExtraction:
@@ -193,6 +228,39 @@ class TestDirectionRestoration:
         # Tempo primo. には←が付与されていない
         tempo_primo_texts = [text for measure, text in words_list if 'Tempo primo' in text]
         assert all(not text.startswith('←') for text in tempo_primo_texts), "Tempo primo should NOT have ← prefix"
+
+    def test_unclear_end_word_gets_arrow(self, tmp_path):
+        """sostenuto/simile には←記号が付与される（Issue #88）"""
+        input_file = Path('work/inbox/威風堂々ラスト-Violin.mxl')
+        if not input_file.exists():
+            pytest.skip(f"Test file not found: {input_file}")
+
+        output_file = tmp_path / 'test_output.mxl'
+
+        # Phase 1: レイアウト抽出
+        layout_map = extract_layout_from_xml(input_file)
+
+        # Phase 2: 反転処理
+        score = converter.parse(str(input_file))
+        reversed_score = reverse_score(score, None)
+        reversed_score.write('mxl', fp=str(output_file))
+
+        # Phase 3: direction要素復元
+        total_measures = len(list(reversed_score.parts[0].getElementsByClass('Measure')))
+        restore_direction_elements(output_file, layout_map, total_measures)
+
+        # 検証
+        words_list = get_words_texts_from_mxl(output_file)
+
+        # sostenuto には←が付与されている
+        sostenuto_texts = [text for measure, text in words_list if 'sostenuto' in text.lower()]
+        assert sostenuto_texts, "sostenuto should be present in output"
+        assert all(text.startswith('←') for text in sostenuto_texts), "sostenuto should have ← prefix"
+
+        # simile には←が付与されている
+        simile_texts = [text for measure, text in words_list if 'simile' in text.lower()]
+        assert simile_texts, "simile should be present in output"
+        assert all(text.startswith('←') for text in simile_texts), "simile should have ← prefix"
 
 
 class TestIssue27Regression:
