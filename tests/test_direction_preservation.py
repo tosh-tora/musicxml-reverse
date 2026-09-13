@@ -919,3 +919,408 @@ class TestIssue73InstrumentChangeLabels:
 
         assert labels == []
         assert others == dirs
+
+
+# ---------------------------------------------------------------------------
+# Issue #74: 最小構成の楽譜で direction の反転を検証するヘルパー
+# ---------------------------------------------------------------------------
+
+def _dt(inner: str) -> str:
+    return f'<direction-type>{inner}</direction-type>'
+
+
+def _dir(direction_types: str, staff: Optional[str] = None, sound: str = '') -> str:
+    staff_xml = f'<staff>{staff}</staff>' if staff else ''
+    return f'<direction placement="below">{direction_types}{staff_xml}{sound}</direction>'
+
+
+def _write_direction_score(path: Path, total_measures: int,
+                           directions: dict[int, list[tuple[float, str]]],
+                           beats: int = 2) -> None:
+    """divisions=1、各小節に四分音符を beats 個並べた楽譜を書き出す
+
+    Args:
+        directions: {小節番号: [(小節内オフセット, direction XML)]}。
+            オフセットが beats 以上なら小節末（音符の後）に置く
+    """
+    measures = []
+    for num in range(1, total_measures + 1):
+        body = ''
+        if num == 1:
+            body += ('<attributes><divisions>1</divisions><key><fifths>0</fifths></key>'
+                     f'<time><beats>{beats}</beats><beat-type>4</beat-type></time>'
+                     '<clef><sign>G</sign><line>2</line></clef></attributes>')
+        placed = directions.get(num, [])
+        for beat in range(beats):
+            body += ''.join(xml for offset, xml in placed if offset == beat)
+            body += ('<note><pitch><step>C</step><octave>5</octave></pitch>'
+                     '<duration>1</duration><voice>1</voice><type>quarter</type></note>')
+        body += ''.join(xml for offset, xml in placed if offset >= beats)
+        measures.append(f'    <measure number="{num}">{body}</measure>\n')
+    path.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<score-partwise version="4.0">\n'
+        '  <part-list><score-part id="P1"><part-name>Test</part-name></score-part></part-list>\n'
+        '  <part id="P1">\n' + ''.join(measures) + '  </part>\n'
+        '</score-partwise>\n',
+        encoding='utf-8',
+    )
+
+
+def _direction_events(path: Path) -> list[tuple[int, float, ET.Element]]:
+    """(小節番号, 小節内オフセット, direction 要素) を出現順に返す"""
+    root = ET.parse(path).getroot()
+    events = []
+    for measure in root.findall('.//{*}measure'):
+        offset = 0.0
+        for child in measure:
+            tag = child.tag.split('}')[-1]
+            if tag == 'note' and child.find('{*}chord') is None:
+                offset += float(child.findtext('{*}duration'))
+            elif tag == 'backup':
+                offset -= float(child.findtext('{*}duration'))
+            elif tag == 'forward':
+                offset += float(child.findtext('{*}duration'))
+            elif tag == 'direction':
+                events.append((int(measure.get('number')), offset, child))
+    return events
+
+
+def _elements(events, tag: str) -> list[tuple[int, float, ET.Element, ET.Element]]:
+    """events から tag 要素を (小節, オフセット, 要素, direction) で抜き出す"""
+    return [(m, offset, elem, direction)
+            for m, offset, direction in events
+            for elem in direction.iter() if elem.tag.split('}')[-1] == tag]
+
+
+def _reverse_directions(path: Path, total_measures: int) -> list[tuple[int, float, ET.Element]]:
+    """direction の抽出と復元だけを通す（音符は反転しない）"""
+    layout_map = extract_layout_from_xml(path)
+    restore_direction_elements(path, layout_map, total_measures)
+    return _direction_events(path)
+
+
+class TestIssue74SpannerPairs:
+    """Issue #74: start/stop で線を描く direction は役割を入れ替えて反転する"""
+
+    TOTAL = 10
+
+    def test_pedal_start_precedes_stop(self, tmp_path):
+        """pedal: 元 m2 頭の start → m4 2拍目の stop は、反転後 m7 2拍目の start → m9 末の stop"""
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            2: [(0, _dir(_dt('<pedal type="start" line="yes" sign="yes"/>')))],
+            4: [(1, _dir(_dt('<pedal type="stop" line="yes" sign="no"/>')))],
+        })
+
+        pedals = [(m, offset, e.get('type'), e.get('sign'))
+                  for m, offset, e, _d in _elements(_reverse_directions(score, self.TOTAL), 'pedal')]
+
+        assert pedals == [(7, 1.0, 'start', 'yes'), (9, 2.0, 'stop', 'no')]
+
+    def test_pedal_discontinue_and_resume_are_swapped(self, tmp_path):
+        """線だけの終了（discontinue）と再開（resume）は、反転後も同じ位置で入れ替わる
+
+        元: start@m2頭 → discontinue@m3 2拍目 → resume@m5頭 → stop@m6 2拍目
+        反転後: start@m5 2拍目 → discontinue@m6末 → resume@m8 2拍目 → stop@m9末
+        """
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            2: [(0, _dir(_dt('<pedal type="start" line="yes"/>')))],
+            3: [(1, _dir(_dt('<pedal type="discontinue" line="yes"/>')))],
+            5: [(0, _dir(_dt('<pedal type="resume" line="yes"/>')))],
+            6: [(1, _dir(_dt('<pedal type="stop" line="yes"/>')))],
+        })
+
+        pedals = [(m, offset, e.get('type'))
+                  for m, offset, e, _d in _elements(_reverse_directions(score, self.TOTAL), 'pedal')]
+
+        assert pedals == [(5, 1.0, 'start'), (6, 2.0, 'discontinue'),
+                          (8, 1.0, 'resume'), (9, 2.0, 'stop')]
+
+    def test_bracket_line_end_stays_at_its_position(self, tmp_path):
+        """bracket の鉤（line-end / end-length）は役割ではなく位置に付いたまま残る"""
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            2: [(0, _dir(_dt('<bracket type="start" line-end="none" number="1"/>')))],
+            4: [(1, _dir(_dt('<bracket type="stop" line-end="down" end-length="15" number="1"/>')))],
+        })
+
+        brackets = [(m, offset, e.get('type'), e.get('line-end'), e.get('end-length'))
+                    for m, offset, e, _d in _elements(_reverse_directions(score, self.TOTAL), 'bracket')]
+
+        assert brackets == [(7, 1.0, 'start', 'down', '15'), (9, 2.0, 'stop', 'none', None)]
+
+    def test_dashes_with_cresc_words(self, tmp_path):
+        """cresc. - - - は、文字を新しい start に付けたまま decresc. に反転する"""
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            2: [(0, _dir(_dt('<words>cresc.</words>') + _dt('<dashes type="start"/>')))],
+            5: [(0, _dir(_dt('<dashes type="stop"/>')))],
+        })
+
+        dashes = _elements(_reverse_directions(score, self.TOTAL), 'dashes')
+
+        assert [(m, offset, e.get('type')) for m, offset, e, _d in dashes] == [
+            (6, 2.0, 'start'), (9, 2.0, 'stop')]
+        start_direction = dashes[0][3]
+        assert start_direction.findtext('.//{*}words') == 'decresc.'
+
+    def test_principal_voice_symbol_moves_with_start(self, tmp_path):
+        """principal-voice の記号（Hauptstimme）は新しい start に付く"""
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            2: [(0, _dir(_dt('<principal-voice type="start" symbol="Hauptstimme"/>')))],
+            4: [(1, _dir(_dt('<principal-voice type="stop" symbol="plain"/>')))],
+        })
+
+        voices = [(m, offset, e.get('type'), e.get('symbol')) for m, offset, e, _d
+                  in _elements(_reverse_directions(score, self.TOTAL), 'principal-voice')]
+
+        assert voices == [(7, 1.0, 'start', 'Hauptstimme'), (9, 2.0, 'stop', 'plain')]
+
+    def test_wedge_with_words_is_paired(self, tmp_path):
+        """words と同居する wedge もペアとして反転する（spread は位置に残る）"""
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            2: [(0, _dir(_dt('<words>poco</words>') + _dt('<wedge type="crescendo"/>')))],
+            4: [(1, _dir(_dt('<wedge type="stop" spread="15"/>')))],
+        })
+
+        wedges = _elements(_reverse_directions(score, self.TOTAL), 'wedge')
+
+        assert [(m, offset, e.get('type'), e.get('spread')) for m, offset, e, _d in wedges] == [
+            (7, 1.0, 'diminuendo', '15'), (9, 2.0, 'stop', None)]
+        assert wedges[0][3].findtext('.//{*}words') == 'poco'
+
+    def test_wedge_pairs_are_matched_per_staff(self, tmp_path):
+        """同じ number のペアが譜をまたいで交差しても取り違えない"""
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            2: [(0, _dir(_dt('<wedge type="crescendo"/>'), staff='1'))],
+            3: [(0, _dir(_dt('<wedge type="crescendo"/>'), staff='2'))],
+            4: [(0, _dir(_dt('<wedge type="stop"/>'), staff='2'))],
+            5: [(0, _dir(_dt('<wedge type="stop"/>'), staff='1'))],
+        })
+
+        wedges = _elements(_reverse_directions(score, self.TOTAL), 'wedge')
+        by_staff: dict[str, list] = {}
+        for m, offset, e, d in wedges:
+            by_staff.setdefault(d.findtext('{*}staff'), []).append((m, offset, e.get('type')))
+
+        assert by_staff == {
+            '1': [(6, 2.0, 'diminuendo'), (9, 2.0, 'stop')],
+            '2': [(7, 2.0, 'diminuendo'), (8, 2.0, 'stop')],
+        }
+
+    def test_staff_divide_direction_is_flipped(self, tmp_path):
+        """staff-divide は分割と合流が入れ替わる（down ↔ up）"""
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            3: [(0, _dir(_dt('<staff-divide type="down"/>')))],
+        })
+
+        divides = [(m, e.get('type')) for m, _offset, e, _d
+                   in _elements(_reverse_directions(score, self.TOTAL), 'staff-divide')]
+
+        assert divides == [(8, 'up')]
+
+
+def _harp_pedals(d_alter: int) -> str:
+    return (f'<harp-pedals><pedal-tuning><pedal-step>D</pedal-step>'
+            f'<pedal-alter>{d_alter}</pedal-alter></pedal-tuning></harp-pedals>')
+
+
+def _metronome(per_minute: int) -> str:
+    return (f'<metronome><beat-unit>quarter</beat-unit>'
+            f'<per-minute>{per_minute}</per-minute></metronome>')
+
+
+class TestIssue74StatefulDirections:
+    """Issue #74: 次の指示まで有効な記号（string-mute / harp-pedals / metronome）の有効範囲反転"""
+
+    TOTAL = 10
+
+    def test_string_mute_region_is_reversed_with_synthesized_off(self, tmp_path):
+        """string-mute on@m3 の区間 m3〜曲末は、反転後 m1〜m8。解除の off を m9 に合成する"""
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            3: [(0, _dir(_dt('<string-mute type="on"/>')))],
+        })
+
+        events = _reverse_directions(score, self.TOTAL)
+        mutes = [(m, offset, e.get('type')) for m, offset, e, _d in _elements(events, 'string-mute')]
+
+        assert mutes == [(1, 0.0, 'on'), (9, 0.0, 'off')]
+        assert _elements(events, 'words') == [], "記号で書かれた指示に words を合成しない"
+
+    def test_string_mute_on_off_are_not_swapped(self, tmp_path):
+        """on@m3頭 → off@m5 2拍目 は、反転後 on@m6 2拍目 → off@m9頭"""
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            3: [(0, _dir(_dt('<string-mute type="on"/>')))],
+            5: [(1, _dir(_dt('<string-mute type="off"/>')))],
+        })
+
+        mutes = [(m, offset, e.get('type')) for m, offset, e, _d
+                 in _elements(_reverse_directions(score, self.TOTAL), 'string-mute')]
+
+        assert mutes == [(6, 1.0, 'on'), (9, 0.0, 'off')]
+
+    def test_harp_pedals_move_to_region_start(self, tmp_path):
+        """harp-pedals A@m3 / B@m7 の区間 m3–6 / m7–10 は、反転後 m5–8 / m1–4
+
+        設定は区間の先頭に移る。最初の指示より前の区間（m1–2 → 反転後 m9–10）は
+        設定が分からないので何も出さない。
+        """
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            3: [(0, _dir(_dt(_harp_pedals(0))))],
+            7: [(0, _dir(_dt(_harp_pedals(1))))],
+        })
+
+        pedals = [(m, offset, e.findtext('.//{*}pedal-alter')) for m, offset, e, _d
+                  in _elements(_reverse_directions(score, self.TOTAL), 'harp-pedals')]
+
+        assert pedals == [(1, 0.0, '1'), (5, 0.0, '0')]
+
+    def test_scordatura_and_accordion_registration_are_settings(self):
+        """scordatura / accordion-registration も設定として分離される"""
+        from layout_preservation import _separate_setting_directions
+
+        scordatura = _play_state_direction(2, 0.0, None, '', None)
+        scordatura.direction_xml = _dir(_dt(
+            '<scordatura><accord string="6"><tuning-step>D</tuning-step>'
+            '<tuning-octave>2</tuning-octave></accord></scordatura>'))
+        accordion = _play_state_direction(4, 0.0, None, '', None)
+        accordion.direction_xml = _dir(_dt('<accordion-registration><accordion-high/>'
+                                           '</accordion-registration>'))
+        words = _play_state_direction(5, 0.0, None, 'espressivo', None)
+
+        settings, others = _separate_setting_directions([scordatura, accordion, words])
+
+        assert settings == [scordatura, accordion]
+        assert others == [words]
+
+    def test_metronome_only_tempo_is_range_reversed(self, tmp_path):
+        """words を持たない metronome も words のテンポと同じく有効範囲で反転する
+
+        ♩=120@m1（区間 m1–5）/ ♩=80@m6（区間 m6–10）→ 反転後 ♩=80@m1 / ♩=120@m6
+        """
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            1: [(0, _dir(_dt(_metronome(120)), sound='<sound tempo="120"/>'))],
+            6: [(0, _dir(_dt(_metronome(80)), sound='<sound tempo="80"/>'))],
+        })
+
+        tempos = [(m, e.findtext('{*}per-minute')) for m, _offset, e, _d
+                  in _elements(_reverse_directions(score, self.TOTAL), 'metronome')]
+
+        assert tempos == [(1, '80'), (6, '120')]
+
+    def test_metric_modulation_is_a_boundary_with_swapped_units(self, tmp_path):
+        """メトリック・モジュレーション（♩ = ♪.）は境界として鏡像位置に置き、左右を入れ替える
+
+        元 m6 頭（m5|m6 の境界）→ 反転後 m5|m6 の境界 = m6 頭。テンポの境界にはならないので
+        m1 の ♩=120（全曲が有効範囲）は反転後も m1 に来る。
+        """
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            1: [(0, _dir(_dt(_metronome(120)), sound='<sound tempo="120"/>'))],
+            6: [(0, _dir(_dt('<metronome><beat-unit>quarter</beat-unit>'
+                             '<beat-unit>eighth</beat-unit><beat-unit-dot/></metronome>')))],
+        })
+
+        metronomes = _elements(_reverse_directions(score, self.TOTAL), 'metronome')
+
+        assert [(m, e.findtext('{*}per-minute')) for m, _o, e, _d in metronomes
+                if e.find('{*}per-minute') is not None] == [(1, '120')]
+        modulations = [(m, offset, [c.tag.split('}')[-1] + (':' + c.text if c.text else '')
+                                    for c in e])
+                       for m, offset, e, _d in metronomes if e.find('{*}per-minute') is None]
+        assert modulations == [(6, 0.0, ['beat-unit:eighth', 'beat-unit-dot', 'beat-unit:quarter'])]
+
+
+def _words_positions(events) -> list[tuple[int, float, str]]:
+    return [(m, offset, e.text) for m, offset, e, _d in _elements(events, 'words')]
+
+
+class TestIssue74SoundNavigation:
+    """Issue #74: D.C. / D.S. / To Coda 等は保守的に扱う（境界に置き、ジャンプ指定は削除する）"""
+
+    TOTAL = 10
+
+    def _navigation_score(self, path: Path) -> None:
+        """Allegro@m1 / To Coda@m4 / Più mosso@m7（テンポはどちらも words + sound）"""
+        _write_direction_score(path, self.TOTAL, {
+            1: [(0, _dir(_dt('<words>Allegro</words>'), sound='<sound tempo="120"/>'))],
+            4: [(0, _dir(_dt('<words>To Coda</words>'), sound='<sound tocoda="coda"/>'))],
+            7: [(0, _dir(_dt('<words>Più mosso</words>'), sound='<sound tempo="140"/>'))],
+        })
+
+    def test_to_coda_does_not_contaminate_tempo_ranges(self, tmp_path):
+        """To Coda（words + sound）をテンポに数えない
+
+        Allegro の区間 m1–6 は反転後 m5–10、Più mosso の区間 m7–10 は m1–4。
+        To Coda をテンポに数えると Allegro の区間が m1–3 に縮み、反転後 m8 に来てしまう。
+        """
+        score = tmp_path / 'score.xml'
+        self._navigation_score(score)
+
+        words = _words_positions(_reverse_directions(score, self.TOTAL))
+
+        assert (5, 0.0, 'Allegro') in words, words
+        assert (1, 0.0, 'Più mosso') in words, words
+
+    def test_to_coda_is_placed_at_mirrored_boundary_without_jump(self, tmp_path):
+        """To Coda は境界（m3|m4 → 反転後 m7|m8）に置き、再生用の tocoda 指定は削除する"""
+        score = tmp_path / 'score.xml'
+        self._navigation_score(score)
+
+        events = _reverse_directions(score, self.TOTAL)
+        to_coda = [(m, offset, d) for m, offset, e, d in _elements(events, 'words')
+                   if e.text == 'To Coda']
+
+        assert [(m, offset) for m, offset, _d in to_coda] == [(8, 0.0)]
+        assert to_coda[0][2].find('{*}sound') is None
+
+    def test_segno_symbol_and_da_capo_positions(self, tmp_path):
+        """境界 b（小節 b の頭）は反転後 total - b + 2 の頭に置く。記号と文字は残す
+
+        segno@m2頭（b=2）→ m10頭、Fine@m5末（b=6）→ m6頭、D.C.@m10末（b=11）→ m1頭
+        """
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            2: [(0, _dir(_dt('<segno/>'), sound='<sound segno="s1"/>'))],
+            5: [(2, _dir(_dt('<words>Fine</words>'), sound='<sound fine="yes"/>'))],
+            10: [(2, _dir(_dt('<words>D.C. al Fine</words>'), sound='<sound dacapo="yes"/>'))],
+        })
+
+        events = _reverse_directions(score, self.TOTAL)
+
+        assert [(m, offset) for m, offset, _e, _d in _elements(events, 'segno')] == [(10, 0.0)]
+        assert sorted(_words_positions(events)) == [(1, 0.0, 'D.C. al Fine'), (6, 0.0, 'Fine')]
+        assert _elements(events, 'sound') == []
+
+    def test_other_sound_attributes_are_kept(self, tmp_path):
+        """ジャンプ以外の sound 属性（dynamics 等）は残す"""
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            3: [(0, _dir(_dt('<words>D.S.</words>'), sound='<sound dalsegno="s1" dynamics="80"/>'))],
+        })
+
+        sounds = [e.attrib for _m, _o, e, _d
+                  in _elements(_reverse_directions(score, self.TOTAL), 'sound')]
+
+        assert sounds == [{'dynamics': '80'}]
+
+    def test_report_warns_that_jumps_were_removed(self, tmp_path):
+        """ジャンプ指定を削除したことを処理レポートに警告として出す"""
+        score = tmp_path / 'score.xml'
+        self._navigation_score(score)
+
+        report = process_file(score, tmp_path / 'score_rev.xml')
+
+        assert report.success
+        warnings = [i for i in report.issues if not i.skipped and 'D.C./D.S.' in i.error_message]
+        assert [(w.part_name, w.measure_number) for w in warnings] == [('P1', 4)]

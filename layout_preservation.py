@@ -16,7 +16,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 
 @dataclass
@@ -70,6 +70,11 @@ class InstrumentRef:
     offset_quarters: float = 0.0  # 小節内の開始オフセット（持ち替えラベルの検出用）
 
 
+# 演奏順序のジャンプを指定する <sound> の属性
+NAVIGATION_SOUND_ATTRIBUTES = ('dacapo', 'dalsegno', 'tocoda', 'fine', 'segno', 'coda',
+                               'forward-repeat')
+
+
 @dataclass
 class DirectionElement:
     """Direction要素の保存用（music21が分割するもの）
@@ -90,6 +95,9 @@ class DirectionElement:
     has_rehearsal: bool = False  # rehearsal（練習番号）子要素を持つか
     staff: Optional[str] = None  # staff子要素の値（複数譜パートでの所属譜）
     sound_pizzicato: Optional[str] = None  # sound要素のpizzicato属性（'yes'/'no'）
+    has_metronome: bool = False  # direction-type に metronome を持つか
+    sound_navigation: tuple[str, ...] = ()  # sound が持つジャンプ指定の属性名（dacapo 等）
+    has_segno_coda: bool = False  # direction-type に segno / coda の記号を持つか
 
 
 @dataclass
@@ -103,6 +111,27 @@ class MeasureStyleElement:
     measure_num: int  # 元譜でのブロック開始小節
     count: int  # ブロックの小節数
     measure_style_xml: str  # measure-style要素全体のXML文字列
+
+
+# start / stop で区間を表す measure-style の子要素
+MEASURE_STYLE_RANGE_KINDS = ('measure-repeat', 'beat-repeat', 'slash')
+
+
+@dataclass
+class MeasureStyleRange:
+    """小節・拍の繰り返し記号とスラッシュ記譜（measure-repeat / beat-repeat / slash）の保存用
+
+    いずれも start と stop で区間を表し、stop は「表示が終わった最初の小節（拍）」に置かれる。
+    繰り返される実音はファイルに書かれているので、反転では記号だけを付け直す（Issue #74）。
+    """
+    kind: str  # MEASURE_STYLE_RANGE_KINDS のいずれか
+    number: Optional[str]  # measure-style の number 属性（譜の番号）
+    start_measure: int
+    start_time: float  # パート先頭からの時間（四分音符単位）
+    start_xml: str  # start 要素だけを持つ measure-style の XML 文字列
+    stop_measure: Optional[int] = None  # stop が無ければ曲末まで
+    stop_time: Optional[float] = None
+    stop_xml: Optional[str] = None
 
 
 @dataclass
@@ -121,9 +150,50 @@ class LayoutMap:
     # Key: part_id
     measure_styles: dict[str, list[MeasureStyleElement]] = field(default_factory=dict)
     # Key: part_id
+    measure_style_ranges: dict[str, list[MeasureStyleRange]] = field(default_factory=dict)
+    # Key: part_id
     defaults_xml: Optional[str] = None  # defaults要素をXML文字列として保存
     credits_xml: list[str] = field(default_factory=list)  # credit要素のXML文字列（順序保持）
     part_name: Optional[str] = None  # 表示用パート名（part-name credit のマッチング用）
+
+
+def _collect_measure_style_ranges(
+    layout_map: 'LayoutMap',
+    open_ranges: dict[tuple[str, Optional[str]], MeasureStyleRange],
+    part_id: str,
+    measure_style: ET.Element,
+    measure_num: int,
+    time: float,
+) -> None:
+    """measure-style の start / stop を区間として対応付けて保存する"""
+    number = measure_style.get('number')
+    for child in measure_style:
+        kind = child.tag.split('}')[-1]
+        if kind not in MEASURE_STYLE_RANGE_KINDS:
+            continue
+
+        wrapper = ET.Element(measure_style.tag, measure_style.attrib)
+        wrapper.append(child)
+        xml = ET.tostring(wrapper, encoding='unicode')
+        key = (kind, number)
+
+        if child.get('type') == 'start':
+            previous = open_ranges.pop(key, None)
+            if previous is not None:
+                # stop が無いまま次の start が来たら、そこで前の区間が終わったとみなす
+                previous.stop_measure, previous.stop_time = measure_num, time
+                layout_map.measure_style_ranges.setdefault(part_id, []).append(previous)
+            open_ranges[key] = MeasureStyleRange(
+                kind=kind, number=number, start_measure=measure_num,
+                start_time=time, start_xml=xml,
+            )
+        elif child.get('type') == 'stop':
+            style_range = open_ranges.pop(key, None)
+            if style_range is None:
+                continue
+            style_range.stop_measure, style_range.stop_time = measure_num, time
+            style_range.stop_xml = xml
+            layout_map.measure_style_ranges.setdefault(part_id, []).append(style_range)
 
 
 def _extract_mxl_content(mxl_path: Path) -> tuple[ET.Element, str]:
@@ -224,6 +294,8 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
         # divisions はパート全体で持ち越す（MusicXML は最初の measure で
         # 1 度だけ宣言されることが多い）
         divisions = 1.0
+        part_time = 0.0  # 小節先頭のパート内時間（四分音符単位）
+        open_style_ranges: dict[tuple[str, Optional[str]], MeasureStyleRange] = {}
 
         # 各小節を走査
         for measure in part.findall('.//{*}measure'):
@@ -317,6 +389,15 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
                     sound = elem.find('.//{*}sound')
                     words = elem.find('.//{*}direction-type/{*}words')
                     rehearsal = elem.find('.//{*}direction-type/{*}rehearsal')
+                    metronome = elem.find('.//{*}direction-type/{*}metronome')
+                    sound_navigation = tuple(
+                        attr for attr in NAVIGATION_SOUND_ATTRIBUTES
+                        if sound is not None and sound.get(attr) is not None
+                    )
+                    has_segno_coda = any(
+                        elem.find('.//{*}direction-type/{*}' + tag) is not None
+                        for tag in ('segno', 'coda')
+                    )
 
                     has_sound = sound is not None
                     has_words = words is not None
@@ -356,6 +437,9 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
                         has_rehearsal=has_rehearsal,
                         staff=staff_value,
                         sound_pizzicato=sound_pizzicato,
+                        has_metronome=metronome is not None,
+                        sound_navigation=sound_navigation,
+                        has_segno_coda=has_segno_coda,
                     )
                     layout_map.directions[part_id].append(direction_elem)
                     direction_index += 1
@@ -501,7 +585,20 @@ def extract_layout_from_xml(xml_path: Path) -> LayoutMap:
                         except ValueError:
                             pass
 
+                # 繰り返し記号・スラッシュ記譜の区間（小節の途中に置かれることもある）
+                elif elem.tag.endswith('attributes'):
+                    for measure_style in elem.findall('{*}measure-style'):
+                        _collect_measure_style_ranges(
+                            layout_map, open_style_ranges, part_id, measure_style,
+                            measure_num, part_time + current_offset,
+                        )
+
             layout_map.measures[measure_key] = measure_layout
+            part_time += measure_duration_quarters
+
+        # stop の無い区間は曲末まで続く
+        for style_range in open_style_ranges.values():
+            layout_map.measure_style_ranges.setdefault(part_id, []).append(style_range)
 
     return layout_map
 
@@ -976,133 +1073,171 @@ def _insert_direction_at_offset(
     measure.append(direction)
 
 
-def _flip_wedge_type(t: Optional[str]) -> str:
-    if t == 'crescendo':
-        return 'diminuendo'
-    if t in ('diminuendo', 'decrescendo'):
-        return 'crescendo'
-    return t or ''
+def _keep_spanner_types(start_type: str, stop_type: str) -> tuple[str, str]:
+    return start_type, stop_type
 
 
-def _wedge_only_direction(dir_elem: 'DirectionElement') -> Optional[ET.Element]:
-    """direction が wedge 単独要素ならその wedge 要素を返す。それ以外は None。"""
-    try:
-        root = ET.fromstring(dir_elem.direction_xml)
-    except ET.ParseError:
-        return None
-    direction_type = root.find('{*}direction-type')
-    if direction_type is None:
-        return None
-    children = list(direction_type)
-    if len(children) != 1:
-        return None
-    child = children[0]
-    if not child.tag.endswith('wedge'):
-        return None
-    return child
+def _reverse_wedge_types(start_type: str, stop_type: str) -> tuple[str, str]:
+    """時間反転すると crescendo と diminuendo が入れ替わる"""
+    flips = {'crescendo': 'diminuendo', 'diminuendo': 'crescendo', 'decrescendo': 'crescendo'}
+    return flips.get(start_type, start_type), stop_type
 
 
-def _separate_wedge_pairs(
-    dir_elems: list['DirectionElement']
-) -> tuple[list[tuple['DirectionElement', 'DirectionElement']], list['DirectionElement']]:
-    """direction リストから wedge start/stop ペアと、それ以外に分離する。
-
-    ペアリングは出現順に number 属性で対応付ける。ペアにならなかった
-    wedge direction は他の direction として扱う（フォールバック）。
+def _reverse_pedal_types(start_type: str, stop_type: str) -> tuple[str, str]:
+    """明示的な踏み込み・離し（start / sostenuto / stop）か、線だけの開始・終了
+    （resume / discontinue）かは端点の位置に付く性質なので、反転後も同じ位置で同じ種類にする
     """
-    pairs: list[tuple[DirectionElement, DirectionElement]] = []
+    if stop_type == 'discontinue':
+        new_start = 'resume'
+    elif start_type == 'sostenuto':
+        new_start = 'sostenuto'
+    else:
+        new_start = 'start'
+    new_stop = 'discontinue' if start_type == 'resume' else 'stop'
+    return new_start, new_stop
+
+
+@dataclass(frozen=True)
+class SpannerSpec:
+    """start と stop の2点で1本の線・記号を描く direction 要素
+
+    時間反転すると始点と終点の役割が入れ替わるので、start の direction を stop の
+    鏡像位置へ、stop の direction を start の鏡像位置へ置き直す（Issue #74）。
+    """
+    tag: str
+    start_types: frozenset[str]
+    stop_types: frozenset[str] = frozenset({'stop'})
+    # 端点の位置に付く属性（hairpin の開き・bracket の鉤など）。役割と一緒に動かさず元の位置に残す
+    position_bound_attrs: tuple[str, ...] = ()
+    reverse_types: Callable[[str, str], tuple[str, str]] = _keep_spanner_types
+    # ペアにならない単独の type の反転表
+    unpaired_type_flips: dict[str, str] = field(default_factory=dict)
+
+
+SPANNER_SPECS = (
+    SpannerSpec('wedge', frozenset({'crescendo', 'diminuendo', 'decrescendo'}),
+                position_bound_attrs=('spread', 'niente'),
+                reverse_types=_reverse_wedge_types),
+    SpannerSpec('octave-shift', frozenset({'up', 'down'})),
+    SpannerSpec('pedal', frozenset({'start', 'sostenuto', 'resume'}),
+                stop_types=frozenset({'stop', 'discontinue'}),
+                reverse_types=_reverse_pedal_types,
+                unpaired_type_flips={'discontinue': 'resume', 'resume': 'discontinue'}),
+    SpannerSpec('dashes', frozenset({'start'})),
+    SpannerSpec('bracket', frozenset({'start'}),
+                position_bound_attrs=('line-end', 'end-length')),
+    SpannerSpec('principal-voice', frozenset({'start'})),
+    # staff-divide は線を持たない単独の記号で、分割と合流の向きが入れ替わる
+    SpannerSpec('staff-divide', frozenset(),
+                unpaired_type_flips={'down': 'up', 'up': 'down'}),
+)
+_SPANNER_SPECS_BY_TAG = {spec.tag: spec for spec in SPANNER_SPECS}
+
+
+def _spanner_children(direction: ET.Element) -> list[tuple[SpannerSpec, ET.Element]]:
+    """direction の全 direction-type 配下からスパナ要素を集める"""
+    found = []
+    for direction_type in direction.findall('{*}direction-type'):
+        for child in direction_type:
+            spec = _SPANNER_SPECS_BY_TAG.get(child.tag.split('}')[-1])
+            if spec is not None:
+                found.append((spec, child))
+    return found
+
+
+def _separate_spanner_pairs(
+    dir_elems: list['DirectionElement']
+) -> tuple[list[tuple[SpannerSpec, 'DirectionElement', 'DirectionElement']],
+           list['DirectionElement']]:
+    """direction リストからスパナの start/stop ペアと、それ以外に分離する。
+
+    ペアは (要素名, number, staff) ごとに出現順で対応付ける。words 等と同居していても
+    スパナ要素が1つだけならペアにする。スパナを2つ以上持つ direction、ペアにならなかった
+    端点、continue / change 等は他の direction として扱う（フォールバック）。
+    """
+    pairs: list[tuple[SpannerSpec, DirectionElement, DirectionElement]] = []
     others: list[DirectionElement] = []
-    open_starts: dict[str, DirectionElement] = {}
+    open_starts: dict[tuple[str, str, Optional[str]], DirectionElement] = {}
 
-    classified: list[tuple[DirectionElement, Optional[ET.Element]]] = []
     for d in dir_elems:
-        wedge = _wedge_only_direction(d)
-        classified.append((d, wedge))
-
-    for d, wedge in classified:
-        if wedge is None:
+        try:
+            found = _spanner_children(ET.fromstring(d.direction_xml))
+        except ET.ParseError:
+            found = []
+        if len(found) != 1:
             others.append(d)
             continue
-        number = wedge.get('number') or '1'
-        wtype = wedge.get('type') or ''
-        if wtype in ('crescendo', 'diminuendo', 'decrescendo'):
-            # 既に開いている同 number の start は孤立扱い
-            if number in open_starts:
-                others.append(open_starts.pop(number))
-            open_starts[number] = d
-        elif wtype == 'stop':
-            start = open_starts.pop(number, None)
+
+        spec, elem = found[0]
+        key = (spec.tag, elem.get('number') or '1', d.staff)
+        spanner_type = elem.get('type') or ''
+        if spanner_type in spec.start_types:
+            # 既に開いている同じキーの start は孤立扱い
+            if key in open_starts:
+                others.append(open_starts.pop(key))
+            open_starts[key] = d
+        elif spanner_type in spec.stop_types:
+            start = open_starts.pop(key, None)
             if start is not None:
-                pairs.append((start, d))
+                pairs.append((spec, start, d))
             else:
                 others.append(d)
         else:
             others.append(d)
 
     # 未クローズの start は孤立扱い
-    for d in open_starts.values():
-        others.append(d)
+    others.extend(open_starts.values())
 
     return pairs, others
 
 
-def _octave_shift_only_direction(dir_elem: 'DirectionElement') -> Optional[ET.Element]:
-    """direction が octave-shift 単独要素ならその octave-shift 要素を返す。それ以外は None。"""
+def _build_reversed_spanner_pair(
+    spec: SpannerSpec,
+    start_dir: 'DirectionElement',
+    stop_dir: 'DirectionElement',
+) -> Optional[tuple[ET.Element, ET.Element]]:
+    """反転後の (新しい start, 新しい stop) の direction 要素を組み立てる
+
+    新しい start は元の stop の位置に、新しい stop は元の start の位置に置かれる。
+    """
     try:
-        root = ET.fromstring(dir_elem.direction_xml)
+        new_start = ET.fromstring(start_dir.direction_xml)
+        new_stop = ET.fromstring(stop_dir.direction_xml)
     except ET.ParseError:
         return None
-    direction_type = root.find('{*}direction-type')
-    if direction_type is None:
-        return None
-    children = list(direction_type)
-    if len(children) != 1:
-        return None
-    child = children[0]
-    if not child.tag.endswith('octave-shift'):
-        return None
-    return child
 
+    start_elem = _spanner_children(new_start)[0][1]
+    stop_elem = _spanner_children(new_stop)[0][1]
+    new_start_type, new_stop_type = spec.reverse_types(
+        start_elem.get('type') or '', stop_elem.get('type') or ''
+    )
+    start_elem.set('type', new_start_type)
+    stop_elem.set('type', new_stop_type)
 
-def _separate_octave_shift_pairs(
-    dir_elems: list['DirectionElement']
-) -> tuple[list[tuple['DirectionElement', 'DirectionElement']], list['DirectionElement']]:
-    """direction リストから octave-shift start/stop ペアと、それ以外に分離する。
-
-    ペアリングは出現順に number 属性で対応付ける。ペアにならなかった
-    octave-shift direction は他の direction として扱う（フォールバック）。
-    """
-    pairs: list[tuple[DirectionElement, DirectionElement]] = []
-    others: list[DirectionElement] = []
-    open_starts: dict[str, DirectionElement] = {}
-
-    for d in dir_elems:
-        os_elem = _octave_shift_only_direction(d)
-        if os_elem is None:
-            others.append(d)
-            continue
-        number = os_elem.get('number') or '1'
-        otype = os_elem.get('type') or ''
-        if otype in ('up', 'down'):
-            # 既に開いている同 number の start は孤立扱い
-            if number in open_starts:
-                others.append(open_starts.pop(number))
-            open_starts[number] = d
-        elif otype == 'stop':
-            start = open_starts.pop(number, None)
-            if start is not None:
-                pairs.append((start, d))
+    for attr in spec.position_bound_attrs:
+        start_value, stop_value = start_elem.get(attr), stop_elem.get(attr)
+        for elem, value in ((start_elem, stop_value), (stop_elem, start_value)):
+            if value is None:
+                elem.attrib.pop(attr, None)
             else:
-                others.append(d)
-        else:
-            # 'continue' などはフォールバック
-            others.append(d)
+                elem.set(attr, value)
 
-    # 未クローズの start は孤立扱い
-    for d in open_starts.values():
-        others.append(d)
+    for direction, source in ((new_start, start_dir), (new_stop, stop_dir)):
+        _strip_dynamics_x_attributes(direction)
+        if _is_dynamics_text_direction(source):
+            words = direction.find('.//{*}direction-type/{*}words')
+            if words is not None and words.text:
+                words.text = _flip_dynamics_text(words.text)
 
-    return pairs, others
+    return new_start, new_stop
+
+
+def _flip_unpaired_spanner_types(direction: ET.Element) -> None:
+    """ペアにならない単独のスパナ要素の type を反転する（staff-divide の down↔up 等）"""
+    for spec, elem in _spanner_children(direction):
+        spanner_type = elem.get('type')
+        if spanner_type in spec.unpaired_type_flips:
+            elem.set('type', spec.unpaired_type_flips[spanner_type])
 
 
 @dataclass(frozen=True)
@@ -1119,6 +1254,8 @@ class StateMarkingGroup:
     state_to_text: dict[str, str]  # 状態名 → 合成用テキスト
     sound_attribute: Optional[str] = None  # 状態を表す <sound> の属性名
     state_to_sound_value: dict[str, str] = field(default_factory=dict)
+    element_tag: Optional[str] = None  # 状態を記号で表す direction-type の要素名
+    state_to_element_type: dict[str, str] = field(default_factory=dict)
     cancel_text_overrides: dict[str, str] = field(default_factory=dict)
     # 打ち消しマーカーを合成する際の表記の上書き（キー: 打ち消される状態名）
 
@@ -1178,6 +1315,8 @@ STATE_MARKING_GROUPS = (
             'ohne dämpfer': 'open',
         },
         state_to_text={'muted': 'con sord.', 'open': 'senza sord.'},
+        element_tag='string-mute',
+        state_to_element_type={'muted': 'on', 'open': 'off'},
     ),
     # 弓の位置・奏法: sul pont. / sul tasto / col legno ↔ ord.
     StateMarkingGroup(
@@ -1233,13 +1372,25 @@ def _direction_words_variants(dir_elem: 'DirectionElement') -> list[str]:
     return [v for v in variants if v and not (v in seen or seen.add(v))]
 
 
+def _state_element(direction: ET.Element, group: StateMarkingGroup) -> Optional[ET.Element]:
+    """direction から group の状態を表す記号要素（<string-mute> 等）を探す"""
+    if group.element_tag is None:
+        return None
+    for direction_type in direction.findall('{*}direction-type'):
+        for child in direction_type:
+            if child.tag.split('}')[-1] == group.element_tag:
+                return child
+    return None
+
+
 def _get_state_marking(
     dir_elem: 'DirectionElement'
 ) -> Optional[tuple[StateMarkingGroup, str]]:
     """direction が状態指示ならその (グループ, 状態名) を返す。それ以外は None。
 
     グループが sound 属性を持つ場合はそれを優先し（楽譜ソフトによっては
-    arco に sound 属性が付かないため）、無ければ words テキストで判定する。
+    arco に sound 属性が付かないため）、次に記号（<string-mute type="on"> 等）、
+    無ければ words テキストで判定する。
     """
     # <sound> 属性による判定（現状は pizzicato のみ）
     if dir_elem.sound_pizzicato is not None:
@@ -1248,6 +1399,19 @@ def _get_state_marking(
                 continue
             for state, value in group.state_to_sound_value.items():
                 if value == dir_elem.sound_pizzicato:
+                    return group, state
+
+    try:
+        root = ET.fromstring(dir_elem.direction_xml)
+    except ET.ParseError:
+        root = None
+    if root is not None:
+        for group in STATE_MARKING_GROUPS:
+            element = _state_element(root, group)
+            if element is None:
+                continue
+            for state, element_type in group.state_to_element_type.items():
+                if element.get('type') == element_type:
                     return group, state
 
     variants = _direction_words_variants(dir_elem)
@@ -1302,6 +1466,17 @@ def _mirror_direction_position(
     return measure_num, max(0.0, offset)
 
 
+def _mirror_boundary_position(
+    dir_elem: 'DirectionElement',
+    total_measures: int,
+) -> tuple[int, float]:
+    """境界に置かれた記号の反転後位置。曲頭の境界は曲末（最終小節の末尾）に対応する"""
+    measure_num, offset = _mirror_direction_position(dir_elem, total_measures)
+    if measure_num > total_measures:
+        return total_measures, dir_elem.measure_duration_quarters
+    return measure_num, offset
+
+
 @dataclass
 class StateMarker:
     """反転後に配置する状態マーカー"""
@@ -1312,6 +1487,7 @@ class StateMarker:
     offset_quarters: float
     template: Optional['DirectionElement'] = None
     replaces: Optional[str] = None  # このマーカーが打ち消す直前の状態
+    replaced_template: Optional['DirectionElement'] = None  # 打ち消される状態の元 direction
 
 
 def _calculate_reversed_state_markers(
@@ -1409,6 +1585,8 @@ def _calculate_reversed_state_markers(
                 offset_quarters=offset,
                 template=template,
                 replaces=replaced_state,
+                replaced_template=(scope_templates.get(replaced_state)
+                                   or global_templates.get((group_name, replaced_state))),
             ))
 
         # 元譜で状態を変えていなかった指示（既に有効な状態の再掲）は、
@@ -1548,6 +1726,146 @@ def _calculate_reversed_instrument_change_labels(
     return result
 
 
+SETTING_DIRECTION_TAGS = frozenset({'harp-pedals', 'scordatura', 'accordion-registration'})
+
+
+def _setting_tag(dir_elem: 'DirectionElement') -> Optional[str]:
+    """direction が設定（harp-pedals 等）ならその要素名を返す"""
+    try:
+        root = ET.fromstring(dir_elem.direction_xml)
+    except ET.ParseError:
+        return None
+    for direction_type in root.findall('{*}direction-type'):
+        for child in direction_type:
+            tag = child.tag.split('}')[-1]
+            if tag in SETTING_DIRECTION_TAGS:
+                return tag
+    return None
+
+
+def _separate_setting_directions(
+    dir_elems: list['DirectionElement']
+) -> tuple[list['DirectionElement'], list['DirectionElement']]:
+    """direction リストから harp-pedals / scordatura / accordion-registration と、それ以外に分離する。
+
+    いずれも「次の同種の指示まで有効」な設定だが、既定状態が無いので打ち消しは合成できない。
+    打楽器の持ち替えラベルと同じく、区間の先頭（次の指示の鏡像位置）へ移す（Issue #74）。
+    """
+    settings: list[DirectionElement] = []
+    others: list[DirectionElement] = []
+    for d in dir_elems:
+        (settings if _setting_tag(d) is not None else others).append(d)
+    return settings, others
+
+
+def _calculate_reversed_setting_directions(
+    settings: list['DirectionElement'],
+    total_measures: int,
+) -> list[tuple['DirectionElement', int, float]]:
+    """設定の反転後位置を (要素名, staff) ごとに独立した区間列として算出する"""
+    by_scope: dict[tuple[Optional[str], Optional[str]], list[DirectionElement]] = {}
+    for d in settings:
+        by_scope.setdefault((_setting_tag(d), d.staff), []).append(d)
+
+    result: list[tuple[DirectionElement, int, float]] = []
+    for dirs in by_scope.values():
+        result.extend(_calculate_reversed_instrument_change_labels(dirs, total_measures))
+    return result
+
+
+def _metric_modulation_metronome(direction: ET.Element) -> Optional[ET.Element]:
+    """♩ = ♪. のように2つの音価を結ぶ metronome（メトリック・モジュレーション）を返す"""
+    for metronome in direction.iter():
+        if metronome.tag.split('}')[-1] != 'metronome':
+            continue
+        tags = [child.tag.split('}')[-1] for child in metronome]
+        if tags.count('beat-unit') >= 2 or 'metronome-relation' in tags:
+            return metronome
+    return None
+
+
+def _separate_metric_modulations(
+    dir_elems: list['DirectionElement']
+) -> tuple[list['DirectionElement'], list['DirectionElement']]:
+    """メトリック・モジュレーションを分離する。
+
+    テンポのような「次の指示まで有効」な範囲ではなく、前後のテンポを結ぶ境界なので、
+    テンポ判定より前に分離して境界として鏡像位置に置く。
+    """
+    modulations: list[DirectionElement] = []
+    others: list[DirectionElement] = []
+    for d in dir_elems:
+        is_modulation = False
+        if d.has_metronome:
+            try:
+                is_modulation = _metric_modulation_metronome(ET.fromstring(d.direction_xml)) is not None
+            except ET.ParseError:
+                pass
+        (modulations if is_modulation else others).append(d)
+    return modulations, others
+
+
+def _swap_metric_modulation(metronome: ET.Element) -> None:
+    """メトリック・モジュレーションの左右を入れ替える（時間反転で前後のテンポが逆になる）"""
+    children = list(metronome)
+    tags = [child.tag.split('}')[-1] for child in children]
+    if 'metronome-relation' in tags:
+        split = tags.index('metronome-relation')
+        first_note = next((i for i, t in enumerate(tags) if t == 'metronome-note'), split)
+        prefix, left = children[:first_note], children[first_note:split]
+        relation, right = [children[split]], children[split + 1:]
+    else:
+        starts = [i for i, t in enumerate(tags) if t == 'beat-unit']
+        if len(starts) != 2:
+            return
+        prefix, left = children[:starts[0]], children[starts[0]:starts[1]]
+        relation, right = [], children[starts[1]:]
+
+    for child in children:
+        metronome.remove(child)
+    for child in prefix + right + relation + left:
+        metronome.append(child)
+
+
+def _separate_navigation_directions(
+    dir_elems: list['DirectionElement']
+) -> tuple[list['DirectionElement'], list['DirectionElement']]:
+    """D.C. / D.S. / To Coda / segno / coda 等の演奏順序の指示と、それ以外に分離する。
+
+    時間反転後の演奏順序は、曲頭以外から始まる・先に前方へ飛んでから戻る等、標準記譜で
+    表せないことが多い。記号と文字は境界として鏡像位置に置き、再生用のジャンプ指定は
+    削除する（Issue #74）。To Coda 等は words + sound を持つため、テンポ判定より前に分離する。
+    """
+    navigation: list[DirectionElement] = []
+    others: list[DirectionElement] = []
+    for d in dir_elems:
+        (navigation if d.sound_navigation or d.has_segno_coda else others).append(d)
+    return navigation, others
+
+
+def _remove_navigation_sound(direction: ET.Element) -> None:
+    """<sound> からジャンプ指定を削除し、意味のある指定が残らなければ <sound> ごと削除する"""
+    for sound in list(direction.findall('{*}sound')):
+        for attr in NAVIGATION_SOUND_ATTRIBUTES:
+            sound.attrib.pop(attr, None)
+        if set(sound.attrib) <= {'time-only'} and len(sound) == 0:
+            direction.remove(sound)
+
+
+def _replace_words_text(direction: ET.Element, text: str) -> None:
+    """direction の words を text 1つにまとめる（分割された words は先頭以外を削除）"""
+    words_elems = [e for e in direction.iter() if e.tag.split('}')[-1] == 'words']
+    if not words_elems:
+        return
+    words_elems[0].text = text
+    for direction_type in direction.findall('{*}direction-type'):
+        for child in list(direction_type):
+            if any(child is w for w in words_elems[1:]):
+                direction_type.remove(child)
+        if len(direction_type) == 0:
+            direction.remove(direction_type)
+
+
 def _strip_words_x_attributes(direction_root: ET.Element) -> None:
     """direction / words から default-x/relative-x を除去する。
 
@@ -1574,9 +1892,24 @@ def _build_state_marking_direction(marker: 'StateMarker') -> Optional[ET.Element
     """
     group, state = marker.group, marker.state
 
-    if marker.template is not None:
+    if state == group.default_state and marker.replaces is not None:
+        words_text = group.cancel_text(marker.replaces)
+    else:
+        words_text = group.state_to_text.get(state)
+
+    template, template_is_other_state = marker.template, False
+    if template is None and marker.replaced_template is not None:
+        # 記号（string-mute 等）で書かれた指示の打ち消しは、words ではなく同じ記号で合成する
         try:
-            direction = ET.fromstring(marker.template.direction_xml)
+            replaced = ET.fromstring(marker.replaced_template.direction_xml)
+        except ET.ParseError:
+            replaced = None
+        if replaced is not None and _state_element(replaced, group) is not None:
+            template, template_is_other_state = marker.replaced_template, True
+
+    if template is not None:
+        try:
+            direction = ET.fromstring(template.direction_xml)
         except ET.ParseError:
             direction = None
         if direction is not None:
@@ -1584,12 +1917,13 @@ def _build_state_marking_direction(marker: 'StateMarker') -> Optional[ET.Element
             _strip_dynamics_x_attributes(direction)
             _set_direction_staff(direction, marker.staff)
             _set_direction_state_sound(direction, group, state)
+            element = _state_element(direction, group)
+            if element is not None and state in group.state_to_element_type:
+                element.set('type', group.state_to_element_type[state])
+            if template_is_other_state and words_text is not None:
+                _replace_words_text(direction, words_text)
             return direction
 
-    if state == group.default_state and marker.replaces is not None:
-        words_text = group.cancel_text(marker.replaces)
-    else:
-        words_text = group.state_to_text.get(state)
     if words_text is None:
         return None
 
@@ -1784,9 +2118,10 @@ def _create_parenthesized_dynamics_direction(
 def _is_tempo_direction(dir_elem: DirectionElement) -> bool:
     """direction要素がテンポ関連かどうかを判定する
 
-    sound子要素を持つwordsはテンポ指示と判断する。
+    sound子要素を持つwords、または metronome を持つ direction はテンポ指示と判断する。
+    メトリック・モジュレーションは範囲ではなく境界なので、呼び出し前に分離しておく。
     """
-    return dir_elem.has_sound and dir_elem.has_words
+    return (dir_elem.has_sound and dir_elem.has_words) or dir_elem.has_metronome
 
 
 def _calculate_reversed_tempo_directions(
@@ -1900,19 +2235,25 @@ def restore_direction_elements(
                 measure.remove(d)
 
         # direction要素をカテゴリに分離:
-        # 1. wedge ペア (cresc/dim) → type 反転 + 時間反転オフセットで再配置
+        # 1. スパナのペア (wedge / octave-shift / pedal / dashes / bracket 等)
+        #    → start と stop の役割を入れ替えて時間反転オフセットで再配置
         # 2. 奏法状態 (pizz./arco) → 有効範囲ベースで反転 + 打ち消しマーカー生成
         # 3. テンポ関連 (sound + words) → 有効範囲ベースで反転
         # 4. ダイナミクス → 有効範囲ベースで反転 + 括弧付きマーカー
         # 5. 打楽器の持ち替えラベル → 区間の先頭へ移す
         # 6. その他 (テキスト等) → 単純な位置反転
+        # 7. 設定 (harp-pedals 等) → 区間の先頭へ移す
+        # 8. メトリック・モジュレーション → 境界として鏡像位置、左右の音価を入れ替え
+        # 9. 演奏順序 (D.C. / D.S. / segno 等) → 境界として鏡像位置、ジャンプ指定は削除
         #
-        # 奏法状態は words + sound を持つためテンポ判定より前に分離する
+        # 奏法状態や To Coda は words + sound を持つためテンポ判定より前に分離する
         # （テンポとして誤分類されるだけでなく、テンポの有効範囲境界も汚染するため）
         all_directions = original_layout_map.directions[part_id]
-        wedge_pairs, non_wedge_dirs = _separate_wedge_pairs(all_directions)
-        octave_shift_pairs, non_pair_dirs = _separate_octave_shift_pairs(non_wedge_dirs)
+        spanner_pairs, non_pair_dirs = _separate_spanner_pairs(all_directions)
+        navigation_directions, non_pair_dirs = _separate_navigation_directions(non_pair_dirs)
         state_marking_directions, non_state_dirs = _separate_state_marking_directions(non_pair_dirs)
+        setting_directions, non_state_dirs = _separate_setting_directions(non_state_dirs)
+        metric_modulations, non_state_dirs = _separate_metric_modulations(non_state_dirs)
         instrument_change_labels, non_state_dirs = _separate_instrument_change_labels(
             non_state_dirs, original_layout_map.instrument_refs.get(part_id, [])
         )
@@ -1963,82 +2304,34 @@ def restore_direction_elements(
             except ET.ParseError:
                 pass
 
-        # 2. wedge ペアの復元（時間反転に伴い type を反転、配置を入れ替え）
-        for start_dir, stop_dir in wedge_pairs:
-            # 元: start at measure A, offset SA → stop at measure B, offset SB
-            # 時間反転すると、反転後の各 direction の小節内オフセットは
-            # (反転後の小節長) - (元のオフセット) になる。
-            # さらに start/stop のロールが入れ替わるため:
-            #   新 start (type 反転) = 反転後の B 小節, offset = M(B') - SB
-            #   新 stop                = 反転後の A 小節, offset = M(A') - SA
-            new_start_measure = total_measures - stop_dir.measure_num + 1
-            new_stop_measure = total_measures - start_dir.measure_num + 1
-
-            try:
-                if new_start_measure in measure_map:
-                    target = measure_map[new_start_measure]
-                    new_start_xml = ET.fromstring(start_dir.direction_xml)
-                    _strip_dynamics_x_attributes(new_start_xml)
-                    wedge_elem = new_start_xml.find('.//{*}direction-type/{*}wedge')
-                    if wedge_elem is not None:
-                        cur_type = wedge_elem.get('type')
-                        wedge_elem.set('type', _flip_wedge_type(cur_type))
-                    # 反転後の小節長は元の対応小節（stop の元小節）と等しい
-                    target_dur = stop_dir.measure_duration_quarters
-                    target_offset = max(0.0, target_dur - stop_dir.offset_quarters)
-                    _insert_direction_at_offset(
-                        target, new_start_xml, target_offset, part_divisions
-                    )
-
-                if new_stop_measure in measure_map:
-                    target = measure_map[new_stop_measure]
-                    new_stop_xml = ET.fromstring(stop_dir.direction_xml)
-                    _strip_dynamics_x_attributes(new_stop_xml)
-                    target_dur = start_dir.measure_duration_quarters
-                    target_offset = max(0.0, target_dur - start_dir.offset_quarters)
-                    _insert_direction_at_offset(
-                        target, new_stop_xml, target_offset, part_divisions
-                    )
-            except ET.ParseError:
-                pass
-
-        # 2b. octave-shift ペアの復元（時間反転に伴い start/stop の位置を入れ替える）
-        # wedge と異なり type は反転せず、start (down/up) と stop の役割だけが入れ替わる:
-        #   元: start (down/up) at measure A offset SA → stop at measure B offset SB
-        #   新 start (down/up と同じ) = 反転後の B 小節, offset = M(B') - SB
-        #   新 stop                     = 反転後の A 小節, offset = M(A') - SA
-        for start_dir, stop_dir in octave_shift_pairs:
-            new_start_measure = total_measures - stop_dir.measure_num + 1
-            new_stop_measure = total_measures - start_dir.measure_num + 1
-
-            try:
-                if new_start_measure in measure_map:
-                    target = measure_map[new_start_measure]
-                    new_start_xml = ET.fromstring(start_dir.direction_xml)
-                    _strip_dynamics_x_attributes(new_start_xml)
-                    target_dur = stop_dir.measure_duration_quarters
-                    target_offset = max(0.0, target_dur - stop_dir.offset_quarters)
-                    _insert_direction_at_offset(
-                        target, new_start_xml, target_offset, part_divisions
-                    )
-
-                if new_stop_measure in measure_map:
-                    target = measure_map[new_stop_measure]
-                    new_stop_xml = ET.fromstring(stop_dir.direction_xml)
-                    _strip_dynamics_x_attributes(new_stop_xml)
-                    target_dur = start_dir.measure_duration_quarters
-                    target_offset = max(0.0, target_dur - start_dir.offset_quarters)
-                    _insert_direction_at_offset(
-                        target, new_stop_xml, target_offset, part_divisions
-                    )
-            except ET.ParseError:
-                pass
+        # 2. スパナのペアの復元（start と stop の役割を入れ替えて置き直す）
+        #   元: start at measure A offset SA → stop at measure B offset SB
+        #   新 start = 反転後の B 小節, offset = M(B) - SB
+        #   新 stop  = 反転後の A 小節, offset = M(A) - SA
+        # 反転後の小節は元の対応小節と同じ長さなので M は元の小節長を使う
+        for spec, start_dir, stop_dir in spanner_pairs:
+            built = _build_reversed_spanner_pair(spec, start_dir, stop_dir)
+            if built is None:
+                continue
+            new_start, new_stop = built
+            for direction, source in ((new_start, stop_dir), (new_stop, start_dir)):
+                target_measure_num = total_measures - source.measure_num + 1
+                if target_measure_num not in measure_map:
+                    continue
+                target_offset = max(0.0, source.measure_duration_quarters - source.offset_quarters)
+                _insert_direction_at_offset(
+                    measure_map[target_measure_num], direction, target_offset, part_divisions
+                )
 
         # 3. ダイナミクスの有効範囲ベース反転
         # テキスト形式の強弱変化指示（cresc./decresc.）の小節番号を境界として渡す
+        # （cresc. + dashes のようにスパナのペアに入ったものも境界に含める）
         text_dyn_measures = [
             d.measure_num for d in other_directions
             if _is_dynamics_text_direction(d)
+        ] + [
+            d.measure_num for _spec, start_dir, stop_dir in spanner_pairs
+            for d in (start_dir, stop_dir) if _is_dynamics_text_direction(d)
         ]
         reversed_dynamics = _calculate_reversed_dynamics_directions(
             dynamics_directions, total_measures, text_dyn_measures
@@ -2103,6 +2396,7 @@ def restore_direction_elements(
             try:
                 restored_direction = ET.fromstring(dir_elem.direction_xml)
                 _strip_dynamics_x_attributes(restored_direction)
+                _flip_unpaired_spanner_types(restored_direction)
 
                 # テキスト形式の cresc./decresc. を反転し、小節先頭に配置
                 if _is_dynamics_text_direction(dir_elem):
@@ -2179,6 +2473,61 @@ def restore_direction_elements(
                 continue
             _strip_words_x_attributes(restored_direction)
             _strip_dynamics_x_attributes(restored_direction)
+            _insert_direction_at_offset(
+                measure_map[measure_num], restored_direction, offset, part_divisions
+            )
+
+        # 8. 設定（harp-pedals / scordatura / accordion-registration）を区間の先頭に移して挿入
+        reversed_settings = _calculate_reversed_setting_directions(
+            setting_directions, total_measures
+        )
+
+        for dir_elem, measure_num, offset in reversed_settings:
+            if measure_num not in measure_map:
+                continue
+
+            try:
+                restored_direction = ET.fromstring(dir_elem.direction_xml)
+            except ET.ParseError:
+                continue
+            _strip_words_x_attributes(restored_direction)
+            _strip_dynamics_x_attributes(restored_direction)
+            _insert_direction_at_offset(
+                measure_map[measure_num], restored_direction, offset, part_divisions
+            )
+
+        # 9. メトリック・モジュレーションは境界として鏡像位置に置き、左右の音価を入れ替える
+        for dir_elem in metric_modulations:
+            measure_num, offset = _mirror_boundary_position(dir_elem, total_measures)
+            if measure_num not in measure_map:
+                continue
+
+            try:
+                restored_direction = ET.fromstring(dir_elem.direction_xml)
+            except ET.ParseError:
+                continue
+            _strip_words_x_attributes(restored_direction)
+            _strip_dynamics_x_attributes(restored_direction)
+            metronome = _metric_modulation_metronome(restored_direction)
+            if metronome is not None:
+                _swap_metric_modulation(metronome)
+            _insert_direction_at_offset(
+                measure_map[measure_num], restored_direction, offset, part_divisions
+            )
+
+        # 10. 演奏順序の指示は境界として鏡像位置に置き、再生用のジャンプ指定は削除する
+        for dir_elem in navigation_directions:
+            measure_num, offset = _mirror_boundary_position(dir_elem, total_measures)
+            if measure_num not in measure_map:
+                continue
+
+            try:
+                restored_direction = ET.fromstring(dir_elem.direction_xml)
+            except ET.ParseError:
+                continue
+            _strip_words_x_attributes(restored_direction)
+            _strip_dynamics_x_attributes(restored_direction)
+            _remove_navigation_sound(restored_direction)
             _insert_direction_at_offset(
                 measure_map[measure_num], restored_direction, offset, part_divisions
             )
@@ -2682,6 +3031,8 @@ def _measure_attributes_for_insert(measure: ET.Element) -> ET.Element:
     for child in measure:
         if child.tag.endswith('attributes'):
             return child
+        if child.tag.endswith(('note', 'backup', 'forward')):
+            break
 
     attributes = ET.Element('attributes')
     insert_pos = 0
@@ -2694,13 +3045,146 @@ def _measure_attributes_for_insert(measure: ET.Element) -> ET.Element:
     return attributes
 
 
-def restore_multiple_rests(
+_NOTE_TYPE_QUARTERS = {
+    'maxima': 32.0, 'long': 16.0, 'breve': 8.0, 'whole': 4.0, 'half': 2.0,
+    'quarter': 1.0, 'eighth': 0.5, '16th': 0.25, '32nd': 0.125, '64th': 1 / 16,
+    '128th': 1 / 32, '256th': 1 / 64, '512th': 1 / 128, '1024th': 1 / 256,
+}
+
+
+def _measure_style_range_child(measure_style_xml: str) -> Optional[ET.Element]:
+    """measure-style の XML から measure-repeat / beat-repeat / slash 要素を返す"""
+    try:
+        measure_style = ET.fromstring(measure_style_xml)
+    except ET.ParseError:
+        return None
+    for child in measure_style:
+        if child.tag.split('}')[-1] in MEASURE_STYLE_RANGE_KINDS:
+            return child
+    return None
+
+
+def _measure_style_stop_xml(start_xml: str) -> str:
+    """元譜に stop が無い区間の stop を start から合成する"""
+    measure_style = ET.fromstring(start_xml)
+    for child in measure_style:
+        if child.tag.split('}')[-1] in MEASURE_STYLE_RANGE_KINDS:
+            child.set('type', 'stop')
+            child.attrib.pop('slashes', None)
+            child.text = None
+    return ET.tostring(measure_style, encoding='unicode')
+
+
+def _measure_timeline(part: ET.Element, divisions: float) -> list[tuple[int, float, float]]:
+    """(小節番号, パート内の開始時刻, 小節長) を小節の並び順に返す（四分音符単位）"""
+    timeline: list[tuple[int, float, float]] = []
+    start = 0.0
+    for measure in part.findall('{*}measure'):
+        try:
+            measure_num = int(measure.get('number'))
+        except (TypeError, ValueError):
+            continue
+        duration = _measure_total_quarters(measure, divisions)
+        timeline.append((measure_num, start, duration))
+        start += duration
+    return timeline
+
+
+def _timeline_position(
+    timeline: list[tuple[int, float, float]], time: float
+) -> Optional[tuple[int, float]]:
+    """パート内時刻を (小節番号, 小節内オフセット) に変換する。曲末以降なら None"""
+    epsilon = 1e-6
+    for measure_num, start, duration in timeline:
+        if start - epsilon <= time < start + duration - epsilon:
+            return measure_num, max(0.0, time - start)
+    return None
+
+
+def _reversed_measure_style_placements(
+    style_range: MeasureStyleRange,
+    total_measures: int,
+    timeline: list[tuple[int, float, float]],
+) -> list[tuple[int, float, str]]:
+    """繰り返し記号・スラッシュ記譜の反転後の (小節番号, 小節内オフセット, measure-style XML)
+
+    slash は表示区間 [a, b) をそのまま時間反転する。measure-repeat / beat-repeat は元になる
+    N 小節（1単位の拍）が区間の直前にあり、反転後はそれがブロックの末尾に来てしまう。
+    周期的な並びは反転しても同じ周期なので、反転後のブロックの先頭 N 小節（1単位）を実音として
+    残し、その直後から繰り返しにする。
+    """
+    epsilon = 1e-6
+    start_xml = style_range.start_xml
+    stop_xml = style_range.stop_xml or _measure_style_stop_xml(start_xml)
+    start_child = _measure_style_range_child(start_xml)
+    if start_child is None:
+        return []
+
+    if style_range.kind == 'measure-repeat':
+        try:
+            count = int((start_child.text or '1').strip())
+        except ValueError:
+            count = 1
+        # 元: 実音 [M-N, M)、繰り返し [M, S) → 反転後のブロック [T-S+2, T-M+N+2)
+        stop_measure = style_range.stop_measure or total_measures + 1
+        start = total_measures - stop_measure + 2 + count
+        stop = total_measures - style_range.start_measure + count + 2
+        if start >= stop or not 1 <= start <= total_measures:
+            return []
+        placements = [(start, 0.0, start_xml)]
+        if stop <= total_measures:
+            placements.append((stop, 0.0, stop_xml))
+        return placements
+
+    if not timeline:
+        return []
+    total_time = timeline[-1][1] + timeline[-1][2]
+
+    unit = 0.0
+    if style_range.kind == 'beat-repeat':
+        base = _NOTE_TYPE_QUARTERS.get((start_child.findtext('{*}slash-type') or '').strip(), 1.0)
+        dots = len(start_child.findall('{*}slash-dot'))
+        unit = base * (2 - 0.5 ** dots)
+
+    original_stop = style_range.stop_time if style_range.stop_time is not None else total_time
+    start_time = total_time - original_stop + unit
+    stop_time = total_time - style_range.start_time + unit
+    if start_time >= stop_time - epsilon:
+        return []
+
+    start_position = _timeline_position(timeline, start_time)
+    if start_position is None:
+        return []
+    placements = [(*start_position, start_xml)]
+    stop_position = _timeline_position(timeline, stop_time)
+    if stop_position is not None:
+        placements.append((*stop_position, stop_xml))
+    return placements
+
+
+def _insert_measure_style(
+    measure: ET.Element,
+    measure_style: ET.Element,
+    offset_quarters: float,
+    divisions: float,
+) -> None:
+    """measure-style を小節内のオフセット位置の <attributes> に入れる"""
+    if offset_quarters <= 1e-6:
+        # <measure-style> は <attributes> の子要素順で最後なので末尾に追加する
+        _measure_attributes_for_insert(measure).append(measure_style)
+        return
+    attributes = ET.Element('attributes')
+    attributes.append(measure_style)
+    _insert_direction_at_offset(measure, attributes, offset_quarters, divisions)
+
+
+def restore_measure_styles(
     output_xml_path: Path,
     original_layout_map: LayoutMap,
     total_measures: int,
     verbose: bool = False,
 ) -> None:
-    """複数小節休符（multiple-rest）を反転後のブロック先頭に置き直す
+    """複数小節休符・繰り返し記号・スラッシュ記譜（measure-style）を反転後の位置に置き直す
 
     <multiple-rest>N</multiple-rest> は「この小節から N 小節」という前方向スパン。
     時間反転すると元の小節 M..M+N-1 のブロックは反転後の
@@ -2708,16 +3192,20 @@ def restore_multiple_rests(
     total-M-N+2 に置く必要がある。小節と一緒に運ばれるとブロック末尾に付いたままになり、
     音符のある小節を休符として結合してしまう。
 
+    <measure-repeat> / <beat-repeat> / <slash> は start / stop の区間として置き直す
+    （_reversed_measure_style_placements、Issue #74）。
+
     出力に残っているものを動かすのではなく、元譜から保存した情報で置き直す
     （music21 が N=1 の multiple-rest を落とすため、消失も同時に回復できる）。
 
     Args:
         output_xml_path: 処理対象のMusicXMLファイル(.xml または .mxl)
-        original_layout_map: 元のレイアウト情報（measure_styles を含む）
+        original_layout_map: 元のレイアウト情報（measure_styles / measure_style_ranges を含む）
         total_measures: 総小節数（反転計算用）
         verbose: デバッグ出力を有効にする
     """
-    if not original_layout_map or not original_layout_map.measure_styles:
+    if not original_layout_map or not (original_layout_map.measure_styles
+                                       or original_layout_map.measure_style_ranges):
         return
 
     is_mxl = output_xml_path.suffix == '.mxl'
@@ -2731,7 +3219,9 @@ def restore_multiple_rests(
     for part_idx, part in enumerate(root.findall('.//{*}part')):
         part_id = part.get('id', f'P{part_idx + 1}')
 
-        if part_id not in original_layout_map.measure_styles:
+        multiple_rests = original_layout_map.measure_styles.get(part_id, [])
+        style_ranges = original_layout_map.measure_style_ranges.get(part_id, [])
+        if not multiple_rests and not style_ranges:
             continue
 
         measure_map: dict[int, ET.Element] = {}
@@ -2743,18 +3233,40 @@ def restore_multiple_rests(
                 except ValueError:
                     pass
 
-        # music21 が出力した multiple-rest を全て削除する
+        # music21 が小節と一緒に運んだ measure-style を削除する
         for measure in part.findall('{*}measure'):
             for attributes in list(measure.findall('{*}attributes')):
                 for measure_style in list(attributes.findall('{*}measure-style')):
-                    if measure_style.find('{*}multiple-rest') is None:
+                    if measure_style.find('{*}multiple-rest') is not None:
+                        attributes.remove(measure_style)
                         continue
-                    attributes.remove(measure_style)
+                    for child in list(measure_style):
+                        if child.tag.split('}')[-1] in MEASURE_STYLE_RANGE_KINDS:
+                            measure_style.remove(child)
+                    if len(measure_style) == 0:
+                        attributes.remove(measure_style)
                 if len(attributes) == 0:
                     measure.remove(attributes)
 
-        # 反転後のブロック先頭に挿入する
-        for style in original_layout_map.measure_styles[part_id]:
+        # 繰り返し記号・スラッシュ記譜を区間として置き直す
+        part_divisions = _find_part_divisions(part)
+        timeline = _measure_timeline(part, part_divisions)
+        for style_range in style_ranges:
+            for measure_num, offset, xml in _reversed_measure_style_placements(
+                    style_range, total_measures, timeline):
+                if measure_num not in measure_map:
+                    continue
+                try:
+                    restored = ET.fromstring(xml)
+                except ET.ParseError:
+                    continue
+                _insert_measure_style(measure_map[measure_num], restored, offset, part_divisions)
+                if verbose:
+                    print(f"  {style_range.kind}: 元 m{style_range.start_measure} "
+                          f"→ 反転後 m{measure_num} ({offset}拍)")
+
+        # 複数小節休符を反転後のブロック先頭に挿入する
+        for style in multiple_rests:
             target = total_measures - style.measure_num - style.count + 2
             if target not in measure_map:
                 if verbose:
