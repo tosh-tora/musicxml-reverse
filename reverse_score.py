@@ -1591,6 +1591,15 @@ def process_file(input_path: Path, output_path: Path,
         try:
             original_layout = extract_layout_from_xml(input_path)
             layout_extraction_success = True
+            for part_id, directions in original_layout.directions.items():
+                for d in directions:
+                    if d.sound_navigation:
+                        report.add_issue(
+                            part_id, d.measure_num,
+                            "D.C./D.S. 等の演奏順序は反転後に変換できないため、再生用のジャンプ指定"
+                            f"（{', '.join(d.sound_navigation)}）を削除しました。演奏順序を確認してください",
+                            skipped=False,
+                        )
         except Exception as layout_error:
             print(f"  警告: レイアウト抽出に失敗しました: {layout_error}")
             original_layout = None
