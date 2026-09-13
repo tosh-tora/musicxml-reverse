@@ -919,3 +919,208 @@ class TestIssue73InstrumentChangeLabels:
 
         assert labels == []
         assert others == dirs
+
+# ---------------------------------------------------------------------------
+# Issue #74: 最小構成の楽譜で direction の反転を検証するヘルパー
+# ---------------------------------------------------------------------------
+
+def _dt(inner: str) -> str:
+    return f'<direction-type>{inner}</direction-type>'
+
+
+def _dir(direction_types: str, staff: Optional[str] = None, sound: str = '') -> str:
+    staff_xml = f'<staff>{staff}</staff>' if staff else ''
+    return f'<direction placement="below">{direction_types}{staff_xml}{sound}</direction>'
+
+
+def _write_direction_score(path: Path, total_measures: int,
+                           directions: dict[int, list[tuple[float, str]]],
+                           beats: int = 2) -> None:
+    """divisions=1、各小節に四分音符を beats 個並べた楽譜を書き出す
+
+    Args:
+        directions: {小節番号: [(小節内オフセット, direction XML)]}。
+            オフセットが beats 以上なら小節末（音符の後）に置く
+    """
+    measures = []
+    for num in range(1, total_measures + 1):
+        body = ''
+        if num == 1:
+            body += ('<attributes><divisions>1</divisions><key><fifths>0</fifths></key>'
+                     f'<time><beats>{beats}</beats><beat-type>4</beat-type></time>'
+                     '<clef><sign>G</sign><line>2</line></clef></attributes>')
+        placed = directions.get(num, [])
+        for beat in range(beats):
+            body += ''.join(xml for offset, xml in placed if offset == beat)
+            body += ('<note><pitch><step>C</step><octave>5</octave></pitch>'
+                     '<duration>1</duration><voice>1</voice><type>quarter</type></note>')
+        body += ''.join(xml for offset, xml in placed if offset >= beats)
+        measures.append(f'    <measure number="{num}">{body}</measure>\n')
+    path.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<score-partwise version="4.0">\n'
+        '  <part-list><score-part id="P1"><part-name>Test</part-name></score-part></part-list>\n'
+        '  <part id="P1">\n' + ''.join(measures) + '  </part>\n'
+        '</score-partwise>\n',
+        encoding='utf-8',
+    )
+
+
+def _direction_events(path: Path) -> list[tuple[int, float, ET.Element]]:
+    """(小節番号, 小節内オフセット, direction 要素) を出現順に返す"""
+    root = ET.parse(path).getroot()
+    events = []
+    for measure in root.findall('.//{*}measure'):
+        offset = 0.0
+        for child in measure:
+            tag = child.tag.split('}')[-1]
+            if tag == 'note' and child.find('{*}chord') is None:
+                offset += float(child.findtext('{*}duration'))
+            elif tag == 'backup':
+                offset -= float(child.findtext('{*}duration'))
+            elif tag == 'forward':
+                offset += float(child.findtext('{*}duration'))
+            elif tag == 'direction':
+                events.append((int(measure.get('number')), offset, child))
+    return events
+
+
+def _elements(events, tag: str) -> list[tuple[int, float, ET.Element, ET.Element]]:
+    """events から tag 要素を (小節, オフセット, 要素, direction) で抜き出す"""
+    return [(m, offset, elem, direction)
+            for m, offset, direction in events
+            for elem in direction.iter() if elem.tag.split('}')[-1] == tag]
+
+
+def _reverse_directions(path: Path, total_measures: int) -> list[tuple[int, float, ET.Element]]:
+    """direction の抽出と復元だけを通す（音符は反転しない）"""
+    layout_map = extract_layout_from_xml(path)
+    restore_direction_elements(path, layout_map, total_measures)
+    return _direction_events(path)
+
+
+class TestIssue74SpannerPairs:
+    """Issue #74: start/stop で線を描く direction は役割を入れ替えて反転する"""
+
+    TOTAL = 10
+
+    def test_pedal_start_precedes_stop(self, tmp_path):
+        """pedal: 元 m2 頭の start → m4 2拍目の stop は、反転後 m7 2拍目の start → m9 末の stop"""
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            2: [(0, _dir(_dt('<pedal type="start" line="yes" sign="yes"/>')))],
+            4: [(1, _dir(_dt('<pedal type="stop" line="yes" sign="no"/>')))],
+        })
+
+        pedals = [(m, offset, e.get('type'), e.get('sign'))
+                  for m, offset, e, _d in _elements(_reverse_directions(score, self.TOTAL), 'pedal')]
+
+        assert pedals == [(7, 1.0, 'start', 'yes'), (9, 2.0, 'stop', 'no')]
+
+    def test_pedal_discontinue_and_resume_are_swapped(self, tmp_path):
+        """線だけの終了（discontinue）と再開（resume）は、反転後も同じ位置で入れ替わる
+
+        元: start@m2頭 → discontinue@m3 2拍目 → resume@m5頭 → stop@m6 2拍目
+        反転後: start@m5 2拍目 → discontinue@m6末 → resume@m8 2拍目 → stop@m9末
+        """
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            2: [(0, _dir(_dt('<pedal type="start" line="yes"/>')))],
+            3: [(1, _dir(_dt('<pedal type="discontinue" line="yes"/>')))],
+            5: [(0, _dir(_dt('<pedal type="resume" line="yes"/>')))],
+            6: [(1, _dir(_dt('<pedal type="stop" line="yes"/>')))],
+        })
+
+        pedals = [(m, offset, e.get('type'))
+                  for m, offset, e, _d in _elements(_reverse_directions(score, self.TOTAL), 'pedal')]
+
+        assert pedals == [(5, 1.0, 'start'), (6, 2.0, 'discontinue'),
+                          (8, 1.0, 'resume'), (9, 2.0, 'stop')]
+
+    def test_bracket_line_end_stays_at_its_position(self, tmp_path):
+        """bracket の鉤（line-end / end-length）は役割ではなく位置に付いたまま残る"""
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            2: [(0, _dir(_dt('<bracket type="start" line-end="none" number="1"/>')))],
+            4: [(1, _dir(_dt('<bracket type="stop" line-end="down" end-length="15" number="1"/>')))],
+        })
+
+        brackets = [(m, offset, e.get('type'), e.get('line-end'), e.get('end-length'))
+                    for m, offset, e, _d in _elements(_reverse_directions(score, self.TOTAL), 'bracket')]
+
+        assert brackets == [(7, 1.0, 'start', 'down', '15'), (9, 2.0, 'stop', 'none', None)]
+
+    def test_dashes_with_cresc_words(self, tmp_path):
+        """cresc. - - - は、文字を新しい start に付けたまま decresc. に反転する"""
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            2: [(0, _dir(_dt('<words>cresc.</words>') + _dt('<dashes type="start"/>')))],
+            5: [(0, _dir(_dt('<dashes type="stop"/>')))],
+        })
+
+        dashes = _elements(_reverse_directions(score, self.TOTAL), 'dashes')
+
+        assert [(m, offset, e.get('type')) for m, offset, e, _d in dashes] == [
+            (6, 2.0, 'start'), (9, 2.0, 'stop')]
+        start_direction = dashes[0][3]
+        assert start_direction.findtext('.//{*}words') == 'decresc.'
+
+    def test_principal_voice_symbol_moves_with_start(self, tmp_path):
+        """principal-voice の記号（Hauptstimme）は新しい start に付く"""
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            2: [(0, _dir(_dt('<principal-voice type="start" symbol="Hauptstimme"/>')))],
+            4: [(1, _dir(_dt('<principal-voice type="stop" symbol="plain"/>')))],
+        })
+
+        voices = [(m, offset, e.get('type'), e.get('symbol')) for m, offset, e, _d
+                  in _elements(_reverse_directions(score, self.TOTAL), 'principal-voice')]
+
+        assert voices == [(7, 1.0, 'start', 'Hauptstimme'), (9, 2.0, 'stop', 'plain')]
+
+    def test_wedge_with_words_is_paired(self, tmp_path):
+        """words と同居する wedge もペアとして反転する（spread は位置に残る）"""
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            2: [(0, _dir(_dt('<words>poco</words>') + _dt('<wedge type="crescendo"/>')))],
+            4: [(1, _dir(_dt('<wedge type="stop" spread="15"/>')))],
+        })
+
+        wedges = _elements(_reverse_directions(score, self.TOTAL), 'wedge')
+
+        assert [(m, offset, e.get('type'), e.get('spread')) for m, offset, e, _d in wedges] == [
+            (7, 1.0, 'diminuendo', '15'), (9, 2.0, 'stop', None)]
+        assert wedges[0][3].findtext('.//{*}words') == 'poco'
+
+    def test_wedge_pairs_are_matched_per_staff(self, tmp_path):
+        """同じ number のペアが譜をまたいで交差しても取り違えない"""
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            2: [(0, _dir(_dt('<wedge type="crescendo"/>'), staff='1'))],
+            3: [(0, _dir(_dt('<wedge type="crescendo"/>'), staff='2'))],
+            4: [(0, _dir(_dt('<wedge type="stop"/>'), staff='2'))],
+            5: [(0, _dir(_dt('<wedge type="stop"/>'), staff='1'))],
+        })
+
+        wedges = _elements(_reverse_directions(score, self.TOTAL), 'wedge')
+        by_staff: dict[str, list] = {}
+        for m, offset, e, d in wedges:
+            by_staff.setdefault(d.findtext('{*}staff'), []).append((m, offset, e.get('type')))
+
+        assert by_staff == {
+            '1': [(6, 2.0, 'diminuendo'), (9, 2.0, 'stop')],
+            '2': [(7, 2.0, 'diminuendo'), (8, 2.0, 'stop')],
+        }
+
+    def test_staff_divide_direction_is_flipped(self, tmp_path):
+        """staff-divide は分割と合流が入れ替わる（down ↔ up）"""
+        score = tmp_path / 'score.xml'
+        _write_direction_score(score, self.TOTAL, {
+            3: [(0, _dir(_dt('<staff-divide type="down"/>')))],
+        })
+
+        divides = [(m, e.get('type')) for m, _offset, e, _d
+                   in _elements(_reverse_directions(score, self.TOTAL), 'staff-divide')]
+
+        assert divides == [(8, 'up')]
+

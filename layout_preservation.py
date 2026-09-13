@@ -16,7 +16,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 
 @dataclass
@@ -976,133 +976,171 @@ def _insert_direction_at_offset(
     measure.append(direction)
 
 
-def _flip_wedge_type(t: Optional[str]) -> str:
-    if t == 'crescendo':
-        return 'diminuendo'
-    if t in ('diminuendo', 'decrescendo'):
-        return 'crescendo'
-    return t or ''
+def _keep_spanner_types(start_type: str, stop_type: str) -> tuple[str, str]:
+    return start_type, stop_type
 
 
-def _wedge_only_direction(dir_elem: 'DirectionElement') -> Optional[ET.Element]:
-    """direction が wedge 単独要素ならその wedge 要素を返す。それ以外は None。"""
-    try:
-        root = ET.fromstring(dir_elem.direction_xml)
-    except ET.ParseError:
-        return None
-    direction_type = root.find('{*}direction-type')
-    if direction_type is None:
-        return None
-    children = list(direction_type)
-    if len(children) != 1:
-        return None
-    child = children[0]
-    if not child.tag.endswith('wedge'):
-        return None
-    return child
+def _reverse_wedge_types(start_type: str, stop_type: str) -> tuple[str, str]:
+    """時間反転すると crescendo と diminuendo が入れ替わる"""
+    flips = {'crescendo': 'diminuendo', 'diminuendo': 'crescendo', 'decrescendo': 'crescendo'}
+    return flips.get(start_type, start_type), stop_type
 
 
-def _separate_wedge_pairs(
-    dir_elems: list['DirectionElement']
-) -> tuple[list[tuple['DirectionElement', 'DirectionElement']], list['DirectionElement']]:
-    """direction リストから wedge start/stop ペアと、それ以外に分離する。
-
-    ペアリングは出現順に number 属性で対応付ける。ペアにならなかった
-    wedge direction は他の direction として扱う（フォールバック）。
+def _reverse_pedal_types(start_type: str, stop_type: str) -> tuple[str, str]:
+    """明示的な踏み込み・離し（start / sostenuto / stop）か、線だけの開始・終了
+    （resume / discontinue）かは端点の位置に付く性質なので、反転後も同じ位置で同じ種類にする
     """
-    pairs: list[tuple[DirectionElement, DirectionElement]] = []
+    if stop_type == 'discontinue':
+        new_start = 'resume'
+    elif start_type == 'sostenuto':
+        new_start = 'sostenuto'
+    else:
+        new_start = 'start'
+    new_stop = 'discontinue' if start_type == 'resume' else 'stop'
+    return new_start, new_stop
+
+
+@dataclass(frozen=True)
+class SpannerSpec:
+    """start と stop の2点で1本の線・記号を描く direction 要素
+
+    時間反転すると始点と終点の役割が入れ替わるので、start の direction を stop の
+    鏡像位置へ、stop の direction を start の鏡像位置へ置き直す（Issue #74）。
+    """
+    tag: str
+    start_types: frozenset[str]
+    stop_types: frozenset[str] = frozenset({'stop'})
+    # 端点の位置に付く属性（hairpin の開き・bracket の鉤など）。役割と一緒に動かさず元の位置に残す
+    position_bound_attrs: tuple[str, ...] = ()
+    reverse_types: Callable[[str, str], tuple[str, str]] = _keep_spanner_types
+    # ペアにならない単独の type の反転表
+    unpaired_type_flips: dict[str, str] = field(default_factory=dict)
+
+
+SPANNER_SPECS = (
+    SpannerSpec('wedge', frozenset({'crescendo', 'diminuendo', 'decrescendo'}),
+                position_bound_attrs=('spread', 'niente'),
+                reverse_types=_reverse_wedge_types),
+    SpannerSpec('octave-shift', frozenset({'up', 'down'})),
+    SpannerSpec('pedal', frozenset({'start', 'sostenuto', 'resume'}),
+                stop_types=frozenset({'stop', 'discontinue'}),
+                reverse_types=_reverse_pedal_types,
+                unpaired_type_flips={'discontinue': 'resume', 'resume': 'discontinue'}),
+    SpannerSpec('dashes', frozenset({'start'})),
+    SpannerSpec('bracket', frozenset({'start'}),
+                position_bound_attrs=('line-end', 'end-length')),
+    SpannerSpec('principal-voice', frozenset({'start'})),
+    # staff-divide は線を持たない単独の記号で、分割と合流の向きが入れ替わる
+    SpannerSpec('staff-divide', frozenset(),
+                unpaired_type_flips={'down': 'up', 'up': 'down'}),
+)
+_SPANNER_SPECS_BY_TAG = {spec.tag: spec for spec in SPANNER_SPECS}
+
+
+def _spanner_children(direction: ET.Element) -> list[tuple[SpannerSpec, ET.Element]]:
+    """direction の全 direction-type 配下からスパナ要素を集める"""
+    found = []
+    for direction_type in direction.findall('{*}direction-type'):
+        for child in direction_type:
+            spec = _SPANNER_SPECS_BY_TAG.get(child.tag.split('}')[-1])
+            if spec is not None:
+                found.append((spec, child))
+    return found
+
+
+def _separate_spanner_pairs(
+    dir_elems: list['DirectionElement']
+) -> tuple[list[tuple[SpannerSpec, 'DirectionElement', 'DirectionElement']],
+           list['DirectionElement']]:
+    """direction リストからスパナの start/stop ペアと、それ以外に分離する。
+
+    ペアは (要素名, number, staff) ごとに出現順で対応付ける。words 等と同居していても
+    スパナ要素が1つだけならペアにする。スパナを2つ以上持つ direction、ペアにならなかった
+    端点、continue / change 等は他の direction として扱う（フォールバック）。
+    """
+    pairs: list[tuple[SpannerSpec, DirectionElement, DirectionElement]] = []
     others: list[DirectionElement] = []
-    open_starts: dict[str, DirectionElement] = {}
+    open_starts: dict[tuple[str, str, Optional[str]], DirectionElement] = {}
 
-    classified: list[tuple[DirectionElement, Optional[ET.Element]]] = []
     for d in dir_elems:
-        wedge = _wedge_only_direction(d)
-        classified.append((d, wedge))
-
-    for d, wedge in classified:
-        if wedge is None:
+        try:
+            found = _spanner_children(ET.fromstring(d.direction_xml))
+        except ET.ParseError:
+            found = []
+        if len(found) != 1:
             others.append(d)
             continue
-        number = wedge.get('number') or '1'
-        wtype = wedge.get('type') or ''
-        if wtype in ('crescendo', 'diminuendo', 'decrescendo'):
-            # 既に開いている同 number の start は孤立扱い
-            if number in open_starts:
-                others.append(open_starts.pop(number))
-            open_starts[number] = d
-        elif wtype == 'stop':
-            start = open_starts.pop(number, None)
+
+        spec, elem = found[0]
+        key = (spec.tag, elem.get('number') or '1', d.staff)
+        spanner_type = elem.get('type') or ''
+        if spanner_type in spec.start_types:
+            # 既に開いている同じキーの start は孤立扱い
+            if key in open_starts:
+                others.append(open_starts.pop(key))
+            open_starts[key] = d
+        elif spanner_type in spec.stop_types:
+            start = open_starts.pop(key, None)
             if start is not None:
-                pairs.append((start, d))
+                pairs.append((spec, start, d))
             else:
                 others.append(d)
         else:
             others.append(d)
 
     # 未クローズの start は孤立扱い
-    for d in open_starts.values():
-        others.append(d)
+    others.extend(open_starts.values())
 
     return pairs, others
 
 
-def _octave_shift_only_direction(dir_elem: 'DirectionElement') -> Optional[ET.Element]:
-    """direction が octave-shift 単独要素ならその octave-shift 要素を返す。それ以外は None。"""
+def _build_reversed_spanner_pair(
+    spec: SpannerSpec,
+    start_dir: 'DirectionElement',
+    stop_dir: 'DirectionElement',
+) -> Optional[tuple[ET.Element, ET.Element]]:
+    """反転後の (新しい start, 新しい stop) の direction 要素を組み立てる
+
+    新しい start は元の stop の位置に、新しい stop は元の start の位置に置かれる。
+    """
     try:
-        root = ET.fromstring(dir_elem.direction_xml)
+        new_start = ET.fromstring(start_dir.direction_xml)
+        new_stop = ET.fromstring(stop_dir.direction_xml)
     except ET.ParseError:
         return None
-    direction_type = root.find('{*}direction-type')
-    if direction_type is None:
-        return None
-    children = list(direction_type)
-    if len(children) != 1:
-        return None
-    child = children[0]
-    if not child.tag.endswith('octave-shift'):
-        return None
-    return child
 
+    start_elem = _spanner_children(new_start)[0][1]
+    stop_elem = _spanner_children(new_stop)[0][1]
+    new_start_type, new_stop_type = spec.reverse_types(
+        start_elem.get('type') or '', stop_elem.get('type') or ''
+    )
+    start_elem.set('type', new_start_type)
+    stop_elem.set('type', new_stop_type)
 
-def _separate_octave_shift_pairs(
-    dir_elems: list['DirectionElement']
-) -> tuple[list[tuple['DirectionElement', 'DirectionElement']], list['DirectionElement']]:
-    """direction リストから octave-shift start/stop ペアと、それ以外に分離する。
-
-    ペアリングは出現順に number 属性で対応付ける。ペアにならなかった
-    octave-shift direction は他の direction として扱う（フォールバック）。
-    """
-    pairs: list[tuple[DirectionElement, DirectionElement]] = []
-    others: list[DirectionElement] = []
-    open_starts: dict[str, DirectionElement] = {}
-
-    for d in dir_elems:
-        os_elem = _octave_shift_only_direction(d)
-        if os_elem is None:
-            others.append(d)
-            continue
-        number = os_elem.get('number') or '1'
-        otype = os_elem.get('type') or ''
-        if otype in ('up', 'down'):
-            # 既に開いている同 number の start は孤立扱い
-            if number in open_starts:
-                others.append(open_starts.pop(number))
-            open_starts[number] = d
-        elif otype == 'stop':
-            start = open_starts.pop(number, None)
-            if start is not None:
-                pairs.append((start, d))
+    for attr in spec.position_bound_attrs:
+        start_value, stop_value = start_elem.get(attr), stop_elem.get(attr)
+        for elem, value in ((start_elem, stop_value), (stop_elem, start_value)):
+            if value is None:
+                elem.attrib.pop(attr, None)
             else:
-                others.append(d)
-        else:
-            # 'continue' などはフォールバック
-            others.append(d)
+                elem.set(attr, value)
 
-    # 未クローズの start は孤立扱い
-    for d in open_starts.values():
-        others.append(d)
+    for direction, source in ((new_start, start_dir), (new_stop, stop_dir)):
+        _strip_dynamics_x_attributes(direction)
+        if _is_dynamics_text_direction(source):
+            words = direction.find('.//{*}direction-type/{*}words')
+            if words is not None and words.text:
+                words.text = _flip_dynamics_text(words.text)
 
-    return pairs, others
+    return new_start, new_stop
+
+
+def _flip_unpaired_spanner_types(direction: ET.Element) -> None:
+    """ペアにならない単独のスパナ要素の type を反転する（staff-divide の down↔up 等）"""
+    for spec, elem in _spanner_children(direction):
+        spanner_type = elem.get('type')
+        if spanner_type in spec.unpaired_type_flips:
+            elem.set('type', spec.unpaired_type_flips[spanner_type])
 
 
 @dataclass(frozen=True)
@@ -1900,7 +1938,8 @@ def restore_direction_elements(
                 measure.remove(d)
 
         # direction要素をカテゴリに分離:
-        # 1. wedge ペア (cresc/dim) → type 反転 + 時間反転オフセットで再配置
+        # 1. スパナのペア (wedge / octave-shift / pedal / dashes / bracket 等)
+        #    → start と stop の役割を入れ替えて時間反転オフセットで再配置
         # 2. 奏法状態 (pizz./arco) → 有効範囲ベースで反転 + 打ち消しマーカー生成
         # 3. テンポ関連 (sound + words) → 有効範囲ベースで反転
         # 4. ダイナミクス → 有効範囲ベースで反転 + 括弧付きマーカー
@@ -1910,8 +1949,7 @@ def restore_direction_elements(
         # 奏法状態は words + sound を持つためテンポ判定より前に分離する
         # （テンポとして誤分類されるだけでなく、テンポの有効範囲境界も汚染するため）
         all_directions = original_layout_map.directions[part_id]
-        wedge_pairs, non_wedge_dirs = _separate_wedge_pairs(all_directions)
-        octave_shift_pairs, non_pair_dirs = _separate_octave_shift_pairs(non_wedge_dirs)
+        spanner_pairs, non_pair_dirs = _separate_spanner_pairs(all_directions)
         state_marking_directions, non_state_dirs = _separate_state_marking_directions(non_pair_dirs)
         instrument_change_labels, non_state_dirs = _separate_instrument_change_labels(
             non_state_dirs, original_layout_map.instrument_refs.get(part_id, [])
@@ -1963,82 +2001,34 @@ def restore_direction_elements(
             except ET.ParseError:
                 pass
 
-        # 2. wedge ペアの復元（時間反転に伴い type を反転、配置を入れ替え）
-        for start_dir, stop_dir in wedge_pairs:
-            # 元: start at measure A, offset SA → stop at measure B, offset SB
-            # 時間反転すると、反転後の各 direction の小節内オフセットは
-            # (反転後の小節長) - (元のオフセット) になる。
-            # さらに start/stop のロールが入れ替わるため:
-            #   新 start (type 反転) = 反転後の B 小節, offset = M(B') - SB
-            #   新 stop                = 反転後の A 小節, offset = M(A') - SA
-            new_start_measure = total_measures - stop_dir.measure_num + 1
-            new_stop_measure = total_measures - start_dir.measure_num + 1
-
-            try:
-                if new_start_measure in measure_map:
-                    target = measure_map[new_start_measure]
-                    new_start_xml = ET.fromstring(start_dir.direction_xml)
-                    _strip_dynamics_x_attributes(new_start_xml)
-                    wedge_elem = new_start_xml.find('.//{*}direction-type/{*}wedge')
-                    if wedge_elem is not None:
-                        cur_type = wedge_elem.get('type')
-                        wedge_elem.set('type', _flip_wedge_type(cur_type))
-                    # 反転後の小節長は元の対応小節（stop の元小節）と等しい
-                    target_dur = stop_dir.measure_duration_quarters
-                    target_offset = max(0.0, target_dur - stop_dir.offset_quarters)
-                    _insert_direction_at_offset(
-                        target, new_start_xml, target_offset, part_divisions
-                    )
-
-                if new_stop_measure in measure_map:
-                    target = measure_map[new_stop_measure]
-                    new_stop_xml = ET.fromstring(stop_dir.direction_xml)
-                    _strip_dynamics_x_attributes(new_stop_xml)
-                    target_dur = start_dir.measure_duration_quarters
-                    target_offset = max(0.0, target_dur - start_dir.offset_quarters)
-                    _insert_direction_at_offset(
-                        target, new_stop_xml, target_offset, part_divisions
-                    )
-            except ET.ParseError:
-                pass
-
-        # 2b. octave-shift ペアの復元（時間反転に伴い start/stop の位置を入れ替える）
-        # wedge と異なり type は反転せず、start (down/up) と stop の役割だけが入れ替わる:
-        #   元: start (down/up) at measure A offset SA → stop at measure B offset SB
-        #   新 start (down/up と同じ) = 反転後の B 小節, offset = M(B') - SB
-        #   新 stop                     = 反転後の A 小節, offset = M(A') - SA
-        for start_dir, stop_dir in octave_shift_pairs:
-            new_start_measure = total_measures - stop_dir.measure_num + 1
-            new_stop_measure = total_measures - start_dir.measure_num + 1
-
-            try:
-                if new_start_measure in measure_map:
-                    target = measure_map[new_start_measure]
-                    new_start_xml = ET.fromstring(start_dir.direction_xml)
-                    _strip_dynamics_x_attributes(new_start_xml)
-                    target_dur = stop_dir.measure_duration_quarters
-                    target_offset = max(0.0, target_dur - stop_dir.offset_quarters)
-                    _insert_direction_at_offset(
-                        target, new_start_xml, target_offset, part_divisions
-                    )
-
-                if new_stop_measure in measure_map:
-                    target = measure_map[new_stop_measure]
-                    new_stop_xml = ET.fromstring(stop_dir.direction_xml)
-                    _strip_dynamics_x_attributes(new_stop_xml)
-                    target_dur = start_dir.measure_duration_quarters
-                    target_offset = max(0.0, target_dur - start_dir.offset_quarters)
-                    _insert_direction_at_offset(
-                        target, new_stop_xml, target_offset, part_divisions
-                    )
-            except ET.ParseError:
-                pass
+        # 2. スパナのペアの復元（start と stop の役割を入れ替えて置き直す）
+        #   元: start at measure A offset SA → stop at measure B offset SB
+        #   新 start = 反転後の B 小節, offset = M(B) - SB
+        #   新 stop  = 反転後の A 小節, offset = M(A) - SA
+        # 反転後の小節は元の対応小節と同じ長さなので M は元の小節長を使う
+        for spec, start_dir, stop_dir in spanner_pairs:
+            built = _build_reversed_spanner_pair(spec, start_dir, stop_dir)
+            if built is None:
+                continue
+            new_start, new_stop = built
+            for direction, source in ((new_start, stop_dir), (new_stop, start_dir)):
+                target_measure_num = total_measures - source.measure_num + 1
+                if target_measure_num not in measure_map:
+                    continue
+                target_offset = max(0.0, source.measure_duration_quarters - source.offset_quarters)
+                _insert_direction_at_offset(
+                    measure_map[target_measure_num], direction, target_offset, part_divisions
+                )
 
         # 3. ダイナミクスの有効範囲ベース反転
         # テキスト形式の強弱変化指示（cresc./decresc.）の小節番号を境界として渡す
+        # （cresc. + dashes のようにスパナのペアに入ったものも境界に含める）
         text_dyn_measures = [
             d.measure_num for d in other_directions
             if _is_dynamics_text_direction(d)
+        ] + [
+            d.measure_num for _spec, start_dir, stop_dir in spanner_pairs
+            for d in (start_dir, stop_dir) if _is_dynamics_text_direction(d)
         ]
         reversed_dynamics = _calculate_reversed_dynamics_directions(
             dynamics_directions, total_measures, text_dyn_measures
@@ -2103,6 +2093,7 @@ def restore_direction_elements(
             try:
                 restored_direction = ET.fromstring(dir_elem.direction_xml)
                 _strip_dynamics_x_attributes(restored_direction)
+                _flip_unpaired_spanner_types(restored_direction)
 
                 # テキスト形式の cresc./decresc. を反転し、小節先頭に配置
                 if _is_dynamics_text_direction(dir_elem):
