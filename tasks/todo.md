@@ -1,5 +1,35 @@
 # TODO
 
+## Issue #84: 途中で移調が変わる打楽器パートで instrument 参照が復元されない（#78 の漏れ）
+
+- [x] 原因特定（music21 が移調変更で Instrument を複製 → 全音符に自前 id の `<instrument>` を付ける）
+- [x] 復元対象パートでは music21 の `<instrument>` を取り除いてから元の参照を書き込む
+- [x] テスト追加（2件、修正なしで失敗することを確認）
+- [x] 動作確認（work/inbox 26ファイル一括、master 出力との差分比較）
+
+### レビュー
+
+#73 の調査中に、Tambourine の反転出力で 123 音符すべてが music21 の生成した1つの id を
+参照し、`<score-part>` に定義が無い無効な参照になっているのを発見。同内容の Schellen は正常。
+
+最初は `<sound><instrument-change>` が原因と推測したが、**最小構成では再現しなかった**。
+Tambourine と Schellen の入力差分から m45 の `<transpose>` を切り分け、music21 の
+`xmlToM21` が途中の移調変更で Instrument を複製することを確認した（Issue 本文も訂正）。
+
+修正は `_restore_instrument_refs()` で、元譜の参照を復元するパートに限り既存の `<instrument>` を
+先に取り除くだけ。`_insert_instrument_element()` の「既にあれば何もしない」は重複防止として残す。
+
+### 検証
+
+- `python -m pytest tests/` → 101 passed, 19 skipped（skip は既存の入力ファイル欠如）
+- 26ファイル一括反転 → 全件成功
+- master 出力との比較: 楽器参照（と music21 のランダム id）以外の差分は全ファイルで無し
+- 楽器参照を持つ全パート（Tambourine / Schellen / Percussion / Triangle / Concert_Snare_Drum / 総譜 P14–P17）で
+  入力と id 分布が一致、未定義の参照 0 件（修正前は Tambourine と総譜 P17 が不一致）
+- Tambourine の出力は同内容の Schellen と全53小節で音高↔楽器の対応が一致
+
+---
+
 ## Issue #76: 1小節だけの行ができる
 
 - [x] （第1案・不採用）改行・改ページを「小節境界」として反転する
