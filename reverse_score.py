@@ -14,6 +14,7 @@ import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 from music21 import converter, stream, dynamics, tie, spanner, clef, expressions, layout
 from music21.spanner import Ottava
@@ -1615,6 +1616,13 @@ def process_file(input_path: Path, output_path: Path,
             new_score.append(score)
             score = new_score
 
+        # タイトルに「反転」を付与（反転版であることが分かるように）
+        original_title: Optional[str] = None
+        if score.metadata is not None and score.metadata.title:
+            original_title = score.metadata.title
+            if not original_title.rstrip().endswith('反転'):
+                score.metadata.title = f"{original_title} 反転"
+
         # SKIP_MEASURE_CONTENT モードでは元のスコアを保持
         if error_handling == ErrorHandling.SKIP_MEASURE_CONTENT:
             original_score = copy.deepcopy(score)
@@ -1682,7 +1690,8 @@ def process_file(input_path: Path, output_path: Path,
                 print(f"  [Phase 4] レイアウト情報を復元中...")
                 from layout_preservation import apply_layout_to_xml
                 try:
-                    apply_layout_to_xml(output_path, original_layout, total_measures)
+                    apply_layout_to_xml(output_path, original_layout, total_measures,
+                                        original_title=original_title)
                     print(f"  [Phase 4] レイアウト復元完了")
                 except Exception as layout_apply_error:
                     print(f"  警告: レイアウト復元に失敗しました: {layout_apply_error}")
