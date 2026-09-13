@@ -1,5 +1,49 @@
 # TODO
 
+## Issue #88: 終端が不明な指示（sostenuto・simile 等）の反転に←を付与する
+
+- [x] 対象語彙の列挙（実コーパスで確認済み: sostenuto, simile, ad lib. + ユーザー判断で
+      検証なし先行対応: dolce, cantabile, espressivo, marcato, legato, sempre,
+      poco a poco, con moto, agitato, tranquillo, grazioso, leggiero）
+- [x] `UNCLEAR_END_WORD_PATTERNS` / `_is_unclear_end_word()` を追加（layout_preservation.py）
+- [x] 「その他 (テキスト等)」カテゴリの単純位置反転に←付与を追加（既存の経過的テンポと同じ規約）
+- [x] テスト追加（単体7件 + ラウンドトリップ1件、威風堂々ラスト-Violin.mxl の
+      sostenuto@m1 / simile@m3 で確認）
+- [x] README 更新
+- [x] 動作確認（pytest、実ファイルでの反転結果を目視確認）
+
+### レビュー
+
+`rit.` / `accel.` 等の経過的テンポで既に採用されている「有効範囲を計算せず単純位置反転 +
+先頭に←」という規約を、テンポ語ではないため `_is_tempo_direction`（sound 要件）の対象に
+ならなかった sostenuto / simile 等にも適用した。新しいパイプライン分岐は作らず、既存の
+「6. その他」カテゴリ（[layout_preservation.py:2410](../layout_preservation.py:2410)）の
+cresc./decresc. 特殊分岐の隣に同型の分岐を追加するだけで済んだ（位置計算ロジックの変更なし）。
+
+対象語彙はユーザー判断で `dolce` 等の一般的な発想標語まで検証なしに先行して含めた
+（オルガンのレジストレーション語彙を開いた集合として扱わなかった #73/#83 とは異なり、
+今回は「未知の words を状態と誤認するリスク」ではなく「既に単純位置反転されている語に
+警告マーカーを追加するだけ」なので誤反転のリスクが無い）。
+
+### 検証
+
+- `python -m pytest tests/` → 157 passed, 19 skipped（変更前と同数、リグレッションなし）
+- `work/inbox/威風堂々ラスト-Violin.mxl` を実際に反転し、出力の words テキストを確認:
+  `sostenuto`（m1→m53）は `←sostenuto`、`simile`（m3→m51 ×2）は `←simile` になった。
+  既存の `rit.`（m34→m20）`←rit.`、`(allargando)`（m29→m25）`←(allargando)` は変化なし
+
+### 対応外
+
+- `simile` は「直前と同様に」という後方参照の指示のため、←は方向が反転したことを示す
+  警告に過ぎず、内容の妥当性までは保証しない（反転後の手動確認が必要。D.C./D.S. と同じ扱い）
+- オルガンのレジストレーション等、構造的な手がかりの無い状態指示は対象外のまま（#83で対応）
+- `reverse_score.py` 側のテンポ収集ロジック（フォールバック時のみ使用）は、
+  sostenuto/simile 等を主要テンポとして誤って有効範囲ベース反転してしまう既存の潜在バグを
+  持つが、通常経路では `layout_preservation.py` が全 direction を上書きするため顕在化しない。
+  今回は対象外（別問題）
+
+---
+
 ## Issue #74: 未対応の有効範囲・ペア構造（pedal/dashes/bracket, D.C.・D.S., 曲中の転調）
 
 - [x] ベースライン: master で work/inbox 26ファイルを反転して保存（work/temp/baseline、26/26 成功、pytest 116 passed / 19 skipped）
