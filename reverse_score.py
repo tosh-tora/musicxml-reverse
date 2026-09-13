@@ -455,6 +455,90 @@ def apply_reversed_layout_elements(
                 break
 
 
+def collect_barline_positions(measures: list[stream.Measure]) -> list[dict]:
+    """パート内の明示的な右バーライン（bar-style）と小節番号を収集する
+
+    通常の小節境界（rightBarline未設定 = 単純な小節線）は反転で位置が
+    変わっても見た目に影響しないため収集対象外。leftBarlineは実例が
+    確認できていないため対象外（現状の挙動を維持する）。
+
+    Args:
+        measures: 小節のリスト（元の順序）
+
+    Returns:
+        バーラインの情報リスト [{measure_num, barline}]
+    """
+    barline_positions = []
+    for measure in measures:
+        if measure.rightBarline is not None:
+            barline_positions.append({
+                'measure_num': measure.number,
+                'barline': copy.deepcopy(measure.rightBarline),
+            })
+    return barline_positions
+
+
+def calculate_reversed_barline_positions(
+    barline_positions: list[dict],
+    total_measures: int
+) -> list[dict]:
+    """右バーラインの反転後の付け先を計算する
+
+    rightBarline は「その小節と次の小節の境界」（最終小節の場合は「曲の終端」）
+    を表す。終止線（type='final'）や曲の最終小節に付いたバーラインは
+    「曲の終端」を表す構造的マーカーであり、内容と一緒にミラーリングする
+    対象ではないため、反転後も常に実際の最終小節へ付け直す。
+    それ以外（曲中の複縦線など）は境界そのものをミラーリングする:
+    元 m_N の右バーラインは m_N と m_(N+1) の境界にあるので、
+    反転後はその境界が total_measures - N の位置に移動する。
+
+    Args:
+        barline_positions: collect_barline_positions() の結果
+        total_measures: 総小節数
+
+    Returns:
+        反転後の位置情報 [{reversed_measure_num, barline}]
+    """
+    reversed_positions = []
+    for pos in barline_positions:
+        barline = pos['barline']
+        measure_num = pos['measure_num']
+
+        if measure_num == total_measures or getattr(barline, 'type', None) == 'final':
+            target = total_measures
+        else:
+            target = total_measures - measure_num
+
+        reversed_positions.append({
+            'reversed_measure_num': target,
+            'barline': copy.deepcopy(barline),
+        })
+    return reversed_positions
+
+
+def apply_reversed_barlines(
+    new_part: stream.Part,
+    reversed_barline_positions: list[dict]
+) -> None:
+    """反転後のパートに右バーラインを設定する
+
+    Args:
+        new_part: 反転後のパート（小節が追加済み）
+        reversed_barline_positions: calculate_reversed_barline_positions() の結果
+    """
+    if not reversed_barline_positions:
+        return
+
+    measures_by_number = {
+        measure.number: measure
+        for measure in new_part.getElementsByClass(stream.Measure)
+    }
+    for pos in reversed_barline_positions:
+        target_measure = measures_by_number.get(pos['reversed_measure_num'])
+        if target_measure is not None:
+            target_measure.rightBarline = pos['barline']
+
+
 # 経過的テンポ表記のパターン
 # これらは「一時的な変化」を示し、次の主要テンポ指示まで有効ではない
 # 反転時は方向が逆になるため、←記号を先頭に付けて表示する
@@ -842,6 +926,9 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
     staff_layout_positions = collect_layout_positions(measures, 'StaffLayout')
     page_layout_positions = collect_layout_positions(measures, 'PageLayout')
 
+    # 右バーライン（bar-style）も同様に反転ロジックで処理
+    barline_positions = collect_barline_positions(measures)
+
     # 調号をコピー (KeySignature)
     key_sigs = first_original_measure.getElementsByClass('KeySignature')
     if key_sigs:
@@ -876,6 +963,9 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
         for elem in list(measure_to_process.getElementsByClass('Clef')):
             measure_to_process.remove(elem)
 
+        # 右バーラインを小節から除去（反転ロジックで再配置するため）
+        measure_to_process.rightBarline = None
+
         # レイアウト要素（System/Staff/PageLayout）を小節から削除（反転ロジックで再配置するため）
         for layout_class in ['SystemLayout', 'StaffLayout', 'PageLayout']:
             for elem in list(measure_to_process.getElementsByClass(layout_class)):
@@ -893,6 +983,7 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
             else:
                 fallback = measure
             fallback.number = i + 1
+            fallback.rightBarline = None
             new_part.append(fallback)
             continue
 
@@ -906,6 +997,7 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
                 # 元の小節（反転前）を使用
                 fallback = copy.deepcopy(original_measures[original_index])
                 fallback.number = i + 1
+                fallback.rightBarline = None
 
                 # 元の小節も書き出せるかテスト
                 fallback_error = test_measure_write(fallback)
@@ -961,6 +1053,10 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
     for positions in (system_layout_positions, staff_layout_positions, page_layout_positions):
         reversed_positions = calculate_reversed_layout_positions(positions, total_measures)
         apply_reversed_layout_elements(new_part, reversed_positions)
+
+    # 右バーライン（bar-style）を反転して適用
+    reversed_barline_positions = calculate_reversed_barline_positions(barline_positions, total_measures)
+    apply_reversed_barlines(new_part, reversed_barline_positions)
 
     # 保存したSpanner情報を使って、新しいパートでSpannerを再構築
     for sp_info in spanner_info:
