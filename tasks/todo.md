@@ -1,5 +1,67 @@
 # TODO
 
+## Issue #74: 未対応の有効範囲・ペア構造（pedal/dashes/bracket, D.C.・D.S., 曲中の転調）
+
+- [x] ベースライン: master で work/inbox 26ファイルを反転して保存（work/temp/baseline、26/26 成功、pytest 116 passed / 19 skipped）
+- [x] ① スパナのペア処理を仕様表駆動に統合（wedge / octave-shift は spread の位置だけが変化）
+- [x] ① pedal / dashes / bracket / principal-voice / staff-divide のペア反転、words 同居の対応
+- [x] ② string-mute / harp-pedals / scordatura / accordion-registration / metronome の有効範囲反転
+- [x] ③ sound ナビゲーションをテンポ判定から分離、ジャンプ属性を削除して警告
+- [x] ④ 曲中の key/time の有効範囲反転、最終小節の余分な key/time を除去
+- [x] ⑤ measure-repeat / beat-repeat / slash の再配置
+- [x] テスト追加（33件、すべて修正前に失敗することを確認）
+- [x] README 更新
+- [x] 動作確認（pytest、26ファイル一括、master 出力との差分・要素数比較、最小スコアの end-to-end）
+
+### レビュー
+
+ユーザー判断により5項目すべてを対応。項目3（D.C. / D.S.）は保守的な扱いを選択。
+
+- **①** wedge / octave-shift の2関数を `SpannerSpec` の表にまとめ、pedal / dashes / bracket /
+  principal-voice / staff-divide に広げた。コーパスで出力が変わったのは hairpin の `spread` の位置だけ。
+  入力は「cresc. の start と dim. の stop に spread」という書き方だが、従来は役割と一緒に動かしていたため
+  反転後は dim. の start / cresc. の stop に付いていた。端点の位置に付く属性として残すことで
+  入力と同じ規則になった（25ファイル。意味比較で他の内容・順序の差分 0）
+- **②** string-mute は既存のミュートの状態グループに記号として追加し、打ち消しも同じ記号で合成する。
+  harp-pedals 等は #73 の持ち替えラベルと同じ計算を流用。metronome 単独もテンポに含め、
+  メトリック・モジュレーションは境界として分離した（テンポ判定を広げたことで新たに誤反転させないため）
+- **③** To Coda がテンポの有効範囲を汚染する問題をテストで再現（Allegro が m5 ではなく m8 に来る）してから
+  テンポ判定より前に分離した
+- **④** issue 記載の `reverse_score.py:788-800` は現在 908-944 に移動していた。原因は小節コピーのループが
+  Clef は除去するのに KeySignature / TimeSignature を除去していないこと。clef / layout と計算を共通化した
+- **⑤** 仕様（stop は表示が終わった最初の小節・拍、繰り返される実音はファイルに書かれている）を確認し、
+  音符の展開ではなく記号の付け直しだけで済むことを確かめてから実装した
+
+テストの期待値を2か所書き誤った（Allegro を m4、segno を m9。正しくは m5 / m10）。
+実装前に区間で検算して修正した（#70 の教訓どおり、小節番号の式ではなく区間で書き出す）。
+
+### 検証
+
+- `python -m pytest tests/` → **149 passed, 19 skipped**（master は 116 passed, 19 skipped）
+- 26ファイル一括反転 → 各段階（①②④③⑤）で 26/26 成功
+- master 出力との差分（ランダム id を除く意味比較）:
+
+  | 変化 | 対象 |
+  |---|---|
+  | hairpin の `spread` が反対側の端点に移る | 25ファイル |
+  | 余分な key / time が最終小節 m53 から消える | 49パート（全ファイル） |
+  | key の再掲が m9 → m10 に移る（区間 m45–53 は反転後 m1–9） | 33パート（m45 に再掲がある17ファイル＋総譜） |
+  | それ以外 | 差分なし（Viola の m9 は clef と key が別の attributes に分かれただけで、clef の位置は不変） |
+
+- 要素数（入力 / master / 本ブランチ）: key / time は全26ファイルで入力と一致（master は各 +1）。
+  その他の増減（括弧付き強弱の direction、tied、Organ の slur 等）は master と同数で本変更とは無関係
+- 最小スコアの end-to-end（`work/temp/e2e74`、music21 を通す）: pedal / words 付き wedge / To Coda / 転調 /
+  measure-repeat / string-mute / segno / slash / D.S. がすべて区間で計算した位置に出力され、警告は3件
+
+### 対応外
+
+- `<sound>` を持たない文字だけの D.C. / D.S.: テキストとして単純に位置反転される
+- harp-pedals 等の最初の指示より前の区間: 設定が分からないので、反転後の末尾区間には何も出さない
+- スパナ要素を2つ以上持つ1つの direction: 従来どおり単純鏡像
+- 小節の途中にある key / time の変更: 反転後は小節の頭に置く
+
+---
+
 ## Issue #84: 途中で移調が変わる打楽器パートで instrument 参照が復元されない（#78 の漏れ）
 
 - [x] 原因特定（music21 が移調変更で Instrument を複製 → 全音符に自前 id の `<instrument>` を付ける）
