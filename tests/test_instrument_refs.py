@@ -263,3 +263,73 @@ class TestIssue78InstrumentRefEndToEnd:
         assert total_notes == 146
         assert notes_without_instrument == 0
         assert notes_with_instrument > 0
+
+
+# 2小節目の頭で <transpose> が変わる（威風堂々ラスト-Tambourine の m45、グロッケンへの持ち替えと同じ構造）。
+# music21 は途中の移調変更で Instrument を複製するため Instrument が2つになり、
+# 書き出し時に全音符へ自前の id で <instrument> を付けてしまう。
+_MID_PART_TRANSPOSE_MEASURES = (
+    '    <measure number="1">'
+    '<attributes><divisions>1</divisions><key><fifths>0</fifths></key>'
+    '<time><beats>2</beats><beat-type>4</beat-type></time>'
+    '<clef><sign>percussion</sign></clef></attributes>'
+    '<note><unpitched><display-step>C</display-step><display-octave>5</display-octave></unpitched>'
+    '<duration>1</duration><instrument id="P1-IA"/><voice>1</voice><type>quarter</type></note>'
+    '<note><unpitched><display-step>E</display-step><display-octave>5</display-octave></unpitched>'
+    '<duration>1</duration><instrument id="P1-IA"/><voice>1</voice><type>quarter</type></note>'
+    '</measure>\n'
+    '    <measure number="2">'
+    '<attributes><transpose><diatonic>0</diatonic><chromatic>0</chromatic>'
+    '<octave-change>2</octave-change></transpose></attributes>'
+    '<note><unpitched><display-step>F</display-step><display-octave>5</display-octave></unpitched>'
+    '<duration>1</duration><instrument id="P1-IB"/><voice>1</voice><type>quarter</type></note>'
+    '<note><unpitched><display-step>G</display-step><display-octave>4</display-octave></unpitched>'
+    '<duration>1</duration><instrument id="P1-IB"/><voice>1</voice><type>quarter</type></note>'
+    '</measure>\n'
+)
+
+
+def _dangling_instrument_refs(path: Path) -> set[str]:
+    """<score-instrument> に定義されていない <note><instrument id> を返す"""
+    notes = _notes(path)
+    used = {inst for entries in notes.values() for _, _, inst in entries if inst is not None}
+    return used - set(_score_instrument_ids(path))
+
+
+class TestIssue84InstrumentChangeRefs:
+    """Issue #84: 途中で移調が変わるパートで music21 が付けた <instrument> に
+    元の参照が上書きされず、未定義の id を参照してしまう"""
+
+    def test_mid_part_instrument_change_restores_original_refs(self, tmp_path):
+        score = tmp_path / 'score.xml'
+        _write_score(score, _MID_PART_TRANSPOSE_MEASURES,
+                     part_list_xml=_MULTI_INSTRUMENT_PART_LIST)
+        output = tmp_path / 'output.xml'
+
+        report = process_file(score, output)
+        assert report.success
+
+        notes = _notes(output)
+        # 小節順が反転: 反転後 m1 = 元 m2（P1-IB）、反転後 m2 = 元 m1（P1-IA）
+        assert [(k, i) for _, k, i in notes[1]] == [('G4', 'P1-IB'), ('F5', 'P1-IB')]
+        assert [(k, i) for _, k, i in notes[2]] == [('E5', 'P1-IA'), ('C5', 'P1-IA')]
+        assert _dangling_instrument_refs(output) == set()
+
+    def test_tambourine_refs_are_restored(self, tmp_path):
+        """威風堂々Tambourine: 元の8種の id 分布が反転後も保たれ、未定義の参照が無い"""
+        input_file = Path(__file__).parent.parent / 'work/inbox/威風堂々ラスト-Tambourine.mxl'
+        if not input_file.exists():
+            pytest.skip(f"Test file not found: {input_file}")
+        output_file = tmp_path / 'test_output.mxl'
+        assert process_file(input_file, output_file).success
+
+        def id_counts(path):
+            counts: dict[str, int] = {}
+            for entries in _notes(path).values():
+                for _, _, inst in entries:
+                    if inst is not None:
+                        counts[inst] = counts.get(inst, 0) + 1
+            return counts
+
+        assert id_counts(output_file) == id_counts(input_file)
+        assert _dangling_instrument_refs(output_file) == set()
