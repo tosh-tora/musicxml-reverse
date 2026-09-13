@@ -20,15 +20,18 @@ from layout_preservation import (
     extract_layout_from_xml,
     restore_direction_elements,
     DirectionElement,
+    InstrumentRef,
     LayoutMap,
     _is_transitional_tempo_text,
     _build_state_marking_direction,
+    _calculate_reversed_instrument_change_labels,
     _calculate_reversed_state_markers,
+    _separate_instrument_change_labels,
     _get_state_marking,
     _is_tempo_direction,
     _separate_state_marking_directions,
 )
-from reverse_score import reverse_score
+from reverse_score import process_file, reverse_score
 
 
 def count_directions_in_mxl(mxl_path: Path) -> int:
@@ -770,3 +773,149 @@ class TestIssue70StateMarkingGroups:
 
         assert ('1', 'div.') in positions, positions
         assert ('14', 'unis.') in positions, positions
+
+
+def _instrument_ref(measure_num: int, offset_q: float, instrument_id: str,
+                    voice: str = '1') -> InstrumentRef:
+    """per-note instrument 参照のテスト用ヘルパー"""
+    return InstrumentRef(measure_num=measure_num, voice=voice, note_index=0,
+                         instrument_id=instrument_id, offset_quarters=offset_q)
+
+
+class TestIssue73InstrumentChangeLabels:
+    """Issue #73: 打楽器の持ち替えラベルを楽器参照の切り替わりから検出し区間ごと反転する"""
+
+    TOTAL_MEASURES = 53
+
+    def _label_texts(self, dirs, refs):
+        labels, _others = _separate_instrument_change_labels(dirs, refs)
+        return [d.words_text for d in labels]
+
+    def test_label_at_instrument_change_is_detected(self):
+        """楽器参照が新しい楽器に切り替わる位置の words はラベル"""
+        refs = [_instrument_ref(1, 0.0, 'TAMB'), _instrument_ref(2, 0.0, 'TAMB'),
+                _instrument_ref(3, 0.0, 'GLOCK')]
+        dirs = [_play_state_direction(3, 0.0, None, 'Glockensp.', None)]
+
+        assert self._label_texts(dirs, refs) == ['Glockensp.']
+
+    def test_words_without_instrument_change_are_not_labels(self):
+        """楽器が変わらない位置の words（ad lib. / simile 等）はラベルにしない"""
+        refs = [_instrument_ref(1, 0.0, 'TAMB'), _instrument_ref(2, 0.0, 'TAMB')]
+        dirs = [_play_state_direction(2, 0.0, None, 'ad lib.', None)]
+
+        assert self._label_texts(dirs, refs) == []
+
+    def test_words_inside_per_pitch_section_are_not_labels(self):
+        """音高ごとに楽器 id が変わる区間の途中にある words はラベルにしない
+
+        グロッケン区間では音符ごとに id が切り替わるが、直前の持ち替え以降に
+        既に使われた id なので持ち替えではない。
+        """
+        refs = [_instrument_ref(1, 0.0, 'TAMB'),
+                _instrument_ref(2, 0.0, 'GL-A'), _instrument_ref(2, 1.0, 'GL-C'),
+                _instrument_ref(3, 0.0, 'GL-A'), _instrument_ref(3, 1.0, 'GL-C')]
+        dirs = [_play_state_direction(2, 0.0, None, 'Glockensp.', None),
+                _play_state_direction(3, 1.0, None, 'simile', None)]
+
+        assert self._label_texts(dirs, refs) == ['Glockensp.']
+
+    def test_first_note_of_part_is_not_a_label(self):
+        """パート最初の音符上の words は切り替え元が無いのでラベルにしない（単一楽器パート）"""
+        refs = [_instrument_ref(1, 0.0, 'TRI'), _instrument_ref(2, 0.0, 'TRI')]
+        dirs = [_play_state_direction(1, 0.0, None, 'ad lib.', None)]
+
+        assert self._label_texts(dirs, refs) == []
+
+    def test_words_before_entrance_are_not_labels(self):
+        """後続の入りまで離れた words（休符上）は巻き込まない"""
+        refs = [_instrument_ref(1, 0.0, 'TAMB'), _instrument_ref(5, 0.0, 'GLOCK')]
+        dirs = [_play_state_direction(4, 0.0, None, 'cresc. molto', None)]
+
+        assert self._label_texts(dirs, refs) == []
+
+    def test_return_to_previous_instrument_is_detected(self):
+        """Tambourine → Glockensp. → Tambourine の戻りもラベルとして検出する"""
+        refs = [_instrument_ref(1, 0.0, 'TAMB'), _instrument_ref(5, 0.0, 'GLOCK'),
+                _instrument_ref(9, 0.0, 'TAMB')]
+        dirs = [_play_state_direction(5, 0.0, None, 'Glockensp.', None),
+                _play_state_direction(9, 0.0, None, 'Tambourine', None)]
+
+        assert self._label_texts(dirs, refs) == ['Glockensp.', 'Tambourine']
+
+    def test_same_position_labels_are_all_detected(self):
+        """同じ位置に分けて置かれた Gl. と Schellen. はどちらもラベル"""
+        refs = [_instrument_ref(1, 0.0, 'GLOCK'),
+                _instrument_ref(2, 0.0, 'GL-HI', voice='1'),
+                _instrument_ref(2, 0.0, 'JINGLE', voice='2')]
+        dirs = [_play_state_direction(2, 0.0, None, 'Gl.', None),
+                _play_state_direction(2, 0.0, None, 'Schellen.', None)]
+
+        assert self._label_texts(dirs, refs) == ['Gl.', 'Schellen.']
+
+    def test_labels_move_to_start_of_reversed_region(self):
+        """威風堂々Tambourine: Tambourine@m17 → Glockensp.@m45 → Gl.+Schellen.@m52
+
+        区間 m52-53 / m45-51 / m17-44 は反転後 m1-2 / m3-9 / m10-37。
+        ラベルの無い初期区間 m1-16（反転後 m38-53）には何も出さない。
+        """
+        dirs = [
+            _play_state_direction(17, 0.0, None, 'Tambourine', None),
+            _play_state_direction(45, 0.0, None, 'Glockensp.', None),
+            _play_state_direction(52, 0.0, None, 'Gl.', None),
+            _play_state_direction(52, 0.0, None, 'Schellen.', None),
+        ]
+        positions = {
+            (d.words_text, m, offset)
+            for d, m, offset in _calculate_reversed_instrument_change_labels(
+                dirs, self.TOTAL_MEASURES)
+        }
+
+        assert positions == {
+            ('Gl.', 1, 0.0), ('Schellen.', 1, 0.0),
+            ('Glockensp.', 3, 0.0), ('Tambourine', 10, 0.0),
+        }
+
+    def test_mid_measure_label_uses_mirrored_offset(self):
+        """小節途中の境界は小節内オフセットも鏡像にする"""
+        dirs = [
+            _play_state_direction(10, 0.0, None, 'Tambourine', None, measure_duration_q=2.0),
+            _play_state_direction(20, 0.5, None, 'Glockensp.', None, measure_duration_q=2.0),
+        ]
+        positions = {
+            (d.words_text, m, offset)
+            for d, m, offset in _calculate_reversed_instrument_change_labels(
+                dirs, self.TOTAL_MEASURES)
+        }
+
+        # 元 m20 の 0.5 拍 → 反転後 m34 の 1.5 拍
+        assert positions == {('Glockensp.', 1, 0.0), ('Tambourine', 34, 1.5)}
+
+    def test_tambourine_positions_end_to_end(self, tmp_path):
+        """威風堂々Tambourine: 反転出力のラベル配置を実測で検証"""
+        input_file = (Path(__file__).parent.parent
+                      / 'work/inbox/威風堂々ラスト-Tambourine.mxl')
+        if not input_file.exists():
+            pytest.skip(f"Test file not found: {input_file}")
+
+        output_file = tmp_path / 'test_output.mxl'
+        report = process_file(input_file, output_file)
+        assert report.success
+
+        labels = ('Tambourine', 'Glockensp.', 'Gl.', 'Schellen.')
+        positions = sorted((int(m), offset, text) for m, offset, _staff, text
+                           in get_words_positions_from_mxl(output_file)
+                           if text in labels)
+
+        assert positions == [
+            (1, 0.0, 'Gl.'), (1, 0.0, 'Schellen.'),
+            (3, 0.0, 'Glockensp.'), (10, 0.0, 'Tambourine'),
+        ], positions
+
+    def test_parts_without_instrument_refs_are_unchanged(self):
+        """楽器参照を持たないパートでは何も分離しない"""
+        dirs = [_play_state_direction(15, 0.0, '3', 'Sw.', None)]
+        labels, others = _separate_instrument_change_labels(dirs, [])
+
+        assert labels == []
+        assert others == dirs
