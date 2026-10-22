@@ -14,6 +14,7 @@ import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 from music21 import converter, stream, dynamics, tie, spanner, clef, expressions, layout
 from music21.spanner import Ottava
@@ -282,11 +283,12 @@ def collect_clef_positions(measures: list[stream.Measure]) -> list[dict]:
     return clef_positions
 
 
-def calculate_reversed_clef_positions(
-    clef_positions: list[dict],
-    total_measures: int
+def calculate_reversed_start_only_positions(
+    positions: list[dict],
+    total_measures: int,
+    element_key: str,
 ) -> list[dict]:
-    """音部記号の反転後位置を計算する
+    """「始点のみ要素」の反転後位置を計算する
 
     「始点のみ要素」は「次の同種要素が出現するまで有効」という性質を持つ。
     1. 各要素の適用終了位置を計算:
@@ -296,37 +298,67 @@ def calculate_reversed_clef_positions(
        reversed_start = total_measures - effective_end + 1
 
     Args:
+        positions: [{measure_num, offset, <element_key>}]（元の順序でソート済み）
+        total_measures: 総小節数
+        element_key: 要素オブジェクトを格納しているキー
+
+    Returns:
+        反転後の位置情報 [{reversed_measure_num, <element_key>}]
+    """
+    if not positions:
+        return []
+
+    reversed_positions = []
+
+    for i, pos in enumerate(positions):
+        if i + 1 < len(positions):
+            # 次の同種要素の直前まで有効
+            effective_end = positions[i + 1]['measure_num'] - 1
+        else:
+            # 最後の要素は曲の最後まで有効
+            effective_end = total_measures
+
+        reversed_positions.append({
+            'reversed_measure_num': total_measures - effective_end + 1,
+            element_key: copy.deepcopy(pos[element_key]),
+        })
+
+    reversed_positions.sort(key=lambda x: x['reversed_measure_num'])
+    return reversed_positions
+
+
+def apply_reversed_start_only_elements(
+    new_part: stream.Part,
+    reversed_positions: list[dict],
+    element_key: str,
+) -> None:
+    """反転後のパートに「始点のみ要素」を挿入する（最初の要素はパートレベル、以降は小節の先頭）"""
+    if not reversed_positions:
+        return
+
+    new_part.insert(0, reversed_positions[0][element_key])
+
+    for pos in reversed_positions[1:]:
+        for measure in new_part.getElementsByClass(stream.Measure):
+            if measure.number == pos['reversed_measure_num']:
+                measure.insert(0, pos[element_key])
+                break
+
+
+def calculate_reversed_clef_positions(
+    clef_positions: list[dict],
+    total_measures: int
+) -> list[dict]:
+    """音部記号の反転後位置を計算する
+
+    Args:
         clef_positions: collect_clef_positions() の結果
         total_measures: 総小節数
 
     Returns:
         反転後の位置情報 [{reversed_measure_num, clef}]
     """
-    if not clef_positions:
-        return []
-
-    reversed_positions = []
-
-    for i, pos in enumerate(clef_positions):
-        # 適用終了位置を計算
-        if i + 1 < len(clef_positions):
-            # 次の音部記号の直前まで有効
-            effective_end = clef_positions[i + 1]['measure_num'] - 1
-        else:
-            # 最後の音部記号は曲の最後まで有効
-            effective_end = total_measures
-
-        # 反転後の開始位置を計算
-        reversed_start = total_measures - effective_end + 1
-
-        reversed_positions.append({
-            'reversed_measure_num': reversed_start,
-            'clef': copy.deepcopy(pos['clef']),
-        })
-
-    # 反転後の小節番号順でソート
-    reversed_positions.sort(key=lambda x: x['reversed_measure_num'])
-    return reversed_positions
+    return calculate_reversed_start_only_positions(clef_positions, total_measures, 'clef')
 
 
 def apply_reversed_clefs(
@@ -339,23 +371,35 @@ def apply_reversed_clefs(
         new_part: 反転後のパート（小節が追加済み）
         reversed_clef_positions: calculate_reversed_clef_positions() の結果
     """
-    if not reversed_clef_positions:
-        return
+    apply_reversed_start_only_elements(new_part, reversed_clef_positions, 'clef')
 
-    # m1に最初の音部記号を挿入（パートレベル）
-    first_clef = reversed_clef_positions[0]
-    new_part.insert(0, first_clef['clef'])
 
-    # m2以降に音部記号の変更を挿入
-    for pos in reversed_clef_positions[1:]:
-        target_measure_num = pos['reversed_measure_num']
+def collect_signature_positions(measures: list[stream.Measure], class_name: str) -> list[dict]:
+    """パート内の調号（KeySignature）・拍子記号（TimeSignature）と小節番号を収集する
 
-        # 対象の小節を検索
-        for measure in new_part.getElementsByClass(stream.Measure):
-            if measure.number == target_measure_num:
-                # 小節の先頭に音部記号を挿入
-                measure.insert(0, pos['clef'])
-                break
+    音部記号と同じく「この小節から次の同種要素が出現するまで有効」な始点のみ要素。
+    小節と一緒に運ぶと適用区間がずれ、元 m1 のコピーが最終小節に余分に出る（Issue #74）。
+
+    Returns:
+        [{measure_num, offset, element}]
+    """
+    positions = []
+    for measure in measures:
+        for element in measure.getElementsByClass(class_name):
+            positions.append({
+                'measure_num': measure.number,
+                'offset': element.offset,
+                'element': element,
+            })
+    positions.sort(key=lambda x: (x['measure_num'], x['offset']))
+    return positions
+
+
+def _remove_signatures(measure: stream.Measure) -> None:
+    """小節から調号・拍子記号を取り除く（反転ロジックで付け直すため）"""
+    for class_name in ('KeySignature', 'TimeSignature'):
+        for element in list(measure.getElementsByClass(class_name)):
+            measure.remove(element)
 
 
 def collect_layout_positions(measures: list[stream.Measure], class_name: str) -> list[dict]:
@@ -399,23 +443,21 @@ def calculate_reversed_layout_positions(
     Returns:
         反転後の位置情報 [{reversed_measure_num, layout_obj}]
     """
-    if not layout_positions:
-        return []
+    reversed_positions = calculate_reversed_start_only_positions(
+        layout_positions, total_measures, 'layout_obj'
+    )
 
-    reversed_positions = []
-
-    for i, pos in enumerate(layout_positions):
-        if i + 1 < len(layout_positions):
-            effective_end = layout_positions[i + 1]['measure_num'] - 1
-        else:
-            effective_end = total_measures
-
-        reversed_start = total_measures - effective_end + 1
-
-        reversed_positions.append({
-            'reversed_measure_num': reversed_start,
-            'layout_obj': copy.deepcopy(pos['layout_obj']),
-        })
+    # 改行・改ページ（new-system / new-page）は出力しない。
+    # <measure width> や音符の default-x は元の行組みに合わせて justify された値で、
+    # 反転すると段の構成が変わって整合しなくなる（Issue #76）。横方向のレイアウトは
+    # strip_horizontal_layout_hints() で情報ごと取り除き、楽譜ソフトの自動改行に任せる。
+    for pos in reversed_positions:
+        layout_obj = pos['layout_obj']
+        if hasattr(layout_obj, 'isNew'):
+            layout_obj.isNew = None
+        if hasattr(layout_obj, 'pageNumber'):
+            # 改ページを出さないのでページ番号だけ残ると不整合になる
+            layout_obj.pageNumber = None
 
     reversed_positions.sort(key=lambda x: x['reversed_measure_num'])
     return reversed_positions
@@ -441,6 +483,90 @@ def apply_reversed_layout_elements(
             if measure.number == target_measure_num:
                 measure.insert(0, pos['layout_obj'])
                 break
+
+
+def collect_barline_positions(measures: list[stream.Measure]) -> list[dict]:
+    """パート内の明示的な右バーライン（bar-style）と小節番号を収集する
+
+    通常の小節境界（rightBarline未設定 = 単純な小節線）は反転で位置が
+    変わっても見た目に影響しないため収集対象外。leftBarlineは実例が
+    確認できていないため対象外（現状の挙動を維持する）。
+
+    Args:
+        measures: 小節のリスト（元の順序）
+
+    Returns:
+        バーラインの情報リスト [{measure_num, barline}]
+    """
+    barline_positions = []
+    for measure in measures:
+        if measure.rightBarline is not None:
+            barline_positions.append({
+                'measure_num': measure.number,
+                'barline': copy.deepcopy(measure.rightBarline),
+            })
+    return barline_positions
+
+
+def calculate_reversed_barline_positions(
+    barline_positions: list[dict],
+    total_measures: int
+) -> list[dict]:
+    """右バーラインの反転後の付け先を計算する
+
+    rightBarline は「その小節と次の小節の境界」（最終小節の場合は「曲の終端」）
+    を表す。終止線（type='final'）や曲の最終小節に付いたバーラインは
+    「曲の終端」を表す構造的マーカーであり、内容と一緒にミラーリングする
+    対象ではないため、反転後も常に実際の最終小節へ付け直す。
+    それ以外（曲中の複縦線など）は境界そのものをミラーリングする:
+    元 m_N の右バーラインは m_N と m_(N+1) の境界にあるので、
+    反転後はその境界が total_measures - N の位置に移動する。
+
+    Args:
+        barline_positions: collect_barline_positions() の結果
+        total_measures: 総小節数
+
+    Returns:
+        反転後の位置情報 [{reversed_measure_num, barline}]
+    """
+    reversed_positions = []
+    for pos in barline_positions:
+        barline = pos['barline']
+        measure_num = pos['measure_num']
+
+        if measure_num == total_measures or getattr(barline, 'type', None) == 'final':
+            target = total_measures
+        else:
+            target = total_measures - measure_num
+
+        reversed_positions.append({
+            'reversed_measure_num': target,
+            'barline': copy.deepcopy(barline),
+        })
+    return reversed_positions
+
+
+def apply_reversed_barlines(
+    new_part: stream.Part,
+    reversed_barline_positions: list[dict]
+) -> None:
+    """反転後のパートに右バーラインを設定する
+
+    Args:
+        new_part: 反転後のパート（小節が追加済み）
+        reversed_barline_positions: calculate_reversed_barline_positions() の結果
+    """
+    if not reversed_barline_positions:
+        return
+
+    measures_by_number = {
+        measure.number: measure
+        for measure in new_part.getElementsByClass(stream.Measure)
+    }
+    for pos in reversed_barline_positions:
+        target_measure = measures_by_number.get(pos['reversed_measure_num'])
+        if target_measure is not None:
+            target_measure.rightBarline = pos['barline']
 
 
 # 経過的テンポ表記のパターン
@@ -637,13 +763,42 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
     spanner_info = []
     measure_based_spanners = []  # RepeatBracket等の小節ベースSpanner
 
-    for sp in part.spannerBundle:
-        spanned_elements_original = list(sp.getSpannedElements())
-        # Allow single-element spanners for dynamics wedges
-        if len(spanned_elements_original) < 2:
-            if not isinstance(sp, (dynamics.Crescendo, dynamics.Diminuendo)):
+    # Grand staff（PartStaff）の楽器では、music21がSlur等のSpannerを
+    # 実際の所属Staffとは異なる方のPartStaffのspannerBundleにまとめて
+    # 格納することがある。そのままpart.spannerBundleだけを見ると、
+    # もう一方のStaffに属するSpannerを取りこぼしてしまう。
+    # そのため、同じStaffGroupに属する他のPartStaffのspannerBundleも
+    # 候補に加える（後続の音符位置マッチングで実際の所属パートに絞り込む）。
+    # Score全体まで対象を広げると、無関係な別楽器の同一形状のフレーズに
+    # 誤マッチする恐れがあるため、対象は同じStaffGroup内のPartStaffに限定する。
+    spanner_source = list(part.spannerBundle)
+    score_context = part.activeSite if isinstance(part.activeSite, stream.Score) else None
+    if score_context is not None and isinstance(part, stream.PartStaff):
+        seen_ids = set(id(sp) for sp in spanner_source)
+        for staff_group in score_context.getElementsByClass(layout.StaffGroup):
+            if not any(p is part for p in staff_group):
                 continue
-            # For dynamics with < 2 elements, skip if no elements at all
+            for sibling in staff_group:
+                if sibling is part:
+                    continue
+                for sp in sibling.spannerBundle:
+                    if id(sp) not in seen_ids:
+                        spanner_source.append(sp)
+                        seen_ids.add(id(sp))
+
+    for sp in spanner_source:
+        # StaffGroup等、Part/PartStaff自体をつなぐSpannerはここでは扱わない
+        # （reverse_score()側でStaffGroupとして別途複製される）
+        if isinstance(sp, layout.StaffGroup):
+            continue
+
+        spanned_elements_original = list(sp.getSpannedElements())
+        # Allow single-element spanners for dynamics wedges and trill extensions
+        # (1音の持続音上に描かれるwavy-lineは開始・終了とも同じ1音にしか付かない)
+        if len(spanned_elements_original) < 2:
+            if not isinstance(sp, (dynamics.Crescendo, dynamics.Diminuendo, expressions.TrillExtension)):
+                continue
+            # 要素が1つもない場合はスキップ
             if len(spanned_elements_original) == 0:
                 continue
 
@@ -665,56 +820,72 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
             # まず、要素が属する小節をgetContextByClassで特定
             containing_measure = elem.getContextByClass(stream.Measure)
             if containing_measure is not None:
-                # 特定の小節のみを検索（誤マッチング防止）
-                target_measures = [m for m in measures if m.number == containing_measure.number]
+                # 自パートの小節かどうかをオブジェクト同一性で厳密に判定する
+                # (同じStaffGroup内の他のPartStaffのSpannerも候補に含めているため、
+                #  小節番号だけで照合すると、他パートの同じ番号の小節にある
+                #  別の音符へ誤って結び付いてしまう恐れがある)
+                if any(m is containing_measure for m in measures):
+                    target_measures = [containing_measure]
+                else:
+                    target_measures = []  # 自パートの小節ではない
             else:
                 # フォールバック：全小節を検索（従来の動作）
                 target_measures = measures
 
             for measure in target_measures:
-                measure_notes = list(measure.notesAndRests)
-                for note_idx, note in enumerate(measure_notes):
-                    # プロパティで一致を判定
-                    offset_match = abs(elem.offset - note.offset) < 0.0001
-                    duration_match = abs(elem.duration.quarterLength - note.duration.quarterLength) < 0.0001
+                # 小節直下のnotesAndRestsと、各Voice内のnotesAndRestsを個別のグループとして候補にする
+                # (Divisi等でVoiceを持つ小節では、直下のnotesAndRestsだけでは
+                #  Voice内の音符に付いたSpanner（スラー等）を見失う)
+                note_groups = [(None, list(measure.notesAndRests))]
+                for voice in measure.voices:
+                    note_groups.append((voice.id, list(voice.notesAndRests)))
 
-                    pitch_match = False
-                    if elem.isRest and note.isRest:
-                        pitch_match = True
-                    elif hasattr(elem, 'pitches') and hasattr(note, 'pitches'):
-                        # Chord: compare all pitches
-                        elem_pitches = sorted(p.nameWithOctave for p in elem.pitches)
-                        note_pitches = sorted(p.nameWithOctave for p in note.pitches)
-                        pitch_match = (elem_pitches == note_pitches)
-                    elif hasattr(elem, 'pitch') and hasattr(note, 'pitch'):
-                        pitch_match = (str(elem.pitch) == str(note.pitch))
-                    elif not elem.isRest and not note.isRest:
-                        # Both are notes but neither has pitch (unpitched percussion)
-                        # Match by grace status instead
-                        pitch_match = (elem.duration.isGrace == note.duration.isGrace)
+                for voice_id, measure_notes in note_groups:
+                    for note_idx, note in enumerate(measure_notes):
+                        # プロパティで一致を判定
+                        offset_match = abs(elem.offset - note.offset) < 0.0001
+                        duration_match = abs(elem.duration.quarterLength - note.duration.quarterLength) < 0.0001
 
-                    if offset_match and duration_match and pitch_match:
-                        # 単音符と和音の両方に対応
-                        if hasattr(note, 'pitches'):
-                            pitch_name = None  # Chordの場合はpitchはNone
-                            pitches_list = sorted(p.nameWithOctave for p in note.pitches)
-                        elif hasattr(note, 'pitch'):
-                            pitch_name = str(note.pitch)
-                            pitches_list = None
-                        else:
-                            pitch_name = None
-                            pitches_list = None
-                        note_positions.append({
-                            'measure_num': measure.number,
-                            'offset': note.offset,
-                            'duration': note.duration.quarterLength,
-                            'pitch': pitch_name,
-                            'pitches': pitches_list,  # 和音用
-                            'is_rest': note.isRest,
-                            'is_grace': note.duration.isGrace,  # Grace note flag for matching
-                            'note_index': note_idx
-                        })
-                        found = True
+                        pitch_match = False
+                        if elem.isRest and note.isRest:
+                            pitch_match = True
+                        elif hasattr(elem, 'pitches') and hasattr(note, 'pitches'):
+                            # Chord: compare all pitches
+                            elem_pitches = sorted(p.nameWithOctave for p in elem.pitches)
+                            note_pitches = sorted(p.nameWithOctave for p in note.pitches)
+                            pitch_match = (elem_pitches == note_pitches)
+                        elif hasattr(elem, 'pitch') and hasattr(note, 'pitch'):
+                            pitch_match = (str(elem.pitch) == str(note.pitch))
+                        elif not elem.isRest and not note.isRest:
+                            # Both are notes but neither has pitch (unpitched percussion)
+                            # Match by grace status instead
+                            pitch_match = (elem.duration.isGrace == note.duration.isGrace)
+
+                        if offset_match and duration_match and pitch_match:
+                            # 単音符と和音の両方に対応
+                            if hasattr(note, 'pitches'):
+                                pitch_name = None  # Chordの場合はpitchはNone
+                                pitches_list = sorted(p.nameWithOctave for p in note.pitches)
+                            elif hasattr(note, 'pitch'):
+                                pitch_name = str(note.pitch)
+                                pitches_list = None
+                            else:
+                                pitch_name = None
+                                pitches_list = None
+                            note_positions.append({
+                                'measure_num': measure.number,
+                                'offset': note.offset,
+                                'duration': note.duration.quarterLength,
+                                'pitch': pitch_name,
+                                'pitches': pitches_list,  # 和音用
+                                'is_rest': note.isRest,
+                                'is_grace': note.duration.isGrace,  # Grace note flag for matching
+                                'note_index': note_idx,
+                                'voice_id': voice_id,  # Voice内の音符ならそのid、小節直下ならNone
+                            })
+                            found = True
+                            break
+                    if found:
                         break
                 if found:
                     break
@@ -764,8 +935,6 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
     if part.partAbbreviation:
         new_part.partAbbreviation = part.partAbbreviation
 
-    # 最初の小節から楽器、調号、拍子記号を取得してコピー
-    first_original_measure = measures[0]
     total_measures = len(measures)
 
     # 楽器をコピー
@@ -785,19 +954,12 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
     staff_layout_positions = collect_layout_positions(measures, 'StaffLayout')
     page_layout_positions = collect_layout_positions(measures, 'PageLayout')
 
-    # 調号をコピー (KeySignature)
-    key_sigs = first_original_measure.getElementsByClass('KeySignature')
-    if key_sigs:
-        first_key = key_sigs.first()
-        if first_key:
-            new_part.insert(0, first_key)
+    # 右バーライン（bar-style）も同様に反転ロジックで処理
+    barline_positions = collect_barline_positions(measures)
 
-    # 拍子記号をコピー (TimeSignature)
-    time_sigs = first_original_measure.getElementsByClass('TimeSignature')
-    if time_sigs:
-        first_time = time_sigs.first()
-        if first_time:
-            new_part.insert(0, first_time)
+    # 調号・拍子記号も音部記号と同様に反転ロジックで処理
+    key_positions = collect_signature_positions(measures, 'KeySignature')
+    time_positions = collect_signature_positions(measures, 'TimeSignature')
 
     # 各小節を処理して追加
     for i, measure in enumerate(reversed_measures):
@@ -815,9 +977,13 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
             for elem in list(measure_to_process.getElementsByClass(tempo_class)):
                 measure_to_process.remove(elem)
 
-        # 音部記号を小節から削除（反転ロジックで再配置するため）
+        # 音部記号・調号・拍子記号を小節から削除（反転ロジックで再配置するため）
         for elem in list(measure_to_process.getElementsByClass('Clef')):
             measure_to_process.remove(elem)
+        _remove_signatures(measure_to_process)
+
+        # 右バーラインを小節から除去（反転ロジックで再配置するため）
+        measure_to_process.rightBarline = None
 
         # レイアウト要素（System/Staff/PageLayout）を小節から削除（反転ロジックで再配置するため）
         for layout_class in ['SystemLayout', 'StaffLayout', 'PageLayout']:
@@ -836,6 +1002,8 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
             else:
                 fallback = measure
             fallback.number = i + 1
+            fallback.rightBarline = None
+            _remove_signatures(fallback)
             new_part.append(fallback)
             continue
 
@@ -849,6 +1017,8 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
                 # 元の小節（反転前）を使用
                 fallback = copy.deepcopy(original_measures[original_index])
                 fallback.number = i + 1
+                fallback.rightBarline = None
+                _remove_signatures(fallback)
 
                 # 元の小節も書き出せるかテスト
                 fallback_error = test_measure_write(fallback)
@@ -860,15 +1030,19 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
                         pass  # 修正失敗しても続行
 
                 # タイと連桁は反転する（小節順序が変わるため）
+                # NOTE: Chordの.tieと.durationは各構成音符(element.notes)と
+                # 同一オブジェクトを共有しているため、reverse_ties/reverse_tupletsを
+                # Chord本体と構成音符の両方に適用すると二重に反転され、
+                # 結果的に反転されないまま(元のstart/stopが残る)になってしまう。
+                # そのためタイ・連符はChord本体にのみ適用し、独立したオブジェクトを
+                # 持つBeamsのみ構成音符ごとに個別処理する。
                 for element in iter_notes_including_voices(fallback):
                     reverse_ties(element)
                     reverse_beams(element)
                     reverse_tuplets(element)
                     if hasattr(element, 'notes'):
                         for note in element.notes:
-                            reverse_ties(note)
                             reverse_beams(note)
-                            reverse_tuplets(note)
                 new_part.append(fallback)
                 continue
 
@@ -877,12 +1051,12 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
             reverse_ties(element)
             reverse_beams(element)
             reverse_tuplets(element)
-            # 和音内の音符のタイと連桁も処理
+            # 和音内の音符のBeamsも個別処理する
+            # (タイ・連符はChordと構成音符でオブジェクトを共有しているため、
+            #  ここで重ねて反転すると二重反転により元に戻ってしまう。詳細は上記参照)
             if hasattr(element, 'notes'):
                 for note in element.notes:
-                    reverse_ties(note)
                     reverse_beams(note)
-                    reverse_tuplets(note)
 
             # 小節番号を再割り当て
         processed_measure.number = i + 1
@@ -892,6 +1066,13 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
     reversed_clef_positions = calculate_reversed_clef_positions(clef_positions, total_measures)
     apply_reversed_clefs(new_part, reversed_clef_positions)
 
+    # 調号・拍子記号を反転して適用（それぞれ独立した系列として扱う）
+    for positions in (key_positions, time_positions):
+        reversed_positions = calculate_reversed_start_only_positions(
+            positions, total_measures, 'element'
+        )
+        apply_reversed_start_only_elements(new_part, reversed_positions, 'element')
+
     # テンポ要素を反転して適用
     reversed_tempo_positions = calculate_reversed_tempo_positions(tempo_positions, total_measures)
     apply_reversed_tempo_elements(new_part, reversed_tempo_positions)
@@ -900,6 +1081,10 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
     for positions in (system_layout_positions, staff_layout_positions, page_layout_positions):
         reversed_positions = calculate_reversed_layout_positions(positions, total_measures)
         apply_reversed_layout_elements(new_part, reversed_positions)
+
+    # 右バーライン（bar-style）を反転して適用
+    reversed_barline_positions = calculate_reversed_barline_positions(barline_positions, total_measures)
+    apply_reversed_barlines(new_part, reversed_barline_positions)
 
     # 保存したSpanner情報を使って、新しいパートでSpannerを再構築
     for sp_info in spanner_info:
@@ -918,8 +1103,15 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
 
                     # 元の小節内のインデックスから、反転後のインデックスを計算
                     # 反転により、notesAndRestsリストも逆順になるため
+                    # Voice内の音符だった場合は、同じVoice（idで対応付け）のnotesAndRestsを
+                    # 参照する（各Voiceは独立した時間軸として個別に反転されるため）
                     original_note_index = pos.get('note_index')
-                    notes_list = list(new_measure.notesAndRests)
+                    pos_voice_id = pos.get('voice_id')
+                    if pos_voice_id is not None:
+                        target_voice = next((v for v in new_measure.voices if v.id == pos_voice_id), None)
+                        notes_list = list(target_voice.notesAndRests) if target_voice is not None else []
+                    else:
+                        notes_list = list(new_measure.notesAndRests)
 
                     # note_indexが記録されている場合は、それを使って一意に識別
                     # SKIP for unpitched percussion (pitch is None) because grace note grouping changes indices
@@ -939,9 +1131,13 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
                                 pass
                             else:
                                 # オフセットとピッチの最終確認（sanity check）
-                                # For grace notes, use looser offset matching since they now share offset with main note
-                                offset_tolerance = 0.5 if pos.get('is_grace', False) else 0.01
-                                offset_match = abs(new_elem.offset - reversed_offset) < offset_tolerance
+                                # Grace noteは主音符と同じオフセットを共有し、その主音符自体の
+                                # 反転後オフセットは「小節長 - offset - duration」という単純計算では
+                                # 求まらないため、offsetでの照合は行わずgrace状態とピッチのみで判定する
+                                if pos.get('is_grace', False):
+                                    offset_match = True
+                                else:
+                                    offset_match = abs(new_elem.offset - reversed_offset) < 0.01
                                 # 和音と単音符の両方に対応
                                 pitch_match = False
                                 if pos['is_rest'] and new_elem.isRest:
@@ -975,9 +1171,12 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
                                     break
                             else:
                                 # Pitched note or rest: use offset matching
-                                # Looser offset matching for grace notes
-                                offset_tolerance = 0.5 if pos.get('is_grace', False) else 0.01
-                                offset_match = abs(new_elem.offset - reversed_offset) < offset_tolerance
+                                # Grace note:主音符と同じオフセットを共有し、その主音符の反転後
+                                # オフセットは単純計算では求まらないためoffsetでは照合しない
+                                if pos.get('is_grace', False):
+                                    offset_match = True
+                                else:
+                                    offset_match = abs(new_elem.offset - reversed_offset) < 0.01
                                 if offset_match:
                                     # ピッチまたは休符かをチェック（和音対応）
                                     if pos['is_rest'] and new_elem.isRest:
@@ -996,7 +1195,7 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
 
         # すべての音符が見つかった場合のみSpannerを作成
         # ダイナミクスは1要素でもOK、それ以外は2要素以上必要
-        min_elements = 1 if issubclass(sp_info['type'], (dynamics.Crescendo, dynamics.Diminuendo)) else 2
+        min_elements = 1 if issubclass(sp_info['type'], (dynamics.Crescendo, dynamics.Diminuendo, expressions.TrillExtension)) else 2
 
         if len(new_spanned_elements) == len(sp_info['positions']) and len(new_spanned_elements) >= min_elements:
             # IMPORTANT: Spannerは時系列順(小節番号→オフセット順)に要素を持つ必要がある
@@ -1004,9 +1203,8 @@ def reverse_part(part: stream.Part | stream.PartStaff, report: ProcessingReport 
             new_spanned_elements_sorted = sorted(
                 new_spanned_elements,
                 key=lambda elem: (
-                    # 要素が属する小節番号を取得
-                    next((m.number for m in new_part.getElementsByClass(stream.Measure)
-                          if elem in m.notesAndRests), 0),
+                    # 要素が属する小節番号を取得（Voice内の音符にも対応）
+                    getattr(elem.getContextByClass(stream.Measure), 'number', 0),
                     # 小節内のオフセット
                     elem.offset
                 )
@@ -1389,11 +1587,19 @@ def process_file(input_path: Path, output_path: Path,
 
     try:
         # ========== Phase 1: レイアウト抽出 ==========
-        print(f"  [Phase 1] レイアウト情報を抽出中...")
         from layout_preservation import extract_layout_from_xml
         try:
             original_layout = extract_layout_from_xml(input_path)
             layout_extraction_success = True
+            for part_id, directions in original_layout.directions.items():
+                for d in directions:
+                    if d.sound_navigation:
+                        report.add_issue(
+                            part_id, d.measure_num,
+                            "D.C./D.S. 等の演奏順序は反転後に変換できないため、再生用のジャンプ指定"
+                            f"（{', '.join(d.sound_navigation)}）を削除しました。演奏順序を確認してください",
+                            skipped=False,
+                        )
         except Exception as layout_error:
             print(f"  警告: レイアウト抽出に失敗しました: {layout_error}")
             original_layout = None
@@ -1409,20 +1615,25 @@ def process_file(input_path: Path, output_path: Path,
             new_score.append(score)
             score = new_score
 
+        # タイトルに「反転」を付与（反転版であることが分かるように）
+        original_title: Optional[str] = None
+        if score.metadata is not None and score.metadata.title:
+            original_title = score.metadata.title
+            if not original_title.rstrip().endswith('反転'):
+                score.metadata.title = f"{original_title} 反転"
+
         # SKIP_MEASURE_CONTENT モードでは元のスコアを保持
         if error_handling == ErrorHandling.SKIP_MEASURE_CONTENT:
             original_score = copy.deepcopy(score)
 
         report.input_note_count = count_notes(score)
         report.part_count = len(score.parts)
-        print(f"  入力音符数: {report.input_note_count}")
-        print(f"  パート数: {report.part_count}")
 
         # 反転処理
         reversed_score = reverse_score(score, report)
 
         report.output_note_count = count_notes(reversed_score)
-        print(f"  出力音符数: {report.output_note_count}")
+        print(f"  音符数: {report.input_note_count} → {report.output_note_count}")
 
         if report.input_note_count != report.output_note_count:
             print(f"  警告: 音符数が一致しません！")
@@ -1437,37 +1648,40 @@ def process_file(input_path: Path, output_path: Path,
             # ========== Phase 3: XML後処理 ==========
             try:
                 # direction要素を元のXMLから復元（music21分割バグ対策）
-                print(f"  [Phase 3] direction要素を復元中...")
-                from layout_preservation import (
-                    restore_direction_elements,
-                    normalize_slur_numbers,
-                    convert_filler_rests_to_forward,
-                )
+                from layout_preservation import (restore_direction_elements,
+                                                 normalize_slur_numbers,
+                                                 convert_filler_rests_to_forward,
+                                                 recalculate_accidentals,
+                                                 restore_measure_styles,
+                                                 strip_horizontal_layout_hints)
                 total_measures = len(list(reversed_score.parts[0].getElementsByClass('Measure')))
                 restore_direction_elements(output_path, original_layout, total_measures)
-                print(f"  [Phase 3] direction要素の復元完了")
 
                 # スラーのnumber属性を正規化
-                print(f"  [Phase 3] スラー番号を正規化中...")
                 normalize_slur_numbers(output_path, verbose=False)
-                print(f"  [Phase 3] スラー番号の正規化完了")
 
                 # Voice先頭に移動した不要な隠し休符をforwardに変換
-                print(f"  [Phase 3] 不要な休符をforwardに変換中...")
                 convert_filler_rests_to_forward(output_path, verbose=False)
-                print(f"  [Phase 3] 休符のforward変換完了")
+
+                # 臨時記号を有効範囲から再計算（反転で小節内の音順が変わるため）
+                recalculate_accidentals(output_path, verbose=False)
+
+                # 複数小節休符・繰り返し記号を反転後の位置に置き直す
+                restore_measure_styles(output_path, original_layout, total_measures)
+
+                # 反転で無効になる水平位置情報を除去（direction 復元より後に実行する）
+                strip_horizontal_layout_hints(output_path, verbose=False)
             except Exception as restore_error:
-                print(f"  警告: direction要素の復元に失敗しました: {restore_error}")
+                print(f"  警告: XML後処理に失敗しました: {restore_error}")
                 import traceback
                 traceback.print_exc()
 
             # ========== Phase 4: レイアウト復元 ==========
             if layout_extraction_success and original_layout is not None:
-                print(f"  [Phase 4] レイアウト情報を復元中...")
                 from layout_preservation import apply_layout_to_xml
                 try:
-                    apply_layout_to_xml(output_path, original_layout, total_measures)
-                    print(f"  [Phase 4] レイアウト復元完了")
+                    apply_layout_to_xml(output_path, original_layout, total_measures,
+                                        original_title=original_title)
                 except Exception as layout_apply_error:
                     print(f"  警告: レイアウト復元に失敗しました: {layout_apply_error}")
                     # レイアウト適用失敗は警告のみ（反転処理自体は成功）
@@ -1626,6 +1840,27 @@ def write_with_part_fallback(score: stream.Score, output_path: Path, report: Pro
         return False
 
 
+def suppress_midi_channel_warning() -> None:
+    """music21 の「MIDI チャンネル不足」警告を表示しないようにする
+
+    MIDI の 16 チャンネルを使い切るほどパートが多いスコアを書き出すと、music21 は <midi-channel> を
+    振り直せず "we are out of midi channels! help!" を stderr に直接出す。
+    重複したチャンネルのまま書き出されるだけで、元の楽譜でも重複しているため
+    利用者が対処すべき問題ではない。他の警告はそのまま表示する。
+    """
+    from music21.musicxml import m21ToXml
+
+    env = m21ToXml.environLocal
+    original_warn = env.warn
+
+    def warn(msg, header=None):
+        if 'out of midi channels' in str(msg):
+            return
+        original_warn(msg, header)
+
+    env.warn = warn
+
+
 def main():
     """メイン処理"""
     import argparse
@@ -1637,6 +1872,7 @@ def main():
 
     error_handling = (ErrorHandling.SKIP_MEASURE_CONTENT if args.skip_measure_content
                       else ErrorHandling.SKIP_PART)
+    suppress_midi_channel_warning()
 
     inbox = Path("work/inbox")
     outbox = Path("work/outbox")

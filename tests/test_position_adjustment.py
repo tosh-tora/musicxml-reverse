@@ -230,6 +230,76 @@ class TestLayoutPositionCalculation:
         assert reversed_positions[1]['layout_obj'].distance == 78.44
 
 
+class TestSystemBreakSuppression:
+    """改行・改ページを出力しないこと（Issue #76）
+
+    <measure width> や音符の default-x は元の行組みに合わせて justify された値なので、
+    反転すると段の構成と整合しなくなる。横方向のレイアウトは
+    strip_horizontal_layout_hints() で情報ごと取り除き、改行も強制せずに
+    楽譜ソフトの自動改行に任せる。
+    """
+
+    def _system_layouts(self, breaks: list[int]) -> list[dict]:
+        """(小節番号) から改行フラグ付きの layout_positions を組み立てる"""
+        positions = []
+        for measure_num in breaks:
+            sl = layout.SystemLayout()
+            sl.isNew = True if measure_num > 1 else None
+            positions.append({'measure_num': measure_num, 'offset': 0, 'layout_obj': sl})
+        return positions
+
+    def test_no_system_break_is_emitted(self):
+        """元譜に改行があっても反転後は出力しない"""
+        positions = self._system_layouts([1, 10, 20, 30, 40, 46, 52])
+
+        reversed_positions = calculate_reversed_layout_positions(positions, 53)
+
+        assert not [p for p in reversed_positions if p['layout_obj'].isNew],             [(p['reversed_measure_num'], p['layout_obj'].isNew) for p in reversed_positions]
+
+    def test_page_break_and_page_number_are_dropped(self):
+        """改ページを出さないので、ページ番号も残さない"""
+        page = layout.PageLayout()
+        page.isNew = True
+        page.pageNumber = 2
+        positions = [{'measure_num': 46, 'offset': 0, 'layout_obj': page}]
+
+        reversed_positions = calculate_reversed_layout_positions(positions, 53)
+
+        assert len(reversed_positions) == 1
+        assert not reversed_positions[0]['layout_obj'].isNew
+        assert reversed_positions[0]['layout_obj'].pageNumber is None
+
+    def test_layout_content_is_still_reversed(self):
+        """改行は出さないが、縦方向の間隔（内容）の反転は従来どおり行う"""
+        first = layout.SystemLayout()
+        first.systemDistance = 100.0
+        second = layout.SystemLayout()
+        second.isNew = True
+        second.systemDistance = 200.0
+        positions = [
+            {'measure_num': 1, 'offset': 0, 'layout_obj': first},
+            {'measure_num': 6, 'offset': 0, 'layout_obj': second},
+        ]
+
+        reversed_positions = calculate_reversed_layout_positions(positions, 10)
+
+        assert [p['reversed_measure_num'] for p in reversed_positions] == [1, 6]
+        assert reversed_positions[0]['layout_obj'].systemDistance == 200.0
+        assert reversed_positions[1]['layout_obj'].systemDistance == 100.0
+
+    def test_staff_layout_is_unaffected(self):
+        """StaffLayout には改行の概念が無いので内容の反転だけ行う"""
+        positions = [
+            {'measure_num': 1, 'offset': 0, 'layout_obj': layout.StaffLayout(distance=78.44)},
+            {'measure_num': 6, 'offset': 0, 'layout_obj': layout.StaffLayout(distance=100.0)},
+        ]
+
+        reversed_positions = calculate_reversed_layout_positions(positions, 10)
+
+        assert [p['reversed_measure_num'] for p in reversed_positions] == [1, 6]
+        assert reversed_positions[0]['layout_obj'].distance == 100.0
+
+
 class TestTempoPositionCollection:
     """テンポ要素の位置収集テスト"""
 
