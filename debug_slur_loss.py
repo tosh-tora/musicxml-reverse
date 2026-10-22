@@ -6,6 +6,10 @@ Debug script to trace slur loss during reversal
 from music21 import converter, spanner
 from pathlib import Path
 import copy
+import tempfile
+
+# Where test_viola_roundtrip.py writes its output files
+TEST_DIR = Path(tempfile.gettempdir()) / "mrev_test" / "viola"
 
 def analyze_slur_matching(original_file: Path):
     """Analyze why slurs are not being matched after reversal"""
@@ -74,7 +78,7 @@ def analyze_slur_matching(original_file: Path):
     # Process the file to get the reversed version
     from reverse_score import process_file, ErrorHandling
 
-    test_dir = Path("C:/Users/I018970/AppData/Local/Temp/mrev_test/viola")
+    test_dir = TEST_DIR
     reversed_file = test_dir / "reversed.mxl"
 
     if not reversed_file.exists():
@@ -166,7 +170,7 @@ def analyze_slur_matching(original_file: Path):
 
 
 if __name__ == "__main__":
-    original = Path("C:/Users/I018970/AppData/Local/Temp/mrev_test/viola/original.mxl")
+    original = TEST_DIR / "original.mxl"
     if not original.exists():
         print(f"Error: {original} not found")
         print("Run test_viola_roundtrip.py first to generate test files")
