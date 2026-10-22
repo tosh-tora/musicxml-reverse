@@ -260,7 +260,9 @@ class TestIssue78InstrumentRefEndToEnd:
             if k != 'REST' and inst is None
         )
 
-        assert total_notes == 146
+        # 元譜の146要素のうち、Voice末尾の非表示休符4つは反転でVoice先頭に移り
+        # forward に変換される（Issue #64）ため、出力の<note>は142になる
+        assert total_notes == 142
         assert notes_without_instrument == 0
         assert notes_with_instrument > 0
 

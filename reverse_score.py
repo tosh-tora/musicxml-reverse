@@ -1650,6 +1650,7 @@ def process_file(input_path: Path, output_path: Path,
                 # direction要素を元のXMLから復元（music21分割バグ対策）
                 from layout_preservation import (restore_direction_elements,
                                                  normalize_slur_numbers,
+                                                 convert_filler_rests_to_forward,
                                                  recalculate_accidentals,
                                                  restore_measure_styles,
                                                  strip_horizontal_layout_hints)
@@ -1658,6 +1659,9 @@ def process_file(input_path: Path, output_path: Path,
 
                 # スラーのnumber属性を正規化
                 normalize_slur_numbers(output_path, verbose=False)
+
+                # Voice先頭に移動した不要な隠し休符をforwardに変換
+                convert_filler_rests_to_forward(output_path, verbose=False)
 
                 # 臨時記号を有効範囲から再計算（反転で小節内の音順が変わるため）
                 recalculate_accidentals(output_path, verbose=False)
